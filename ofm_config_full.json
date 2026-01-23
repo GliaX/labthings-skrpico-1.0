@@ -1,0 +1,25 @@
+{
+    "things": {
+        "camera": {
+            "class": "openflexure_microscope_server.things.camera.picamera:StreamingPiCamera2",
+            "kwargs": {
+                "camera_board": "picamera_hq"
+            }
+        },
+        "stage": "openflexure_microscope_server.things.stage.skrPico:SkrPicoThing",
+        "autofocus": "openflexure_microscope_server.things.autofocus:AutofocusThing",
+        "camera_stage_mapping": "openflexure_microscope_server.things.camera_stage_mapping:CameraStageMapper",
+        "system": "openflexure_microscope_server.things.system:OpenFlexureSystem",
+        "smart_scan": {
+            "class": "openflexure_microscope_server.things.smart_scan:SmartScanThing",
+            "kwargs": {
+                "scans_folder": "/home/maalus/ofm/openflexure/scans"
+            }
+        },
+        "stage_measure": "openflexure_microscope_server.things.stage_measure:RangeofMotionThing",
+        "bg_color_channels_luv": "openflexure_microscope_server.things.background_detect:ColourChannelDetectLUV",
+        "bg_channel_deviations_luv": "openflexure_microscope_server.things.background_detect:ChannelDeviationLUV"
+    },
+    "settings_folder": "/home/maalus/ofm/openflexure/settings",
+    "log_folder": "/home/maalus/ofm/openflexure/logs"
+}
