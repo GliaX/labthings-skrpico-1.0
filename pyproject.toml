@@ -1,0 +1,38 @@
+[project]
+name = "labthings-skrpico-1.0"
+version = "0.0.1"
+authors = [
+  { name="Richard Bowman", email="richard.bowman@cantab.net" },
+  { name="Adam Popanda", email="adam@glia.org" }
+]
+description = "BIGTTREETECH SKR Pico v1.0 motor controller support for LabThings-FastAPI"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "labthings-fastapi",
+  "numpy",
+]
+
+[project.optional-dependencies]
+dev = [
+  "labthings-fastapi[dev]"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/GliaX/labthings-skrpico-1.0"
+"Bug Tracker" = "https://github.com/GliaX/labthings-skrpico-1.0/issues"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+target-version = "py313"
+
+[tool.mypy]
+plugins = ["pydantic.mypy"]
