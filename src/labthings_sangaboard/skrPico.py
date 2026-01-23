@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 import httpx
 from types import TracebackType
 from typing import Any, Literal, Optional, Self
@@ -20,16 +19,17 @@ class SkrPicoThing(BaseStage):
         thing_server_interface: lt.ThingServerInterface,
         **kwargs: Any,
     ) -> None:
-        self.port = kwargs["port"] if "port" in kwargs else "7125"
-        self.baseurl = kwargs["baseurl"] if "baseurl" in kwargs else "http://192.168.100.16"
+        self.port = kwargs["moonrakerport"] if "moonrakerport" in kwargs else "7125"
+        self.baseurl = kwargs["baseurl"] if "baseurl" in kwargs else "http://127.0.0.1"
         self.acceleration = kwargs["acceleration"] if "acceleration" in kwargs else 15000
         self.speed = kwargs["speed"] if "speed" in kwargs else 1000
         super().__init__(thing_server_interface, **kwargs)
 
     def __enter__(self) -> Self:
+        self.set_zero_position()
         with httpx.Client() as client:
             r = client.get(self.baseurl + ":" + self.port + "/printer/info")
-
+            # todo check http status throw error?
     def __exit__(
             self,
             _exc_type: type[BaseException],
@@ -52,20 +52,21 @@ class SkrPicoThing(BaseStage):
     def update_position(self) -> None:
         """Read position from the stage and set the corresponding property."""
         with (httpx.Client() as client):
-            response = client.post(self.baseurl + ":" + self.port + "/printer/objects/query", data = {
+            response = client.post(self.baseurl + ":" + self.port + "/printer/objects/query", json = {
                 "objects": {
                     "gcode_move": None,
                     "toolhead": ["position", "status"]
                 }
             }).json()
+            # todo check http status
 
             self._hardware_position = dict(
-                zip(self.axis_names, response["status"]["toolhead"]["position"])
+                zip(self.axis_names, response["result"]["status"]["toolhead"]["position"])
             )
 
 
     def check_firmware(self) -> None:
-        httpx.get(self.baseurl + "/printer/info")
+        httpx.get(self.baseurl + "/printer/info") # todo check http status
 
     def move_gcode(self,
         move_type: MovementType,
@@ -77,13 +78,13 @@ class SkrPicoThing(BaseStage):
         with (httpx.Client() as client):
             self.moving = True
             try:
-                response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script", data={
-                    "script": f"{move_type} /n"
-                              "G1 ".join(
-                        f"{axis.upper()}{axisDisplacement}" for axis, axisDisplacement in displacement.items())
-                                       .join(f" S{self.speed} F{self.acceleration}")
+                response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script", json={
+                    "script": f"{move_type.value} \n" +
+                              "G1 "+ "".join(f"{axis.upper()}{axisDisplacement} " for axis, axisDisplacement in displacement.items()) +
+                              f"S{self.speed} F{self.acceleration}\n"
                 }).json()
-
+            # todo check http status
+            # todo implement api key / security
             finally:
                 self.moving = False
                 self.update_position()
@@ -114,11 +115,12 @@ class SkrPicoThing(BaseStage):
         stage.
         """
         with httpx.Client() as client:
-            response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script", data={
-                "script": "SET_KINEMATIC_POSITION X=0 Y=0 Z=0 SET_HOMED=<XYZ>"
+            response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script", json={
+                "script": "SET_KINEMATIC_POSITION X=0 Y=0 Z=0 SET_HOMED=XYZ"
 
         }).json()
         self.update_position()
+        # todo check http status
 
     @lt.action
     def flash_led(
