@@ -48,7 +48,6 @@ class SkrPicoThing(BaseStage):
         ABSOLUTE = "G90"
         RELATIVE = "G91"
 
-
     def update_position(self) -> None:
         """Read position from the stage and set the corresponding property."""
         with (httpx.Client() as client):
@@ -81,7 +80,8 @@ class SkrPicoThing(BaseStage):
                 response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script", json={
                     "script": f"{move_type.value} \n" +
                               "G1 "+ "".join(f"{axis.upper()}{axisDisplacement} " for axis, axisDisplacement in displacement.items()) +
-                              f"S{self.speed} F{self.acceleration}\n"
+                              f"S{self.speed} F{self.acceleration} \n" +
+                              "M400"
                 }).json()
             # todo check http status
             # todo implement api key / security
