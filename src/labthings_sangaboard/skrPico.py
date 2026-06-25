@@ -22,9 +22,11 @@ class SkrPicoThing(BaseStage):
         self.port = kwargs["moonrakerport"] if "moonrakerport" in kwargs else "7125"
         self.baseurl = kwargs["baseurl"] if "baseurl" in kwargs else "http://127.0.0.1"
         self.acceleration = kwargs["acceleration"] if "acceleration" in kwargs else 45000
-        self.speed = kwargs["speed"] if "speed" in kwargs else 9000
+        self.speed = kwargs["speed"] if "speed" in kwargs else 1000 #todo bring speed back up to 9000 when hardcoded distances in webapp are fixed
         self.timeout = httpx.Timeout(60.0)
+        self._step_time = 0.000001
         super().__init__(thing_server_interface, **kwargs)
+        self.set_jog()
 
     def __enter__(self) -> Self:
         self.set_zero_position()
@@ -67,22 +69,82 @@ class SkrPicoThing(BaseStage):
     def check_firmware(self) -> None:
         httpx.get(self.baseurl + "/printer/info", timeout=self.timeout) # todo check http status
 
+    def _hardware_start_move_relative(self, displacement: Sequence[int]) -> None:
+        """Start a relative move.
+
+        This starts the stage moving, but does not wait for the move to complete. It
+        sets ``self.moving`` to ``True``: resetting it is the responsibility of the calling code.
+        """
+        with self._hardware_lock:
+            self.moving = True
+            self.move_gcode(self.MovementType.RELATIVE, False, displacement)
+
+
+    def _hardware_stop(self) -> None:
+        """Stop any motion of the stage as soon as possible."""
+        with self._hardware_lock:
+            with (httpx.Client() as client):
+                try:
+                    response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script",
+                                           timeout=self.timeout, json={
+                            "script": "JOG_INTERRUPT"
+                        }).json()
+                # todo check http status
+                # todo implement api key / security
+                finally:
+                    self.moving = False
+                    self.update_position()
+
+    def _poll_moving(self) -> bool:
+        """Determine if the stage is still moving.
+
+        This also sets ``moving`` if the status has changed.
+
+        :return: whether the stage is still moving.
+        """
+        with self._hardware_lock:
+            return self.moving
+
+    def _estimate_move_duration(self, displacement: Sequence[int]) -> float:
+        """Calculate the expected duration of a move with the given displacement."""
+        max_displacement = max(abs(d) for d in displacement)
+        # This does not yet check the board's speed.
+        return max_displacement * self._step_time
+
     def move_gcode(self,
         move_type: MovementType,
-        block_cancellation: bool = False, ## todo later, implement cancels
+        block_cancellation: bool = False,
+        displacement=None,
         **kwargs: int,
                    ) -> None:
+        if displacement is None:
+            displacement_axis = dict(zip(self.axis_names, [kwargs.get(axis, 0) for axis in self.axis_names]))
+            displacement = list(displacement_axis.values())
+        else:
+            displacement_axis = dict(zip(self.axis_names, displacement))
 
-        displacement = dict(zip(self.axis_names, [kwargs.get(axis, 0) for axis in self.axis_names]))
         with (httpx.Client() as client):
             self.moving = True
             try:
                 response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script", timeout=self.timeout, json={
-                    "script": f"{move_type.value} \n" +
-                              "G1 "+ "".join(f"{axis.upper()}{axisDisplacement} " for axis, axisDisplacement in displacement.items()) +
-                              f"S{self.speed} F{self.acceleration} \n" +
-                              "M400"
+                    "script": "JOG_MOVE "+ "".join(f"{axis.upper()}={axisDisplacement} " for axis, axisDisplacement in displacement_axis.items()) +
+                              f"S={self.speed} F={self.acceleration} \n"
                 }).json()
+
+                duration = self._estimate_move_duration(displacement)
+                if not block_cancellation:
+                    if duration > 0.02:
+                        lt.cancellable_sleep(
+                            duration - 0.01
+                        )
+            # todo poll klipper instead of waiting for cancel
+            except lt.exceptions.InvocationCancelledError as e:
+                # If the move has been cancelled, stop it but don't handle the exception.
+                # We need the exception to propagate in order to stop any calling tasks,
+                # and to mark the invocation as "cancelled" rather than stopped.
+                self._hardware_stop()
+                raise e
+
             # todo check http status
             # todo implement api key / security
             finally:
@@ -94,7 +156,7 @@ class SkrPicoThing(BaseStage):
         block_cancellation: bool = False,
         **kwargs: int,
     ) -> None:
-        """Make a relative move using G91"""
+        """Make a relative move"""
         self.move_gcode(self.MovementType.RELATIVE, block_cancellation, **kwargs)
 
 
@@ -104,7 +166,14 @@ class SkrPicoThing(BaseStage):
         **kwargs: int,
     ) -> None:
         """Make an absolute move."""
-        self.move_gcode(self.MovementType.ABSOLUTE, block_cancellation, **kwargs)
+        self.update_position()
+        displacement = {
+            axis: int(pos) - self._hardware_position[axis]
+            for axis, pos in kwargs.items()
+            if axis in self.axis_names
+        }
+
+        self.move_gcode(self.MovementType.ABSOLUTE, block_cancellation, **displacement)
 
     @lt.action
     def set_zero_position(self) -> None:
@@ -121,6 +190,16 @@ class SkrPicoThing(BaseStage):
         }).json()
         self.update_position()
         # todo check http status
+
+    def set_jog(self) -> None:
+        """Toggle the "jog" mode which enables interruptible moves.
+        """
+        with httpx.Client() as client:
+            response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script", timeout=self.timeout,
+                                   json={
+                                       "script": "JOG"
+                                   }).json()
+        self.update_position()
 
     @lt.action
     def flash_led(

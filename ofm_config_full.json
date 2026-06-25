@@ -3,7 +3,7 @@
         "camera": {
             "class": "openflexure_microscope_server.things.camera.picamera:StreamingPiCamera2",
             "kwargs": {
-                "camera_board": "picamera_hq"
+                "camera_board": "picamera_v2"
             }
         },
         "stage": "openflexure_microscope_server.things.stage.skrPico:SkrPicoThing",
@@ -13,13 +13,19 @@
         "smart_scan": {
             "class": "openflexure_microscope_server.things.smart_scan:SmartScanThing",
             "kwargs": {
-                "scans_folder": "/home/maalus/ofm/openflexure/scans"
+                "default_workflow": "histo_scan_workflow"
             }
         },
+		"histo_scan_workflow": "openflexure_microscope_server.things.scan_workflows:HistoScanWorkflow",
+        "snake_workflow": "openflexure_microscope_server.things.scan_workflows:SnakeWorkflow",
+        "raster_workflow": "openflexure_microscope_server.things.scan_workflows:RasterWorkflow",
         "stage_measure": "openflexure_microscope_server.things.stage_measure:RangeofMotionThing",
         "bg_color_channels_luv": "openflexure_microscope_server.things.background_detect:ColourChannelDetectLUV",
         "bg_channel_deviations_luv": "openflexure_microscope_server.things.background_detect:ChannelDeviationLUV"
     },
-    "settings_folder": "/home/maalus/ofm/openflexure/settings",
-    "log_folder": "/home/maalus/ofm/openflexure/logs"
+    "settings_folder": "/home/admin/ofm/openflexure/settings",
+    "application_config": {
+        "log_folder": "/home/admin/ofm/openflexure/logs/",
+        "data_folder": "/home/admin/ofm/openflexure/data/"
+    }
 }
