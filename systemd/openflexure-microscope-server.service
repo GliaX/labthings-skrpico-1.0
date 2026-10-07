@@ -1,0 +1,17 @@
+[Unit]
+Description=OpenFlexure Microscope Server
+After=network-online.target klipper.service moonraker.service
+Wants=network-online.target
+Requires=klipper.service moonraker.service
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/openflexure-microscope-server
+ExecStartPre=/home/admin/openflexure-microscope-server/systemd/wait-for-klippy.sh
+ExecStart=/home/admin/openflexure-microscope-server/.venv/bin/openflexure-microscope-server --fallback -c ./ofm_config_full.json --port 5000 --host 0.0.0.0
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

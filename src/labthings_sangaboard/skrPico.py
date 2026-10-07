@@ -22,7 +22,7 @@ class SkrPicoThing(BaseStage):
         self.port = kwargs["moonrakerport"] if "moonrakerport" in kwargs else "7125"
         self.baseurl = kwargs["baseurl"] if "baseurl" in kwargs else "http://127.0.0.1"
         self.acceleration = kwargs["acceleration"] if "acceleration" in kwargs else 45000
-        self.speed = kwargs["speed"] if "speed" in kwargs else 1000 #todo bring speed back up to 9000 when hardcoded distances in webapp are fixed
+        self.speed = kwargs["speed"] if "speed" in kwargs else 1000
         self.timeout = httpx.Timeout(60.0)
         self._step_time = 0.000001
         super().__init__(thing_server_interface, **kwargs)
@@ -115,6 +115,7 @@ class SkrPicoThing(BaseStage):
         move_type: MovementType,
         block_cancellation: bool = False,
         displacement=None,
+        planned: bool = False,
         **kwargs: int,
                    ) -> None:
         if displacement is None:
@@ -123,20 +124,27 @@ class SkrPicoThing(BaseStage):
         else:
             displacement_axis = dict(zip(self.axis_names, displacement))
 
+        jog_axes = "".join(f"{axis.upper()}={axisDisplacement} " for axis, axisDisplacement in displacement_axis.items())
+        gcode_axes = "".join(f"{axis.upper()}{axisDisplacement} " for axis, axisDisplacement in displacement_axis.items())
+        if planned:
+            script = (f"JOG VALUE=0\n{move_type.value}\nG1 {gcode_axes}S{self.speed} F{self.acceleration}\nM400\nJOG VALUE=1\n")
+        else:
+            script = (f"JOG VALUE=1\nJOG_MOVE {jog_axes}S={self.speed} F={self.acceleration} \n")
+
         with (httpx.Client() as client):
             self.moving = True
             try:
                 response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script", timeout=self.timeout, json={
-                    "script": "JOG_MOVE "+ "".join(f"{axis.upper()}={axisDisplacement} " for axis, axisDisplacement in displacement_axis.items()) +
-                              f"S={self.speed} F={self.acceleration} \n"
+                    "script": script
                 }).json()
 
-                duration = self._estimate_move_duration(displacement)
-                if not block_cancellation:
-                    if duration > 0.02:
-                        lt.cancellable_sleep(
-                            duration - 0.01
-                        )
+                if not planned:
+                    duration = self._estimate_move_duration(displacement)
+                    if not block_cancellation:
+                        if duration > 0.02:
+                            lt.cancellable_sleep(
+                                duration - 0.01
+                            )
             # todo poll klipper instead of waiting for cancel
             except lt.exceptions.InvocationCancelledError as e:
                 # If the move has been cancelled, stop it but don't handle the exception.
@@ -157,7 +165,7 @@ class SkrPicoThing(BaseStage):
         **kwargs: int,
     ) -> None:
         """Make a relative move"""
-        self.move_gcode(self.MovementType.RELATIVE, block_cancellation, **kwargs)
+        self.move_gcode(self.MovementType.RELATIVE, block_cancellation, planned=True, **kwargs)
 
 
     def _hardware_move_absolute(
@@ -173,7 +181,7 @@ class SkrPicoThing(BaseStage):
             if axis in self.axis_names
         }
 
-        self.move_gcode(self.MovementType.ABSOLUTE, block_cancellation, **displacement)
+        self.move_gcode(self.MovementType.ABSOLUTE, block_cancellation, displacement, planned=True)
 
     @lt.action
     def set_zero_position(self) -> None:
