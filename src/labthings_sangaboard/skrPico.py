@@ -26,7 +26,6 @@ class SkrPicoThing(BaseStage):
         self.timeout = httpx.Timeout(60.0)
         self._step_time = 0.000001
         super().__init__(thing_server_interface, **kwargs)
-        self.set_jog()
 
     def __enter__(self) -> Self:
         self.set_zero_position()
@@ -77,6 +76,7 @@ class SkrPicoThing(BaseStage):
         """
         with self._hardware_lock:
             self.moving = True
+            self.set_jog()
             self.move_gcode(self.MovementType.RELATIVE, False, displacement)
 
 
@@ -92,8 +92,17 @@ class SkrPicoThing(BaseStage):
                 # todo check http status
                 # todo implement api key / security
                 finally:
+                    self.unset_jog()
                     self.moving = False
                     self.update_position()
+
+    def _jog_loop(self, first_command: JogCommand) -> None:
+        try:
+            super()._jog_loop(first_command)
+        finally:
+            # A jog session that ends without a stop command must still
+            # restore the default mode (the stop path is a no-op if nothing moves).
+            self._hardware_stop()
 
     def _poll_moving(self) -> bool:
         """Determine if the stage is still moving.
@@ -130,7 +139,7 @@ class SkrPicoThing(BaseStage):
         jog_axes = "".join(f"{axis.upper()}={axisDisplacement} " for axis, axisDisplacement in displacement_axis.items())
         gcode_axes = "".join(f"{axis.upper()}{axisDisplacement} " for axis, axisDisplacement in displacement_axis.items())
         if planned:
-            script = (f"JOG VALUE=0\n{move_type.value}\nG1 {gcode_axes}S9000 F45000\nM400\nJOG VALUE=1\n")
+            script = (f"{move_type.value}\nG1 {gcode_axes}S9000 F45000\nM400\n")
         else:
             scale = max(abs(d) for d in displacement_axis.values()) / 600
             script = (f"JOG VALUE=1\nJOG_MOVE {jog_axes}S={self.speed * scale} F={self.acceleration * scale}\n")
@@ -203,12 +212,20 @@ class SkrPicoThing(BaseStage):
         # todo check http status
 
     def set_jog(self) -> None:
-        """Toggle the "jog" mode which enables interruptible moves.
+        """Enable jog mode for low-latency manual moves.
         """
+        self._send_jog_mode_command(True)
+
+    def unset_jog(self) -> None:
+        """Return to standard (ready) mode.
+        """
+        self._send_jog_mode_command(False)
+
+    def _send_jog_mode_command(self, enable: bool) -> None:
         with httpx.Client() as client:
             response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script", timeout=self.timeout,
                                    json={
-                                       "script": "JOG"
+                                       "script": f"JOG VALUE={1 if enable else 0}"
                                    }).json()
         self.update_position()
 
