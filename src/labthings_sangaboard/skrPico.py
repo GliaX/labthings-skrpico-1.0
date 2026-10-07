@@ -76,7 +76,6 @@ class SkrPicoThing(BaseStage):
         """
         with self._hardware_lock:
             self.moving = True
-            self.set_jog()
             self.move_gcode(self.MovementType.RELATIVE, False, displacement)
 
 
@@ -98,6 +97,7 @@ class SkrPicoThing(BaseStage):
 
     def _jog_loop(self, first_command: JogCommand) -> None:
         try:
+            self.set_jog()
             super()._jog_loop(first_command)
         finally:
             # A jog session that ends without a stop command must still
@@ -115,10 +115,8 @@ class SkrPicoThing(BaseStage):
             return self.moving
 
     def _estimate_move_duration(self, displacement: Sequence[int]) -> float:
-        """Calculate the expected duration of a move with the given displacement."""
-        max_displacement = max(abs(d) for d in displacement)
-        # This does not yet check the board's speed.
-        return max_displacement * self._step_time
+        """Duration of a jog move: 600/speed seconds at any displacement."""
+        return 600.0 / self.speed
 
     def move_gcode(self,
         move_type: MovementType,
@@ -150,15 +148,10 @@ class SkrPicoThing(BaseStage):
                 response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script", timeout=self.timeout, json={
                     "script": script
                 }).json()
+                # Raise InvocationCancelledError before starting another move
+                # if the invoking action has been cancelled.
+                lt.raise_if_cancelled()
 
-                if not planned:
-                    duration = self._estimate_move_duration(displacement)
-                    if not block_cancellation:
-                        if duration > 0.02:
-                            lt.cancellable_sleep(
-                                duration - 0.01
-                            )
-            # todo poll klipper instead of waiting for cancel
             except lt.exceptions.InvocationCancelledError as e:
                 # If the move has been cancelled, stop it but don't handle the exception.
                 # We need the exception to propagate in order to stop any calling tasks,
