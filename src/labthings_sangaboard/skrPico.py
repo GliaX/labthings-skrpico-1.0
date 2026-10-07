@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import httpx
 from types import TracebackType
-from typing import Any, Literal, Mapping, Optional, Self
+from typing import Any, Literal, Mapping, Optional, Self, Sequence
 from enum import Enum
 
 import labthings_fastapi as lt
 
-from . import BaseStage
+from . import BaseStage, JogCommand
 
 class SkrPicoThing(BaseStage):
     """A Thing to manage a SKR Pico v1.0 motor controller using Moonraker.
@@ -19,19 +19,20 @@ class SkrPicoThing(BaseStage):
         thing_server_interface: lt.ThingServerInterface,
         **kwargs: Any,
     ) -> None:
-        self.port = kwargs["moonrakerport"] if "moonrakerport" in kwargs else "7125"
-        self.baseurl = kwargs["baseurl"] if "baseurl" in kwargs else "http://127.0.0.1"
-        self.acceleration = kwargs["acceleration"] if "acceleration" in kwargs else 45000
-        self.speed = kwargs["speed"] if "speed" in kwargs else 1000
+        self.port = kwargs.get("moonrakerport", "7125")
+        self.baseurl = kwargs.get("baseurl", "http://127.0.0.1")
+        self.acceleration = kwargs.get("acceleration", 45000)
+        self.speed = kwargs.get("speed", 1000)
         self.timeout = httpx.Timeout(60.0)
         self._step_time = 0.000001
-        super().__init__(thing_server_interface, **kwargs)
+        super().__init__(thing_server_interface)
 
     def __enter__(self) -> Self:
         self.set_zero_position()
         with httpx.Client() as client:
             r = client.get(self.baseurl + ":" + self.port + "/printer/info",timeout=self.timeout)
             # todo check http status throw error?
+        return self
     def __exit__(
             self,
             _exc_type: type[BaseException],
@@ -43,7 +44,7 @@ class SkrPicoThing(BaseStage):
 
     # Z1 is chained to Z but still reports position data
     axis_inverted: dict[str, bool] = lt.setting(
-        default={"x": True, "y": False, "z": True}, readonly=True
+        default_factory=lambda: {"x": True, "y": False, "z": True}, readonly=True
     )
     class MovementType(Enum):
         ABSOLUTE = "G90"
