@@ -1,7 +1,7 @@
 #!/bin/sh
 i=0
 while :; do
-    if curl -sf http://127.0.0.1:7125/printer/info | grep -q '"state"[[:space:]]*:[[:space:]]*"ready"'; then
+    if curl -sf http://127.0.0.1:7125/printer/info | grep -Eq '"state"[[:space:]]*:[[:space:]]*"(ready|jogging)"'; then
         exit 0
     fi
     i=$((i + 1))
