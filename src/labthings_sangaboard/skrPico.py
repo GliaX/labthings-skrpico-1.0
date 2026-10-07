@@ -179,12 +179,12 @@ class SkrPicoThing(BaseStage):
     ) -> None:
         """Make an absolute move."""
         self.update_position()
-        displacement = [
-            int(kwargs.get(axis, self._hardware_position[axis])) - self._hardware_position[axis]
+        positions = [
+            kwargs.get(axis, self._hardware_position[axis])
             for axis in self.axis_names
         ]
 
-        self.move_gcode(self.MovementType.ABSOLUTE, block_cancellation, displacement, planned=True)
+        self.move_gcode(self.MovementType.ABSOLUTE, block_cancellation, positions, planned=True)
 
     @lt.action
     def set_zero_position(self) -> None:
