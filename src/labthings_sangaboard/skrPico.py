@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import httpx
 from types import TracebackType
-from typing import Any, Literal, Optional, Self
+from typing import Any, Literal, Mapping, Optional, Self
 from enum import Enum
 
 import labthings_fastapi as lt
@@ -121,6 +121,9 @@ class SkrPicoThing(BaseStage):
         if displacement is None:
             displacement_axis = dict(zip(self.axis_names, [kwargs.get(axis, 0) for axis in self.axis_names]))
             displacement = list(displacement_axis.values())
+        elif isinstance(displacement, Mapping):
+            displacement_axis = {axis: displacement.get(axis, 0) for axis in self.axis_names}
+            displacement = list(displacement_axis.values())
         else:
             displacement_axis = dict(zip(self.axis_names, displacement))
 
@@ -176,11 +179,10 @@ class SkrPicoThing(BaseStage):
     ) -> None:
         """Make an absolute move."""
         self.update_position()
-        displacement = {
-            axis: int(pos) - self._hardware_position[axis]
-            for axis, pos in kwargs.items()
-            if axis in self.axis_names
-        }
+        displacement = [
+            int(kwargs.get(axis, self._hardware_position[axis])) - self._hardware_position[axis]
+            for axis in self.axis_names
+        ]
 
         self.move_gcode(self.MovementType.ABSOLUTE, block_cancellation, displacement, planned=True)
 
