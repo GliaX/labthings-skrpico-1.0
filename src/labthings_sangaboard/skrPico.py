@@ -28,10 +28,7 @@ class SkrPicoThing(BaseStage):
         super().__init__(thing_server_interface)
 
     def __enter__(self) -> Self:
-        self.set_zero_position()
-        with httpx.Client() as client:
-            r = client.get(self.baseurl + ":" + self.port + "/printer/info",timeout=self.timeout)
-            # todo check http status throw error?
+        self.set_homed()
         return self
     def __exit__(
             self,
@@ -46,6 +43,24 @@ class SkrPicoThing(BaseStage):
     axis_inverted: dict[str, bool] = lt.setting(
         default_factory=lambda: {"x": True, "y": False, "z": True}, readonly=True
     )
+
+    def _send_gcode_script(self, client: httpx.Client, script: str) -> dict:
+        """Send a gcode script to Moonraker, raising if the request fails."""
+        response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script",
+                               timeout=self.timeout, json={"script": script})
+        response.raise_for_status()
+        data = response.json()
+        if "error" in data:
+            raise IOError(f"Moonraker rejected script {script!r}: {data['error']}")
+        return data
+
+    def _get_status(self, client: httpx.Client, payload: dict) -> dict:
+        """Query printer objects from Moonraker, raising if the request fails."""
+        response = client.post(self.baseurl + ":" + self.port + "/printer/objects/query",
+                               timeout=self.timeout, json=payload)
+        response.raise_for_status()
+        return response.json()
+
     class MovementType(Enum):
         ABSOLUTE = "G90"
         RELATIVE = "G91"
@@ -53,21 +68,21 @@ class SkrPicoThing(BaseStage):
     def update_position(self) -> None:
         """Read position from the stage and set the corresponding property."""
         with (httpx.Client() as client):
-            response = client.post(self.baseurl + ":" + self.port + "/printer/objects/query", timeout=self.timeout, json = {
+            response = self._get_status(client, {
                 "objects": {
                     "gcode_move": None,
                     "toolhead": ["position", "status"]
                 }
-            }).json()
-            # todo check http status
-
+            })
             self._hardware_position = dict(
                 zip(self.axis_names, response["result"]["status"]["toolhead"]["position"])
             )
 
 
     def check_firmware(self) -> None:
-        httpx.get(self.baseurl + "/printer/info", timeout=self.timeout) # todo check http status
+        with httpx.Client() as client:
+            response = client.get(self.baseurl + ":" + self.port + "/printer/info", timeout=self.timeout)
+            response.raise_for_status()
 
     def _hardware_start_move_relative(self, displacement: Sequence[int]) -> None:
         """Start a relative move.
@@ -85,12 +100,7 @@ class SkrPicoThing(BaseStage):
         with self._hardware_lock:
             with (httpx.Client() as client):
                 try:
-                    response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script",
-                                           timeout=self.timeout, json={
-                            "script": "JOG_INTERRUPT"
-                        }).json()
-                # todo check http status
-                # todo implement api key / security
+                    self._send_gcode_script(client, "JOG_INTERRUPT")
                 finally:
                     self.unset_jog()
                     self.moving = False
@@ -146,9 +156,7 @@ class SkrPicoThing(BaseStage):
         with (httpx.Client() as client):
             self.moving = True
             try:
-                response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script", timeout=self.timeout, json={
-                    "script": script
-                }).json()
+                self._send_gcode_script(client, script)
                 # Raise InvocationCancelledError before starting another move
                 # if the invoking action has been cancelled.
                 lt.raise_if_cancelled()
@@ -160,8 +168,6 @@ class SkrPicoThing(BaseStage):
                 self._hardware_stop()
                 raise e
 
-            # todo check http status
-            # todo implement api key / security
             finally:
                 self.moving = False
                 self.update_position()
@@ -198,12 +204,18 @@ class SkrPicoThing(BaseStage):
         stage.
         """
         with httpx.Client() as client:
-            response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script", timeout=self.timeout, json={
-                "script": "SET_KINEMATIC_POSITION X=0 Y=0 Z=0 SET_HOMED=XYZ"
-
-        }).json()
+            self._send_gcode_script(client, "SET_KINEMATIC_POSITION X=0 Y=0 Z=0 SET_HOMED=XYZ")
         self.update_position()
-        # todo check http status
+
+    def set_homed(self) -> None:
+        """Mark the current position as homed without changing coordinates.
+
+        Klippy keeps running across microscope-server restarts, so the
+        coordinate frame survives restarts, like the sangaboard's counters.
+        """
+        with httpx.Client() as client:
+            self._send_gcode_script(client, "SET_KINEMATIC_POSITION SET_HOMED=XYZ")
+        self.update_position()
 
     def set_jog(self) -> None:
         """Enable jog mode for low-latency manual moves.
@@ -217,10 +229,7 @@ class SkrPicoThing(BaseStage):
 
     def _send_jog_mode_command(self, enable: bool) -> None:
         with httpx.Client() as client:
-            response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script", timeout=self.timeout,
-                                   json={
-                                       "script": f"JOG VALUE={1 if enable else 0}"
-                                   }).json()
+            self._send_gcode_script(client, f"JOG VALUE={1 if enable else 0}")
         self.update_position()
 
     @lt.action
