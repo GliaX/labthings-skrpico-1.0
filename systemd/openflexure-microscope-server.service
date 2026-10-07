@@ -8,6 +8,7 @@ Requires=klipper.service moonraker.service
 Type=simple
 User=admin
 WorkingDirectory=/home/admin/openflexure-microscope-server
+Environment=PATH=/home/admin/openflexure-microscope-server/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStartPre=/home/admin/openflexure-microscope-server/systemd/wait-for-klippy.sh
 ExecStart=/home/admin/openflexure-microscope-server/.venv/bin/openflexure-microscope-server --fallback -c ./ofm_config_full.json --port 5000 --host 0.0.0.0
 Restart=always

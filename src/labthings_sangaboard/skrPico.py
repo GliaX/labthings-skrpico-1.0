@@ -130,7 +130,7 @@ class SkrPicoThing(BaseStage):
         jog_axes = "".join(f"{axis.upper()}={axisDisplacement} " for axis, axisDisplacement in displacement_axis.items())
         gcode_axes = "".join(f"{axis.upper()}{axisDisplacement} " for axis, axisDisplacement in displacement_axis.items())
         if planned:
-            script = (f"JOG VALUE=0\n{move_type.value}\nG1 {gcode_axes}S{self.speed} F{self.acceleration}\nM400\nJOG VALUE=1\n")
+            script = (f"JOG VALUE=0\n{move_type.value}\nG1 {gcode_axes}S9000 F45000\nM400\nJOG VALUE=1\n")
         else:
             scale = max(abs(d) for d in displacement_axis.values()) / 600
             script = (f"JOG VALUE=1\nJOG_MOVE {jog_axes}S={self.speed * scale} F={self.acceleration * scale}\n")
