@@ -1205,7 +1205,7 @@ class SmoothAutofocusThing(lt.Thing):
         return FollowResult(stops=stops, peaks=peaks, entries=entries)
 
 
-class SmoothCompatAutofocus(AutofocusThing):
+class SmoothCompatAutofocus(SmoothAutofocusThing, AutofocusThing):
     """Drop-in AutofocusThing backed by the smooth autofocus engine.
 
     Keeps the smooth module's own units and gates: dz is interpreted as the
