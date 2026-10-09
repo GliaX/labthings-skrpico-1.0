@@ -3,6 +3,7 @@
         "camera": "openflexure_microscope_server.things.camera.picamera:PiCameraHQ",
         "stage": "openflexure_microscope_server.things.stage.skrPico:SkrPicoThing",
         "autofocus": "openflexure_microscope_server.things.autofocus:AutofocusThing",
+        "smooth_autofocus": "openflexure_microscope_server.things.smooth_autofocus:SmoothAutofocusThing",
         "gallery": "openflexure_microscope_server.things.gallery.GalleryThing",
         "camera_stage_mapping": "openflexure_microscope_server.things.camera_stage_mapping:CameraStageMapper",
         "system": "openflexure_microscope_server.things.system:OpenFlexureSystem",

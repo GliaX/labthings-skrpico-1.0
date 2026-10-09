@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import httpx
+import time
 from types import TracebackType
 from typing import Any, Literal, Mapping, Optional, Self, Sequence
 from enum import Enum
@@ -44,10 +45,10 @@ class SkrPicoThing(BaseStage):
         default_factory=lambda: {"x": True, "y": False, "z": True}, readonly=True
     )
 
-    def _send_gcode_script(self, client: httpx.Client, script: str) -> dict:
+    def _send_gcode_script(self, client: httpx.Client, script: str, timeout: Optional[httpx.Timeout] = None) -> dict:
         """Send a gcode script to Moonraker, raising if the request fails."""
         response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script",
-                               timeout=self.timeout, json={"script": script})
+                               timeout=timeout or self.timeout, json={"script": script})
         response.raise_for_status()
         data = response.json()
         if "error" in data:
@@ -179,6 +180,57 @@ class SkrPicoThing(BaseStage):
     ) -> None:
         """Make a relative move"""
         self.move_gcode(self.MovementType.RELATIVE, block_cancellation, planned=True, **kwargs)
+
+    def move_relative_z_timed(
+        self, steps: int, seconds: float, trailing_sync: bool = False
+    ) -> None:
+        steps = int(steps)
+        seconds = float(seconds)
+        if steps == 0 or seconds <= 0:
+            return
+        if self.axis_inverted.get("z", False):
+            steps = -steps
+        speed = abs(steps) / seconds
+        script = (
+            "G91\n"
+            f"G1 Z{steps} S{speed:.6f} F{speed * 60.0:.3f}\n"
+            + ("\nM400\n" if trailing_sync else "")
+        )
+        t_send = time.time()
+        with httpx.Client() as client:
+            self._send_gcode_script(
+                client, script, timeout=httpx.Timeout(30.0 + seconds)
+            )
+        self.move_started_at = t_send + 0.02
+        self.move_ended_at = t_send + 0.02 + seconds
+
+    move_started_at: float = 0.0
+    move_ended_at: float = 0.0
+
+    def move_gcode_sync(self) -> None:
+        """Block until the printer's motion queue is fully drained (M400)."""
+        with httpx.Client() as client:
+            self._send_gcode_script(client, "M400")
+
+    def z_live_velocity(self) -> float:
+        """Current Z velocity from klippy's motion_report (planned moves only)."""
+        with httpx.Client() as client:
+            response = self._get_status(client, {
+                "objects": {"motion_report": ["live_velocity"]}
+            })
+        return float(
+            response["result"]["status"]["motion_report"]["live_velocity"]
+        )
+
+    def z_live_position(self) -> float:
+        """Current Z from klippy's motion_report (hardware frame, tracks queue)."""
+        with httpx.Client() as client:
+            response = self._get_status(client, {
+                "objects": {"motion_report": ["live_position"]}
+            })
+        return float(
+            response["result"]["status"]["motion_report"]["live_position"][2]
+        )
 
 
     def _hardware_move_absolute(
