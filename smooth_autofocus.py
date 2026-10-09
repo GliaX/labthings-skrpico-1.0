@@ -8,7 +8,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Self
+from typing import List, Literal, Optional, Self
 
 import numpy as np
 from PIL import Image
@@ -16,6 +16,11 @@ from pydantic import BaseModel, Field
 
 import labthings_fastapi as lt
 
+from .autofocus import (
+    AutofocusThing,
+    NoFocusFoundError as ScanNoFocusFoundError,
+    SharpnessDataArrays,
+)
 from .camera import BaseCamera
 from .stage import BacklashCompensation, BaseStage
 from .smooth_af_core import (
@@ -46,7 +51,7 @@ class SmoothAutofocusParams(BaseModel):
     min_r2: float = Field(default=0.5, ge=0, le=1)
     min_snr: float = Field(default=1.4, ge=1)
     min_abs_sharpness: float = Field(default=15.0, ge=0)
-    min_abs_sharpness_fast: float = Field(default=4.0, ge=0)
+    min_abs_sharpness_fast: float = Field(default=15.0, ge=0)
     fwhm_min_steps: float = Field(default=0.4, gt=0)
     fwhm_max_steps: float = Field(default=24.0, gt=0)
 
@@ -712,7 +717,11 @@ class SmoothAutofocusThing(lt.Thing):
         t0 = time.monotonic()
         self._thermal_cool_down()
         monitor = StreamSharpnessMonitor(self._cam)
-        with self._fast_stream(restore=False, mode_name="crop990") as fast, monitor:
+        session = (time.time() - getattr(self, "_last_focus_ts", 0.0)) < 60.0
+        self._last_focus_ts = time.time()
+        with self._fast_stream(
+            restore=not session, mode_name="crop990"
+        ) as fast, monitor:
             if not fast:
                 time.sleep(0.3)
             t_settle = time.monotonic()
@@ -724,11 +733,7 @@ class SmoothAutofocusThing(lt.Thing):
                     monitor,
                     params,
                     t0,
-                    min_abs=(
-                        params.min_abs_sharpness
-                        if fast
-                        else params.min_abs_sharpness_fast
-                    ),
+                    min_abs=params.min_abs_sharpness
                 )
                 LOGGER.info(
                     "AF timing: total=%.2fs mode=%s",
@@ -823,7 +828,7 @@ class SmoothAutofocusThing(lt.Thing):
             )
             mode += "small150|" + small.mode + "|"
             small_ok = small.confident and small.best_sharp >= min_abs
-            if not small_ok and small.best_sharp >= 4.0 * min_abs:
+            if not small_ok and small.best_sharp >= 2.0 * min_abs:
                 small_ok = True
                 mode += "small_argmax|"
             if small_ok:
@@ -993,15 +998,14 @@ class SmoothAutofocusThing(lt.Thing):
                 q_w2 = max(3, len(c_w) // 4)
                 w_top = statistics.fmean(p.sharpness for p in c_w[-q_w2:])
                 cur_pos = self._last_hw
-                resc = int(round(tip_anchor))
+                resc = int(round(max(c_w, key=lambda p: p.sharpness).z))
                 if w_top >= min_abs and abs(resc - cur_pos) <= params.wide_span_steps:
                     mode += f"|wide_rescue{resc}"
-                    self._timed_move_to(
-                        monitor, resc - 1.0, params.tip_velocity
-                    )
                     self._timed_move_to(monitor, float(resc), params.tip_velocity)
-                    time.sleep(0.12)
-                    vres = monitor.sharpness[-15:]
+                    time.sleep(0.25)
+                    _vm = len(monitor.sharpness)
+                    time.sleep(0.15)
+                    vres = monitor.sharpness[_vm:]
                     v_med_r = statistics.median(vres) if vres else 0.0
                     mode += f"|rescue_v{v_med_r:.0f}(min{min_abs:.0f})"
                     if v_med_r >= min_abs:
@@ -1185,3 +1189,68 @@ class SmoothAutofocusThing(lt.Thing):
             if wait > 0:
                 time.sleep(wait)
         return FollowResult(stops=stops, peaks=peaks, entries=entries)
+
+
+class SmoothCompatAutofocus(AutofocusThing):
+    """Drop-in AutofocusThing backed by the smooth autofocus engine.
+
+    Keeps the smooth module's own units and gates: dz is interpreted as the
+    total search span in stage units (not the stock stage's step semantics),
+    sweeps run at the smooth module's velocities, and acceptance is the
+    dwell-verified small-first path. Intended to be registered in place of
+    ``AutofocusThing`` so scan workflows call the smooth engine directly.
+    """
+
+    _af_params = SmoothAutofocusParams()
+
+    def _run_smooth(self, span: int) -> SharpnessDataArrays:
+        params = self._af_params.model_copy(update={"search_span_steps": span})
+        result = self.smooth_focus(params)
+        z = [pt.z for pt in result.curve]
+        s = [pt.sharpness for pt in result.curve]
+        n = len(z)
+        return SharpnessDataArrays(
+            jpeg_times=np.array(z, dtype=float),
+            jpeg_sizes=np.array(s, dtype=float),
+            focus_foms=np.array(s, dtype=float),
+            stage_times=np.zeros(n, dtype=float),
+            stage_positions=[
+                {"x": 0, "y": 0, "z": int(round(zi))} for zi in z
+            ],
+        )
+
+    @lt.action
+    def fast_autofocus(
+        self,
+        dz: int = 2000,
+        start: Literal["centre", "base"] = "centre",
+        sharpness_metric=None,
+        record=None,
+    ) -> SharpnessDataArrays:
+        """Autofocus with the smooth engine; dz = total search span (stage units)."""
+        span = max(8, min(int(dz), 192))
+        try:
+            return self._run_smooth(span)
+        except NoFocusFoundError as exc:
+            raise ScanNoFocusFoundError(str(exc)) from exc
+
+    @lt.action
+    def looping_autofocus(
+        self,
+        dz: int = 2000,
+        start: Literal["centre", "base"] = "centre",
+        sharpness_metric=None,
+        record=None,
+    ) -> tuple[list[float], list[float]]:
+        """Run the smooth engine once; it already re-verifies and re-anchors.
+
+        The stock version loops up to 10 times until the peak lands mid-window;
+        the smooth engine's own small-first/wide/verify chain does that job, so
+        a single pass is issued here.
+        """
+        try:
+            self._run_smooth(max(8, min(int(dz), 192)))
+        except NoFocusFoundError as exc:
+            raise ScanNoFocusFoundError(str(exc)) from exc
+        peaks = [float(self._stage.position["z"])]
+        return peaks, []
