@@ -26,6 +26,9 @@ class SkrPicoThing(BaseStage):
         self.speed = kwargs.get("speed", 1000)
         self.timeout = httpx.Timeout(60.0)
         self._step_time = 0.000001
+        self._client = httpx.Client(
+            base_url=self.baseurl + ":" + self.port, timeout=self.timeout
+        )
         super().__init__(thing_server_interface)
 
     def __enter__(self) -> Self:
@@ -37,17 +40,19 @@ class SkrPicoThing(BaseStage):
             _exc_value: Optional[BaseException],
             _traceback: Optional[TracebackType],
     ) -> None:
-        with httpx.Client() as client:
-            client.close()
+        client = self._client
+        client.close()
 
     # Z1 is chained to Z but still reports position data
     axis_inverted: dict[str, bool] = lt.setting(
         default_factory=lambda: {"x": True, "y": False, "z": True}, readonly=True
     )
 
-    def _send_gcode_script(self, client: httpx.Client, script: str, timeout: Optional[httpx.Timeout] = None) -> dict:
+    def _send_gcode_script(self, client: Optional[httpx.Client] = None, script: str = "", timeout: Optional[httpx.Timeout] = None) -> dict:
         """Send a gcode script to Moonraker, raising if the request fails."""
-        response = client.post(self.baseurl + ":" + self.port + "/printer/gcode/script",
+        if client is None:
+            client = self._client
+        response = client.post("/printer/gcode/script",
                                timeout=timeout or self.timeout, json={"script": script})
         response.raise_for_status()
         data = response.json()
@@ -55,10 +60,12 @@ class SkrPicoThing(BaseStage):
             raise IOError(f"Moonraker rejected script {script!r}: {data['error']}")
         return data
 
-    def _get_status(self, client: httpx.Client, payload: dict) -> dict:
+    def _get_status(self, client: Optional[httpx.Client] = None, payload: Optional[dict] = None) -> dict:
         """Query printer objects from Moonraker, raising if the request fails."""
-        response = client.post(self.baseurl + ":" + self.port + "/printer/objects/query",
-                               timeout=self.timeout, json=payload)
+        if client is None:
+            client = self._client
+        response = client.post("/printer/objects/query",
+                               timeout=self.timeout, json=payload or {})
         response.raise_for_status()
         return response.json()
 
@@ -68,22 +75,22 @@ class SkrPicoThing(BaseStage):
 
     def update_position(self) -> None:
         """Read position from the stage and set the corresponding property."""
-        with (httpx.Client() as client):
-            response = self._get_status(client, {
-                "objects": {
-                    "gcode_move": None,
-                    "toolhead": ["position", "status"]
-                }
-            })
-            self._hardware_position = dict(
-                zip(self.axis_names, response["result"]["status"]["toolhead"]["position"])
-            )
+        client = self._client
+        response = self._get_status(client, {
+            "objects": {
+                "gcode_move": None,
+                "toolhead": ["position", "status"]
+            }
+        })
+        self._hardware_position = dict(
+            zip(self.axis_names, response["result"]["status"]["toolhead"]["position"])
+        )
 
 
     def check_firmware(self) -> None:
-        with httpx.Client() as client:
-            response = client.get(self.baseurl + ":" + self.port + "/printer/info", timeout=self.timeout)
-            response.raise_for_status()
+        client = self._client
+        response = client.get("/printer/info", timeout=self.timeout)
+        response.raise_for_status()
 
     def _hardware_start_move_relative(self, displacement: Sequence[int]) -> None:
         """Start a relative move.
@@ -99,13 +106,13 @@ class SkrPicoThing(BaseStage):
     def _hardware_stop(self) -> None:
         """Stop any motion of the stage as soon as possible."""
         with self._hardware_lock:
-            with (httpx.Client() as client):
-                try:
-                    self._send_gcode_script(client, "JOG_INTERRUPT")
-                finally:
-                    self.unset_jog()
-                    self.moving = False
-                    self.update_position()
+            client = self._client
+            try:
+                self._send_gcode_script(client, "JOG_INTERRUPT")
+            finally:
+                self.unset_jog()
+                self.moving = False
+                self.update_position()
 
     def _jog_loop(self, first_command: JogCommand) -> None:
         try:
@@ -154,24 +161,24 @@ class SkrPicoThing(BaseStage):
             scale = max(abs(d) for d in displacement_axis.values()) / 600
             script = (f"JOG VALUE=1\nJOG_MOVE {jog_axes}S={self.speed * scale} F={self.acceleration * scale}\n")
 
-        with (httpx.Client() as client):
-            self.moving = True
-            try:
-                self._send_gcode_script(client, script)
-                # Raise InvocationCancelledError before starting another move
-                # if the invoking action has been cancelled.
-                lt.raise_if_cancelled()
+        client = self._client
+        self.moving = True
+        try:
+            self._send_gcode_script(client, script)
+            # Raise InvocationCancelledError before starting another move
+            # if the invoking action has been cancelled.
+            lt.raise_if_cancelled()
 
-            except lt.exceptions.InvocationCancelledError as e:
-                # If the move has been cancelled, stop it but don't handle the exception.
-                # We need the exception to propagate in order to stop any calling tasks,
-                # and to mark the invocation as "cancelled" rather than stopped.
-                self._hardware_stop()
-                raise e
+        except lt.exceptions.InvocationCancelledError as e:
+            # If the move has been cancelled, stop it but don't handle the exception.
+            # We need the exception to propagate in order to stop any calling tasks,
+            # and to mark the invocation as "cancelled" rather than stopped.
+            self._hardware_stop()
+            raise e
 
-            finally:
-                self.moving = False
-                self.update_position()
+        finally:
+            self.moving = False
+            self.update_position()
 
     def _hardware_move_relative(
         self,
@@ -197,10 +204,20 @@ class SkrPicoThing(BaseStage):
             + ("\nM400\n" if trailing_sync else "")
         )
         t_send = time.time()
-        with httpx.Client() as client:
-            self._send_gcode_script(
-                client, script, timeout=httpx.Timeout(30.0 + seconds)
-            )
+        try:
+            with open("/home/admin/openflexure-microscope-server/smooth_af_moves.log", "a") as f:
+                f.write(f"SEND steps={steps} seconds={seconds} sync={trailing_sync} t={t_send:.3f}\n")
+        except Exception:
+            pass
+        client = self._client
+        self._send_gcode_script(
+            client, script, timeout=httpx.Timeout(30.0 + seconds)
+        )
+        try:
+            with open("/home/admin/openflexure-microscope-server/smooth_af_moves.log", "a") as f:
+                f.write(f"SENT ok t={time.time():.3f}\n")
+        except Exception:
+            pass
         self.move_started_at = t_send + 0.02
         self.move_ended_at = t_send + 0.02 + seconds
 
@@ -209,25 +226,25 @@ class SkrPicoThing(BaseStage):
 
     def move_gcode_sync(self) -> None:
         """Block until the printer's motion queue is fully drained (M400)."""
-        with httpx.Client() as client:
-            self._send_gcode_script(client, "M400")
+        client = self._client
+        self._send_gcode_script(client, "M400")
 
     def z_live_velocity(self) -> float:
         """Current Z velocity from klippy's motion_report (planned moves only)."""
-        with httpx.Client() as client:
-            response = self._get_status(client, {
-                "objects": {"motion_report": ["live_velocity"]}
-            })
+        client = self._client
+        response = self._get_status(client, {
+            "objects": {"motion_report": ["live_velocity"]}
+        })
         return float(
             response["result"]["status"]["motion_report"]["live_velocity"]
         )
 
     def z_live_position(self) -> float:
         """Current Z from klippy's motion_report (hardware frame, tracks queue)."""
-        with httpx.Client() as client:
-            response = self._get_status(client, {
-                "objects": {"motion_report": ["live_position"]}
-            })
+        client = self._client
+        response = self._get_status(client, {
+            "objects": {"motion_report": ["live_position"]}
+        })
         return float(
             response["result"]["status"]["motion_report"]["live_position"][2]
         )
@@ -255,8 +272,8 @@ class SkrPicoThing(BaseStage):
         It is intended for use after manually or automatically recentring the
         stage.
         """
-        with httpx.Client() as client:
-            self._send_gcode_script(client, "SET_KINEMATIC_POSITION X=0 Y=0 Z=0 SET_HOMED=XYZ")
+        client = self._client
+        self._send_gcode_script(client, "SET_KINEMATIC_POSITION X=0 Y=0 Z=0 SET_HOMED=XYZ")
         self.update_position()
 
     def set_homed(self) -> None:
@@ -265,8 +282,8 @@ class SkrPicoThing(BaseStage):
         Klippy keeps running across microscope-server restarts, so the
         coordinate frame survives restarts, like the sangaboard's counters.
         """
-        with httpx.Client() as client:
-            self._send_gcode_script(client, "SET_KINEMATIC_POSITION SET_HOMED=XYZ")
+        client = self._client
+        self._send_gcode_script(client, "SET_KINEMATIC_POSITION SET_HOMED=XYZ")
         self.update_position()
 
     def set_jog(self) -> None:
@@ -280,8 +297,8 @@ class SkrPicoThing(BaseStage):
         self._send_jog_mode_command(False)
 
     def _send_jog_mode_command(self, enable: bool) -> None:
-        with httpx.Client() as client:
-            self._send_gcode_script(client, f"JOG VALUE={1 if enable else 0}")
+        client = self._client
+        self._send_gcode_script(client, f"JOG VALUE={1 if enable else 0}")
         self.update_position()
 
     @lt.action

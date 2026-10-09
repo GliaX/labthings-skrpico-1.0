@@ -1092,7 +1092,7 @@ class PiCameraHQ(StreamingPiCamera2):
                 bit_depth=10,
                 use_lores_as_preview=False,
                 scaler_crop=None,
-                frame_rate=120.0,
+                frame_rate=90.0,
             ),
         }
 

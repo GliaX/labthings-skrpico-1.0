@@ -2,6 +2,7 @@ import io
 import json
 import logging
 import statistics
+import subprocess
 import threading
 import time
 from contextlib import contextmanager
@@ -152,7 +153,7 @@ class StreamSharpnessMonitor:
                 self.times.append(ts.timestamp())
                 self.sharpness.append(sharp)
                 self.brightness.append(bright)
-            time.sleep(max(0.005, 0.02 - (time.monotonic() - t0)))
+            time.sleep(max(0.005, 0.025 - (time.monotonic() - t0)))
 
     def __enter__(self) -> Self:
         self.running = True
@@ -230,22 +231,41 @@ class SmoothAutofocusThing(lt.Thing):
         keep_frames: bool = False,
         poll: float = 0.02,
         sync: bool = False,
+        min_seconds: float = 0.15,
     ) -> List[tuple]:
         cur = self._last_hw
         delta_hw = int(round(target_hw - cur))
+        try:
+            Path(__file__).resolve().parents[3].joinpath(
+                "smooth_af_moves.log"
+            ).open("a").write(
+                f"move target={target_hw} cur={cur} delta={delta_hw} "
+                f"sync={sync} t={time.time():.3f}\n"
+            )
+        except Exception:
+            pass
+        self._last_move_t = [time.time(), None]
         if delta_hw == 0:
             return []
-        seconds = max(0.5, abs(delta_hw) / velocity)
+        seconds = max(min_seconds, abs(delta_hw) / velocity)
         mark = len(monitor.times)
         z_start = cur
-        self._stage.move_relative_z_timed(
-            self._hw_steps_param(delta_hw), seconds, trailing_sync=True
-        )
-        t_end = time.time()
+        if sync:
+            self._stage.move_relative_z_timed(
+                self._hw_steps_param(delta_hw), seconds, trailing_sync=True
+            )
+            t_end = time.time()
+        else:
+            self._stage.move_relative_z_timed(
+                self._hw_steps_param(delta_hw), seconds, trailing_sync=False
+            )
+            time.sleep(seconds + 0.05)
+            t_end = time.time()
         t_start = t_end - seconds
         z_end = cur + delta_hw
         traj = [(t_start, float(z_start)), (t_end, float(z_end))]
         self._last_hw = z_end
+        self._last_move_t[1] = time.time()
         if not keep_frames:
             del monitor.times[mark:]
             del monitor.sharpness[mark:]
@@ -279,11 +299,33 @@ class SmoothAutofocusThing(lt.Thing):
         velocity: float,
     ) -> List[CurvePoint]:
         cur = getattr(self, "_last_hw", None)
-        if cur is None or not (min(z_start, z_end) - 2.0 <= cur <= max(z_start, z_end) + 2.0):
+        lo = min(z_start, z_end)
+        hi = max(z_start, z_end)
+        if cur is None or not (lo - 2.0 <= cur <= hi + 2.0):
             self._timed_move_to(monitor, z_start, velocity, keep_frames=False)
             time.sleep(0.12)
+        elif cur is not None and abs(z_end - cur) < 4.0:
+            z_end = int(round(z_end + (hi - lo) * (1.0 if z_end >= z_start else -1.0)))
+        act_fps = 0.0
+        if len(monitor.times) >= 2:
+            recent = [
+                t for t in monitor.times if t >= time.time() - 1.5
+            ]
+            if len(recent) >= 2:
+                span = recent[-1] - recent[0]
+                if span > 0:
+                    act_fps = (len(recent) - 1) / span
+        span_abs = abs(z_end - z_start)
+        natural = max(0.15, span_abs / velocity)
+        seconds = natural
+        if act_fps > 1.0:
+            need = 12.0 / act_fps
+            if need > seconds and span_abs > 8:
+                seconds = need
         mark = len(monitor.times)
-        traj = self._timed_move_to(monitor, z_end, velocity, keep_frames=True)
+        traj = self._timed_move_to(
+            monitor, z_end, velocity, keep_frames=True, min_seconds=seconds
+        )
         times = monitor.times[mark:]
         points: List[CurvePoint] = []
         if len(times) < 2 or len(traj) < 2:
@@ -440,7 +482,7 @@ class SmoothAutofocusThing(lt.Thing):
             LOGGER.warning("Could not switch to fast_preview", exc_info=True)
             switched = False
         try:
-            yield switched
+            yield not switched
         finally:
             if switched and restore:
                 try:
@@ -471,6 +513,7 @@ class SmoothAutofocusThing(lt.Thing):
         timed = hasattr(self._stage, "move_relative_z_timed")
         if not timed:
             raise NoFocusFoundError("dash_focus needs move_relative_z_timed")
+        self._thermal_cool_down()
         if hasattr(self._stage, "set_homed"):
             self._stage.set_homed()
         monitor = StreamSharpnessMonitor(self._cam)
@@ -618,6 +661,45 @@ class SmoothAutofocusThing(lt.Thing):
         self._dash_stable = 0
         return traj
 
+    def _soc_temp(self) -> Optional[float]:
+        try:
+            out = subprocess.run(
+                ["vcgencmd", "measure_temp"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+            return float(out.split("=")[1].split("'")[0])
+        except Exception:
+            try:
+                raw = Path("/sys/class/thermal/thermal_zone0/temp").read_text()
+                return float(raw) / 1000.0
+            except Exception:
+                return None
+
+    def _thermal_cool_down(
+        self,
+        high: float = 78.0,
+        low: float = 75.0,
+        max_wait: float = 120.0,
+    ) -> None:
+        """If the SoC is thermally throttling, drop the camera to the low-power
+        default mode and wait for the temperature to fall before sweeping."""
+        temp = self._soc_temp()
+        if temp is None or temp < high:
+            return
+        try:
+            if self._cam.streaming_mode != "default":
+                self._cam._start_streaming("default")
+        except Exception:
+            LOGGER.warning("Cool-down mode flip failed", exc_info=True)
+            return
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline:
+            time.sleep(5.0)
+            temp = self._soc_temp()
+            if temp is None or temp <= low:
+                break
+        LOGGER.info("Thermal cool-down finished at %.1fC", temp or -1.0)
+
     @lt.action
     def smooth_focus(self, params: SmoothAutofocusParams) -> SmoothFocusResult:
         """Continuous coarse sweep, then a continuous fine sweep; parks at the peak.
@@ -628,9 +710,11 @@ class SmoothAutofocusThing(lt.Thing):
         on a wrong plane.
         """
         t0 = time.monotonic()
+        self._thermal_cool_down()
         monitor = StreamSharpnessMonitor(self._cam)
         with self._fast_stream(restore=False, mode_name="crop990") as fast, monitor:
-            time.sleep(1.5 if fast else 0.5)
+            if not fast:
+                time.sleep(0.3)
             t_settle = time.monotonic()
             LOGGER.info(
                 "AF timing: settle=%.2fs", t_settle - t0
@@ -641,9 +725,9 @@ class SmoothAutofocusThing(lt.Thing):
                     params,
                     t0,
                     min_abs=(
-                        params.min_abs_sharpness_fast
+                        params.min_abs_sharpness
                         if fast
-                        else params.min_abs_sharpness
+                        else params.min_abs_sharpness_fast
                     ),
                 )
                 LOGGER.info(
@@ -651,6 +735,15 @@ class SmoothAutofocusThing(lt.Thing):
                     time.monotonic() - t0,
                     result.mode,
                 )
+                try:
+                    Path(__file__).resolve().parents[3].joinpath(
+                        "smooth_af_moves.log"
+                    ).open("a").write(
+                        f"RUN total={time.monotonic() - t0:.2f} "
+                        f"mode={result.mode}\n"
+                    )
+                except Exception:
+                    pass
                 return result
             finally:
                 LOGGER.info(
@@ -721,7 +814,7 @@ class SmoothAutofocusThing(lt.Thing):
         if timed and abs(anchor - z0) <= 24 and anchor_fresh:
             small = self._run_search(
                 monitor,
-                anchor,
+                anchor - 4,
                 params.model_copy(update={
                     "search_span_steps": 24,
                     "coarse_velocity": params.tip_velocity,
@@ -803,6 +896,10 @@ class SmoothAutofocusThing(lt.Thing):
                 ],
                 "z_guess": round(wide.z_guess, 1),
                 "monitor_n": len(monitor.times),
+                "last_frames": [
+                    round(t, 3) for t in monitor.times[-15:]
+                ],
+                "now": round(time.time(), 3),
             }))
         except Exception:
             pass
@@ -810,7 +907,7 @@ class SmoothAutofocusThing(lt.Thing):
         attempt = wide
         if timed:
             fine_lo = int(round(wide.z_guess)) - 24
-            fine_hi = int(round(wide.z_guess)) + 24
+            fine_hi = int(round(wide.z_guess)) + 8
             _t["tip_start"] = time.time()
             fine_pts = self._sweep_timed(
                 monitor,
@@ -906,7 +1003,7 @@ class SmoothAutofocusThing(lt.Thing):
                     time.sleep(0.12)
                     vres = monitor.sharpness[-15:]
                     v_med_r = statistics.median(vres) if vres else 0.0
-                    mode += f"|rescue_v{v_med_r:.0f}"
+                    mode += f"|rescue_v{v_med_r:.0f}(min{min_abs:.0f})"
                     if v_med_r >= min_abs:
                         attempt = _Attempt(
                             float(resc), float(resc), True, float(v_med_r),
