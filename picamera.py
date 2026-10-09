@@ -470,6 +470,11 @@ class StreamingPiCamera2(BaseCamera, ABC):
         stream_config["buffer_count"] = mode_info.buffer_count
         return stream_config
 
+    def set_stream_framerate(self, fps: float) -> None:
+        """Change the live stream frame rate without reconfiguring the sensor mode."""
+        with self._streaming_picamera() as picam:
+            picam.set_controls({"FrameRate": float(fps)})
+
     def _start_streaming(self, mode: str = "default") -> None:
         """Start the MJPEG stream. This is where persistent controls are sent to camera.
 

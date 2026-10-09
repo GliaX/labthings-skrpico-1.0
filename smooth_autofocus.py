@@ -308,7 +308,7 @@ class SmoothAutofocusThing(lt.Thing):
         hi = max(z_start, z_end)
         if cur is None or not (lo - 2.0 <= cur <= hi + 2.0):
             self._timed_move_to(monitor, z_start, velocity, keep_frames=False)
-            time.sleep(0.12)
+            self._dwell(0.12)
         elif cur is not None and abs(z_end - cur) < 4.0:
             z_end = int(round(z_end + (hi - lo) * (1.0 if z_end >= z_start else -1.0)))
         act_fps = 0.0
@@ -518,7 +518,13 @@ class SmoothAutofocusThing(lt.Thing):
         timed = hasattr(self._stage, "move_relative_z_timed")
         if not timed:
             raise NoFocusFoundError("dash_focus needs move_relative_z_timed")
-        self._thermal_cool_down()
+        fps = self._thermal_framerate()
+        self._fps_cap = fps
+        if fps < 90.0:
+            try:
+                self._cam.set_stream_framerate(fps)
+            except Exception:
+                LOGGER.warning("fps cap failed", exc_info=True)
         if hasattr(self._stage, "set_homed"):
             self._stage.set_homed()
         monitor = StreamSharpnessMonitor(self._cam)
@@ -680,30 +686,31 @@ class SmoothAutofocusThing(lt.Thing):
             except Exception:
                 return None
 
-    def _thermal_cool_down(
-        self,
-        high: float = 78.0,
-        low: float = 75.0,
-        max_wait: float = 120.0,
-    ) -> None:
-        """If the SoC is thermally throttling, drop the camera to the low-power
-        default mode and wait for the temperature to fall before sweeping."""
+    _fps_cap: float = 90.0
+
+    def _dwell(self, base: float) -> None:
+        """Sleep scaled to the active fps cap so dwells collect the same
+        number of frames regardless of thermal throttling."""
+        time.sleep(base * 90.0 / self._fps_cap)
+
+    def _thermal_framerate(self, high: float = 78.0) -> float:
+        """Pick a sustainable stream fps from the SoC temperature.
+
+        Non-blocking thermal management: instead of pausing until the chip
+        cools, run the sweeps at a frame rate the thermals can sustain. The
+        adaptive sweep duration compensates automatically, so runs stay honest
+        (>=12 frames per sweep) just slower.
+        """
         temp = self._soc_temp()
-        if temp is None or temp < high:
-            return
-        try:
-            if self._cam.streaming_mode != "default":
-                self._cam._start_streaming("default")
-        except Exception:
-            LOGGER.warning("Cool-down mode flip failed", exc_info=True)
-            return
-        deadline = time.monotonic() + max_wait
-        while time.monotonic() < deadline:
-            time.sleep(5.0)
-            temp = self._soc_temp()
-            if temp is None or temp <= low:
-                break
-        LOGGER.info("Thermal cool-down finished at %.1fC", temp or -1.0)
+        if temp is None:
+            return 90.0
+        if temp < 78.0:
+            return 90.0
+        if temp < 81.0:
+            return 60.0
+        if temp < 84.0:
+            return 45.0
+        return 30.0
 
     @lt.action
     def smooth_focus(self, params: SmoothAutofocusParams) -> SmoothFocusResult:
@@ -715,13 +722,20 @@ class SmoothAutofocusThing(lt.Thing):
         on a wrong plane.
         """
         t0 = time.monotonic()
-        self._thermal_cool_down()
+        fps = self._thermal_framerate()
+        self._fps_cap = fps
         monitor = StreamSharpnessMonitor(self._cam)
         session = (time.time() - getattr(self, "_last_focus_ts", 0.0)) < 60.0
         self._last_focus_ts = time.time()
         with self._fast_stream(
             restore=not session, mode_name="crop990"
         ) as fast, monitor:
+            if fast and fps < 90.0:
+                try:
+                    self._cam.set_stream_framerate(fps)
+                    LOGGER.info("Thermal fps cap %.0f", fps)
+                except Exception:
+                    LOGGER.warning("fps cap failed", exc_info=True)
             if not fast:
                 time.sleep(0.3)
             t_settle = time.monotonic()
@@ -772,7 +786,7 @@ class SmoothAutofocusThing(lt.Thing):
                 if old_exp is not None and old_exp > 2000:
                     self._cam.exposure_time = 2000
                     self._af_exposure_sticky = True
-                    time.sleep(0.15)
+                    self._dwell(0.15)
             except Exception:
                 LOGGER.warning("Exposure cap failed; running uncapped", exc_info=True)
         return self._focus_inner(monitor, params, t0, min_abs, timed)
@@ -786,7 +800,7 @@ class SmoothAutofocusThing(lt.Thing):
         timed: bool,
     ) -> SmoothFocusResult:
         if timed:
-            time.sleep(0.12)
+            self._dwell(0.12)
             z0 = int(round(self._stage.z_live_position()))
             self._last_hw = float(z0)
         else:
@@ -840,7 +854,7 @@ class SmoothAutofocusThing(lt.Thing):
                 self._timed_move_to(
                     monitor, peak_f, params.tip_velocity, sync=True
                 )
-                time.sleep(0.12)
+                self._dwell(0.12)
                 ver = monitor.sharpness[-20:]
                 v_sm = statistics.median(ver) if ver else 0.0
                 mode += f"smallpark{v_sm:.0f}"
@@ -1002,9 +1016,9 @@ class SmoothAutofocusThing(lt.Thing):
                 if w_top >= min_abs and abs(resc - cur_pos) <= params.wide_span_steps:
                     mode += f"|wide_rescue{resc}"
                     self._timed_move_to(monitor, float(resc), params.tip_velocity)
-                    time.sleep(0.25)
+                    self._dwell(0.25)
                     _vm = len(monitor.sharpness)
-                    time.sleep(0.15)
+                    self._dwell(0.15)
                     vres = monitor.sharpness[_vm:]
                     v_med_r = statistics.median(vres) if vres else 0.0
                     mode += f"|rescue_v{v_med_r:.0f}(min{min_abs:.0f})"
@@ -1082,7 +1096,7 @@ class SmoothAutofocusThing(lt.Thing):
                 actual = self._last_hw
                 park_err = abs(actual - peak)
             mode += f"|park_err{park_err:.1f}"
-            time.sleep(0.12)
+            self._dwell(0.12)
             verify = monitor.sharpness[-20:]
             v_med = statistics.median(verify) if verify else 0.0
             near = [p for p in combined if abs(p.z - actual) < 4.0]
@@ -1109,7 +1123,7 @@ class SmoothAutofocusThing(lt.Thing):
                     self._timed_move_to(monitor, peak - 1.0, params.coarse_velocity)
                     self._timed_move_to(monitor, peak, params.coarse_velocity)
                     actual = self._last_hw
-                    time.sleep(0.12)
+                    self._dwell(0.12)
                     verify = monitor.sharpness[-20:]
                     v_med = statistics.median(verify) if verify else 0.0
                     mode += f"|reverify{v_med:.0f}"
