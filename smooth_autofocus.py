@@ -37,14 +37,13 @@ LOGGER = logging.getLogger(__name__)
 
 _FAR_SPAN = 1024.0
 _FAR_VELOCITY = 6000.0
-_FAR_MEDIAN_BAR = 1.12
+_FAR_MEDIAN_BAR = 1.25
 _NEAR_SPAN = 110.0
 _NEAR_VELOCITY = 250.0
 _TINY_SPAN = 180.0
 _TINY_VELOCITY = 700.0
-_TINY_BUDGET = 0.3
 _TINY_MIN_V = 100.0
-_PARK_VELOCITY = 3000.0
+_PARK_VELOCITY = 6000.0
 _MEDIAN_BAR = 1.6
 _EDGE_MARGIN = 0.12
 FPS = 120.0
@@ -182,16 +181,18 @@ class StreamSharpnessMonitor:
 
 
 class _EncoderBurst:
-    """Stop both MJPEG encoders for a high-fps metric burst, restore after.
+    """Throttle sensor fps for a high-fps metric burst, restore after.
 
-    The encoders (VideoCore) are the dominant heat source at high fps; during
-    the burst nobody consumes the UI stream, so they are stopped. Must be
-    entered INSIDE _fast_stream (a mode switch restarts the encoders). The
-    restore mirrors _start_streaming's encoder half: the main preview
-    recording plus the lores encoder, then the run's own fps cap.
+    The camera lives in crop990 with the encoders running at preview
+    fps; the burst raises the sensor to the metric rate and stops the
+    encoders (nobody consumes the UI stream mid-AF). Restore restarts
+    the encoders and drops back to preview fps — both live controls,
+    no reconfigure.
     """
 
-    def __init__(self, camera, fps: float, restore_fps: float = 120.0) -> None:
+    def __init__(
+        self, camera, fps: float, restore_fps: float = 20.0
+    ) -> None:
         self._cam = camera
         self.fps = float(fps)
         self.restore_fps = float(restore_fps)
@@ -563,7 +564,7 @@ class SmoothAutofocusThing(lt.Thing):
             else:
                 t_acc, d_acc = 0.0, 0.0
             sgn = 1.0 if delta >= 0 else -1.0
-            z_rel = (za - cur) * sgn
+            z_rel = min(max((za - cur) * sgn, 0.0), abs(delta))
             t_acc2 = t_acc * t_acc
             if z_rel <= d_acc:
                 tau = (2.0 * z_rel / accel) ** 0.5 if accel else 0.0
@@ -765,6 +766,23 @@ class SmoothAutofocusThing(lt.Thing):
             z_lo + _EDGE_MARGIN * span <= arg <= z_hi - _EDGE_MARGIN * span
         ):
             return None
+        if fit.fwhm is not None and fit.fwhm > 60.0 and best >= 1.6 * max(
+            s_floor, 1e-9
+        ):
+            top = sorted(pts, key=lambda q: q[2], reverse=True)
+            top_n = top[: max(2, len(top) // 5)]
+            wsum = sum(q[2] for q in top_n)
+            if wsum > 0:
+                z_fit = (
+                    sum(q[0] * q[2] for q in top_n) / wsum
+                )
+                return (
+                    FitOutcome(
+                        ok=True, peak=z_fit, fwhm=None, r2=fit.r2,
+                        snr=fit.snr
+                    ),
+                    best,
+                )
         if (fit.r2 is None or fit.r2 < 0.5) or (
             fit.snr is None or fit.snr < 1.2
         ):
@@ -776,7 +794,6 @@ class SmoothAutofocusThing(lt.Thing):
             z_fit = (
                 sum(q[0] * q[2] for q in top_n) / wsum if wsum > 0 else arg
             )
-            mode += "|argmax"
             return (
                 FitOutcome(
                     ok=True, peak=z_fit, fwhm=None, r2=fit.r2, snr=fit.snr
@@ -791,17 +808,22 @@ class SmoothAutofocusThing(lt.Thing):
         return self._stage_z()
 
     def _save_last_focus(
-        self, peak: float, static: float = 0.0, curve_top: float = 0.0
+        self, monitor: "StreamSharpnessMonitor", mark: int, peak: float
     ) -> None:
-        _log(f"SAVE anchor={peak:.1f} static={static:.0f} top={curve_top:.0f}")
+        mark2 = len(monitor.times)
+        monitor.wait_frames(4, mark2, timeout=0.5)
+        post = monitor.frames_since(mark2)[-4:]
+        focus_static = (
+            statistics.median([f[2] for f in post]) if len(post) >= 3 else 0.0
+        )
+        _log(
+            f"SAVE anchor={peak:.1f} focus_static={focus_static:.0f} "
+            f"pre_static={type(self)._SESS_STATIC:.0f}"
+        )
         type(self)._SESS_Z = float(peak)
         type(self)._SESS_TS = time.time()
-        cur_ref = type(self)._SESS_STATIC
-        if curve_top > 0:
-            if static >= 0.6 * curve_top and static >= cur_ref:
-                type(self)._SESS_STATIC = float(static)
-        elif static > 0 and static >= cur_ref:
-            type(self)._SESS_STATIC = float(static)
+        if focus_static > 0 and focus_static > type(self)._SESS_STATIC:
+            type(self)._SESS_STATIC = float(focus_static)
 
     @contextmanager
     def _fast_stream(self, restore: bool = True, mode_name: str = "fast_preview"):
@@ -827,7 +849,7 @@ class SmoothAutofocusThing(lt.Thing):
         finally:
             if switched and restore:
                 try:
-                    self._cam._start_streaming(prev_mode or "default")
+                    self._cam._start_streaming(mode_name)
                 except Exception:
                     LOGGER.warning(
                         "Could not restore streaming mode", exc_info=True
@@ -838,9 +860,9 @@ class SmoothAutofocusThing(lt.Thing):
         mode = ""
         z0 = self._last_hw
 
-        pre = monitor.frames_since(0)[-8:]
+        pre = monitor.frames_since(0)[-4:]
         static_med = (
-            statistics.median([f[2] for f in pre]) if len(pre) >= 4 else 0.0
+            statistics.median([f[2] for f in pre]) if len(pre) >= 3 else 0.0
         )
         mode += f"|static{static_med:.0f}"
 
@@ -853,8 +875,11 @@ class SmoothAutofocusThing(lt.Thing):
             d_near = 1 if type(self)._FAR_DIR == 1 else -1
             near_v = self._cal_near_velocity()
             near_mark = len(monitor.times)
-            self._sync_move(
-                monitor, z0 + d_near * _NEAR_SPAN, near_v, near_mark, labeled=False
+            traj_a, frames_a = self._sync_move(
+                monitor, z0 + d_near * _NEAR_SPAN, near_v, near_mark
+            )
+            pts_a = self._label_leg(
+                frames_a, z0, z0 + d_near * _NEAR_SPAN, traj_a, near_v
             )
             near_mark2 = len(monitor.times)
             traj, frames = self._sync_move(
@@ -870,13 +895,27 @@ class SmoothAutofocusThing(lt.Thing):
                 "c": [q[1] for q in near_pts],
                 "p": [q[3] for q in near_pts],
             })
+            gate = self._fit_gate(pts_a, static_med)
+            if gate is not None:
+                fit, best = gate
+                mode += f"|near_up{fit.peak:.1f}"
+                park_z = self._park(monitor, fit.peak, len(monitor.times))
+                mode += f"|park{park_z:.1f}"
+                self._save_last_focus(monitor, len(monitor.times), fit.peak)
+                return SmoothFocusResult(
+                    peak_z=park_z, mode=mode, fit=fit,
+                    curve=[CurvePoint(z=q[0], sharpness=q[2]) for q in pts_a],
+                    elapsed_s=time.monotonic() - t0,
+                )
+            near_pts = pts_a + near_pts
+            near_pts.sort()
             gate = self._fit_gate(near_pts, static_med)
             if gate is not None:
                 fit, best = gate
                 mode += f"|near_fit{fit.peak:.1f}"
                 park_z = self._park(monitor, fit.peak, len(monitor.times))
                 mode += f"|park{park_z:.1f}"
-                self._save_last_focus(fit.peak, static_med, best)
+                self._save_last_focus(monitor, len(monitor.times), fit.peak)
                 return SmoothFocusResult(
                     peak_z=park_z, mode=mode, fit=fit,
                     curve=[CurvePoint(z=q[0], sharpness=q[2]) for q in near_pts],
@@ -933,7 +972,11 @@ class SmoothAutofocusThing(lt.Thing):
             span_h = max(15.0, min(_TINY_SPAN, (fwhm * 1.25) if fwhm else 50.0))
             tiny_lo = max(claw_z - span_h, min(leg_a, leg_b))
             tiny_hi = min(claw_z + span_h, max(leg_a, leg_b))
-            tiny_v = max(_TINY_MIN_V, min(_TINY_VELOCITY, (tiny_hi - tiny_lo) / _TINY_BUDGET))
+            f_ref = fwhm if fwhm else 20.0
+            tiny_v = max(
+                _TINY_MIN_V,
+                min(_TINY_VELOCITY, FPS * f_ref / 5.0),
+            )
             tiny_mark = len(monitor.times)
             self._sync_move(
                 monitor, tiny_lo, _PARK_VELOCITY, tiny_mark, labeled=False
@@ -951,12 +994,36 @@ class SmoothAutofocusThing(lt.Thing):
                 "p": [q[3] for q in tiny_pts],
             })
             gate = self._fit_gate(tiny_pts)
+            if gate is None and tiny_pts:
+                s_floor_t = sorted(q[2] for q in tiny_pts)[
+                    max(0, len(tiny_pts) * 3 // 10 - 1)
+                ]
+                t_arg = max(tiny_pts, key=lambda q: q[2])
+                if (
+                    t_arg[2] >= 1.25 * max(s_floor_t, 1e-9)
+                    and abs(t_arg[0] - claw_z) <= 45.0
+                ):
+                    top_t = sorted(
+                        tiny_pts, key=lambda q: q[2], reverse=True
+                    )[: max(2, len(tiny_pts) // 5)]
+                    wsum_t = sum(q[2] for q in top_t)
+                    z_fit = (
+                        sum(q[0] * q[2] for q in top_t) / wsum_t
+                        if wsum_t > 0
+                        else t_arg[0]
+                    )
+                    mode += "|tiny_near"
+                    gate = (
+                        FitOutcome(ok=True, peak=z_fit, fwhm=None),
+                        t_arg[2],
+                    )
+                    fit, best = gate
             if gate is not None:
                 fit, best = gate
                 mode += f"|tiny_fit{fit.peak:.1f}"
                 park_z = self._park(monitor, fit.peak, len(monitor.times))
                 mode += f"|park{park_z:.1f}"
-                self._save_last_focus(fit.peak, static_med, best)
+                self._save_last_focus(monitor, len(monitor.times), fit.peak)
                 return SmoothFocusResult(
                     peak_z=park_z, mode=mode, fit=fit,
                     curve=[
@@ -970,6 +1037,86 @@ class SmoothAutofocusThing(lt.Thing):
                 "s": [q[2] for q in tiny_pts],
                 "b": [q[1] for q in tiny_pts],
             })
+            if "far2" not in mode:
+                mode += "|retryfar2"
+                far_mark2 = len(monitor.times)
+                traj2, frames2 = self._sync_move(
+                    monitor, leg_b, _FAR_VELOCITY, far_mark2
+                )
+                leg2_pts = self._label_leg(frames2, claw_z, leg_b, traj2,
+                                           _FAR_VELOCITY)
+                _dump_json("smooth_af_seekpts_far2.json", {
+                    "z": [q[0] for q in leg2_pts],
+                    "s": [q[2] for q in leg2_pts],
+                    "c": [q[1] for q in leg2_pts],
+                    "p": [q[3] for q in leg2_pts],
+                })
+                claw_z2, claw_tag2 = self._claw(leg2_pts, "far2")
+                if claw_z2 is not None:
+                    claw_z2 = self._refine_hit(leg2_pts, claw_z2)
+                mode += claw_tag2
+                if claw_z2 is not None:
+                    span_h2 = span_h
+                    t_lo2 = max(claw_z2 - span_h2, min(leg_a, leg_b))
+                    t_hi2 = min(claw_z2 + span_h2, max(leg_a, leg_b))
+                    v2 = tiny_v
+                    tm2 = len(monitor.times)
+                    self._sync_move(
+                        monitor, t_lo2, _PARK_VELOCITY, tm2, labeled=False
+                    )
+                    tm2b = len(monitor.times)
+                    traj4, frames4 = self._sync_move(
+                        monitor, t_hi2, v2, tm2b
+                    )
+                    t_pts2 = self._label_leg(frames4, t_lo2, t_hi2, traj4, v2)
+                    _dump_json("smooth_af_seekpts_tiny.json", {
+                        "z": [q[0] for q in t_pts2],
+                        "s": [q[2] for q in t_pts2],
+                        "c": [q[1] for q in t_pts2],
+                        "p": [q[3] for q in t_pts2],
+                    })
+                    gate2 = self._fit_gate(t_pts2)
+                    if gate2 is None and t_pts2:
+                        fl2 = sorted(q[2] for q in t_pts2)[
+                            max(0, len(t_pts2) * 3 // 10 - 1)
+                        ]
+                        a2 = max(t_pts2, key=lambda q: q[2])
+                        if (
+                            a2[2] >= 1.25 * max(fl2, 1e-9)
+                            and abs(a2[0] - claw_z2) <= 45.0
+                        ):
+                            tp2 = sorted(
+                                t_pts2, key=lambda q: q[2], reverse=True
+                            )[: max(2, len(t_pts2) // 5)]
+                            ws2 = sum(q[2] for q in tp2)
+                            zf2 = (
+                                sum(q[0] * q[2] for q in tp2) / ws2
+                                if ws2 > 0 else a2[0]
+                            )
+                            mode += "|tiny_near"
+                            gate2 = (
+                                FitOutcome(ok=True, peak=zf2, fwhm=None),
+                                a2[2],
+                            )
+                    if gate2 is not None:
+                        fit, best = gate2
+                        mode += f"|tiny_fit{fit.peak:.1f}"
+                        park_z = self._park(
+                            monitor, fit.peak, len(monitor.times)
+                        )
+                        mode += f"|park{park_z:.1f}"
+                        self._save_last_focus(
+                            monitor, len(monitor.times), fit.peak
+                        )
+                        return SmoothFocusResult(
+                            peak_z=park_z, mode=mode, fit=fit,
+                            curve=[
+                                CurvePoint(z=q[0], sharpness=q[2])
+                                for q in t_pts2
+                            ],
+                            elapsed_s=time.monotonic() - t0,
+                        )
+                    mode += "|tiny_fail2"
 
         mode += "|no_anchor_refuse"
         ret_mark = len(monitor.times)
@@ -1011,9 +1158,20 @@ class SmoothAutofocusThing(lt.Thing):
             with self._fast_stream(
                 restore=True, mode_name="crop990"
             ) as _fast, monitor:
+                with self._cam._streaming_picamera() as picam:
+                    picam.set_controls({"FrameRate": float(burst)})
+                _t_ramp = time.monotonic()
+                monitor.wait_frames(4, 0, timeout=2.0)
                 _log(
-                    f"SETUP mode_ready t={time.monotonic() - _t_switch:.3f}"
+                    f"SETUP ramp120 t={time.monotonic() - _t_ramp:.3f} "
+                    f"n={len(monitor.times)}"
                 )
+                if not _fast:
+                    _log(
+                        f"SETUP mode_ready t={time.monotonic() - _t_switch:.3f}"
+                    )
+                else:
+                    _log("SETUP mode_ready t=0.000 (already crop990)")
                 _t_burst = time.monotonic()
                 with _EncoderBurst(self._cam, burst):
                     _log(
@@ -1291,7 +1449,7 @@ class SmoothAutofocusThing(lt.Thing):
             pass
         near_v = self._cal_near_velocity()
         span_h = max(15.0, min(_TINY_SPAN, (fwhm * 1.25) if fwhm else _TINY_SPAN))
-        tiny_v = max(_TINY_MIN_V, min(_TINY_VELOCITY, (2 * span_h) / _TINY_BUDGET))
+        tiny_v = max(_TINY_MIN_V, min(_TINY_VELOCITY, FPS * fwhm / 5.0))
         mode += f"|fwhm{fwhm:.1f}|c{contrast:.2f}|err{sweep_err:+.1f}|b{b:.1f}"
         _log(
             f"CAL fwhm={fwhm:.1f} contrast={contrast:.2f} zpk={zpk:.1f} "
