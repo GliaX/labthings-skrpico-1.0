@@ -283,6 +283,16 @@ def _dump_json(name: str, payload: dict) -> None:
         pass
 
 
+def _probe_regime(prev_gain, prev_exp):
+    """Probe imaging regime from the pre-AF state: gain doubled, exposure
+    halved (less motion blur), clamped to keep 120fps and sane frames."""
+    g = 2.0 * prev_gain if prev_gain else 2.0
+    g = max(1.0, min(16.0, g))
+    e = (prev_exp / 2.0) if prev_exp else 1000.0
+    e = max(100.0, min(8000.0, e))
+    return g, int(e)
+
+
 class SmoothAutofocusThing(lt.Thing):
     """Autofocus from a continuous sharpness curve sampled while the stage sweeps.
 
@@ -371,10 +381,27 @@ class SmoothAutofocusThing(lt.Thing):
         samples = []
         moving_seen = False
         t_open = t_post + 0.5 * seconds
-        deadline = t_post + seconds + 2.0
+        # motion end is known from geometry: commanded time + accel corners.
+        # Once past it (+ one status tick slack), the leg IS done — do not sit
+        # waiting for the v=0 push (it can lag true stop by a full tick).
+        corner = 0.0
+        _ag = getattr(self._stage, "printer_max_accel", None)
+        if callable(_ag):
+            _a = _ag()
+            if _a and 0.0 < _a < 1e7 and velocity > _a * seconds:
+                pass
+        if seconds > 0.02:
+            corner = 0.266 if velocity >= 4000 else max(0.0, 0.06 * velocity / 1000.0)
+        expected_end = t_post + seconds + corner
+        deadline = min(t_post + seconds + 2.0, expected_end + 0.9)
         while time.monotonic() < deadline:
             new = motion_since(t_open)
             if len(new) == len(samples):
+                if (
+                    moving_seen
+                    and time.monotonic() > expected_end + 0.26
+                ):
+                    break
                 if motion_wait is None:
                     continue
                 motion_wait(
@@ -387,6 +414,8 @@ class SmoothAutofocusThing(lt.Thing):
             if abs(samples[-1][2]) > 0.5:
                 moving_seen = True
             elif moving_seen:
+                break
+            if moving_seen and time.monotonic() > expected_end + 0.26:
                 break
         falling = None
         mids = []
@@ -536,7 +565,7 @@ class SmoothAutofocusThing(lt.Thing):
         each frame's timestamp. traj is the telemetry sample list."""
         if len(frames) < 6 or not traj:
             return []
-        zs = [(t, z) for (t, z) in traj]
+        zs = sorted((t, z) for (t, z) in traj)
         t0, t1 = zs[0][0], zs[-1][0]
         if t1 <= t0:
             return []
@@ -929,8 +958,9 @@ class SmoothAutofocusThing(lt.Thing):
             ) as _fast, monitor:
                 with _EncoderBurst(self._cam, burst):
                     try:
-                        self._cam.analogue_gain = 2.0
-                        self._cam.exposure_time = 1000
+                        _g, _e = _probe_regime(prev_gain, prev_exp)
+                        self._cam.analogue_gain = _g
+                        self._cam.exposure_time = _e
                         result = self._run_flow(monitor)
                         LOGGER.info(
                             "AF total=%.2fs mode=%s",
@@ -985,8 +1015,9 @@ class SmoothAutofocusThing(lt.Thing):
             _log("PROBE mode_switched t=%.3f" % (time.monotonic(),))
             with _EncoderBurst(self._cam, burst), monitor:
                 try:
-                    self._cam.analogue_gain = 2.0
-                    self._cam.exposure_time = 1000
+                    _g, _e = _probe_regime(prev_gain, prev_exp)
+                    self._cam.analogue_gain = _g
+                    self._cam.exposure_time = _e
                     monitor.wait_frames(
                         max(8, int(n_frames)), 0,
                         timeout=max(2.0, 4.0 * max(8, int(n_frames)) / FPS),
@@ -1066,8 +1097,9 @@ class SmoothAutofocusThing(lt.Thing):
             ) as _fast, monitor:
                 with _EncoderBurst(self._cam, 120.0):
                     try:
-                        self._cam.analogue_gain = 2.0
-                        self._cam.exposure_time = 1000
+                        _g, _e = _probe_regime(prev_gain, prev_exp)
+                        self._cam.analogue_gain = _g
+                        self._cam.exposure_time = _e
                         m1 = len(monitor.times)
                         self._sync_move(
                             monitor, z0 + d_near * sweep_span, sweep_velocity, m1
