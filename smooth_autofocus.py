@@ -1,7 +1,6 @@
 import json
 import logging
 import statistics
-import subprocess
 import threading
 import time
 from contextlib import contextmanager
@@ -57,20 +56,8 @@ class NoFocusFoundError(RuntimeError):
 
 class SmoothAutofocusParams(BaseModel):
     search_span_steps: int = Field(default=32, gt=0)
-    wide_span_steps: int = Field(default=96, gt=0)
-    wide_velocity: float = Field(default=600.0, gt=0)
-    tip_velocity: float = Field(default=100.0, gt=0)
-    tip_span_steps: int = Field(default=24, gt=0)
-    coarse_velocity: float = Field(default=300.0, gt=0)
-    fine_velocity: float = Field(default=150.0, gt=0)
-    fine_span_steps: int = Field(default=3, gt=0)
-    chunk_steps: int = Field(default=1, gt=0)
     min_r2: float = Field(default=0.5, ge=0, le=1)
     min_snr: float = Field(default=1.4, ge=1)
-    min_abs_sharpness: float = Field(default=2.0, ge=0)
-    min_abs_sharpness_fast: float = Field(default=2.0, ge=0)
-    fwhm_min_steps: float = Field(default=0.4, gt=0)
-    fwhm_max_steps: float = Field(default=24.0, gt=0)
 
 
 _FOLLOW_LOG_PATH = (
