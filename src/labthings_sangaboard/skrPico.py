@@ -189,18 +189,18 @@ class SkrPicoThing(BaseStage):
         self.move_gcode(self.MovementType.RELATIVE, block_cancellation, planned=True, **kwargs)
 
     def move_relative_z_timed(
-        self, steps: int, seconds: float, trailing_sync: bool = False
+        self, steps: float, seconds: float, trailing_sync: bool = False
     ) -> None:
-        steps = int(steps)
+        steps = float(steps)
         seconds = float(seconds)
-        if steps == 0 or seconds <= 0:
+        if abs(steps) < 1e-9 or seconds <= 0:
             return
         if self.axis_inverted.get("z", False):
             steps = -steps
         speed = abs(steps) / seconds
         script = (
             "G91\n"
-            f"G1 Z{steps} S{speed:.6f} F{speed * 60.0:.3f}\n"
+            f"G1 Z{steps:.3f} S{speed:.6f} F{speed * 60.0:.3f}\n"
             + ("\nM400\n" if trailing_sync else "")
         )
         t_send = time.time()

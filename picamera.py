@@ -59,6 +59,53 @@ from . import BaseCamera, CaptureMode, StreamingMode
 from . import picamera_recalibrate_utils as recalibrate_utils
 from . import picamera_tuning_file_utils as tf_utils
 
+_AF_FRAME_STASH = None
+_AF_TSKEYS_DONE = False
+_AF_PEND = []
+_AF_ANCHOR = None
+
+
+def _frame_stash_start() -> None:
+    global _AF_FRAME_STASH, _AF_PEND, _AF_ANCHOR
+    _AF_FRAME_STASH = []
+    _AF_PEND = []
+    _AF_ANCHOR = None
+
+
+def _frame_stash_dump(path: str) -> int:
+    global _AF_FRAME_STASH
+    st = _AF_FRAME_STASH
+    _AF_FRAME_STASH = None
+    n = len(st) if st else 0
+    try:
+        with open(path + ".count", "w") as f:
+            f.write(str(n))
+        if n > 10:
+            import numpy as _np
+
+            _np.savez(
+                path,
+                ts=_np.array([t for (t, _f) in st]),
+                frames=_np.stack([f for (_t, f) in st]),
+            )
+    except Exception:
+        pass
+    return n
+
+
+def _af_emit(ts, sharp, bright, chroma, pooled, small, cb) -> None:
+    _st = _AF_FRAME_STASH
+    if _st is not None:
+        try:
+            _st.append((ts, small))
+            if len(_st) > 4096:
+                del _st[:1]
+        except Exception:
+            pass
+    cb(ts, sharp, bright, chroma, pooled)
+
+
+
 if TYPE_CHECKING:
     from libcamera import Request
 
@@ -474,6 +521,120 @@ class StreamingPiCamera2(BaseCamera, ABC):
         """Change the live stream frame rate without reconfiguring the sensor mode."""
         with self._streaming_picamera() as picam:
             picam.set_controls({"FrameRate": float(fps)})
+
+
+    def set_af_metric_hook(self, callback) -> None:
+        """Install a per-frame sharpness callback fed from the raw lores Y plane.
+
+        The callback receives ``(timestamp_s, sharpness, brightness)`` for every
+        captured frame, computed without JPEG decode. Pass ``None`` to remove.
+        """
+        self._af_metric_hook = callback
+        try:
+            with self._streaming_picamera() as picam:
+                picam.pre_callback = self._af_pre_callback
+        except Exception:
+            pass
+
+
+    def _af_pre_callback(self, request) -> None:
+        import numpy as _np
+        global _AF_TSKEYS_DONE, _AF_PEND, _AF_ANCHOR
+
+        cb = getattr(self, "_af_metric_hook", None)
+        if cb is None:
+            return
+        try:
+            arr = request.make_array("lores")
+            rows, stride = arr.shape[0], arr.shape[1]
+            y_rows = rows * 2 // 3
+            y = arr[:y_rows, :stride].astype(_np.uint8, copy=False)
+            a = y.astype(_np.int16)
+            dx = a[:, 1:] - a[:, :-1]
+            dy = a[1:, :] - a[:-1, :]
+            sharp = float((dx * dx).mean() + (dy * dy).mean())
+            bright = float(y.mean())
+            chroma = 0.0
+            pooled = 0.0
+            try:
+                c_all = arr[y_rows:, :stride].astype(_np.int16, copy=False)
+                c_rows = (rows - y_rows) // 2 * 2
+                c = c_all[:c_rows]
+                if c_rows >= 2 and stride >= 2:
+                    u = c[0::2]
+                    v = c[1::2]
+                    w_ev = stride // 2 * 2
+                    d = (v[:, :w_ev] - u[:, :w_ev])
+                    blk = 8
+                    hh = c_rows // 2 // blk * blk
+                    ww = w_ev // blk * blk
+                    if hh >= blk and ww >= blk:
+                        mb = d[:hh, :ww].reshape(
+                            hh // blk, blk, ww // blk, blk
+                        ).mean(axis=(1, 3))
+                        chroma = float(mb.std())
+                ph = y_rows // blk * blk
+                pw = stride // blk * blk
+                if ph >= blk and pw >= blk:
+                    gx = a[:ph, 1:pw] - a[:ph, : pw - 1]
+                    gy = a[1:ph, :pw] - a[: ph - 1, :pw]
+                    e = gx[: ph - 1, : pw - 1].astype(_np.int32) ** 2 + gy[
+                        : ph - 1, : pw - 1
+                    ].astype(_np.int32) ** 2
+                    gh = (ph - 1) // blk * blk
+                    gw = (pw - 1) // blk * blk
+                    eb = e[:gh, :gw].reshape(
+                        gh // blk, blk, gw // blk, blk
+                    ).mean(axis=(1, 3))
+                    pooled = float(eb.std())
+            except Exception:
+                pass
+            try:
+                _md = request.get_metadata()
+            except Exception:
+                _md = None
+            if not isinstance(_md, dict):
+                try:
+                    _md = dict(request.metadata)
+                except Exception:
+                    _md = None
+            if _md is not None and not _AF_TSKEYS_DONE:
+                try:
+                    _lines = "".join(
+                        f"{k}: {v}\n" for k, v in sorted(_md.items())
+                    )
+                    open(
+                        "/home/admin/openflexure-microscope-server/"
+                        "smooth_af_tskeys.json", "w").write(_lines)
+                except Exception:
+                    pass
+                finally:
+                    _AF_TSKEYS_DONE = True
+            _st_ns = None
+            if isinstance(_md, dict):
+                for _k in ("SensorTimestamp", "sensor_timestamp"):
+                    if _md.get(_k):
+                        _st_ns = _md[_k]
+                        break
+            if not _st_ns:
+                _AF_PEND.append(
+                    (sharp, bright, chroma, pooled, y[::8, ::8].copy())
+                )
+                return
+            ts = float(_st_ns) / 1e9
+            n_pend = len(_AF_PEND)
+            if n_pend:
+                if _AF_ANCHOR is None:
+                    step = 0.0
+                else:
+                    step = (ts - _AF_ANCHOR) / (n_pend + 1)
+                for i, (s, b, c, p, small) in enumerate(_AF_PEND):
+                    _af_emit(ts - step * (n_pend - i), s, b, c, p, small, cb)
+                _AF_PEND = []
+            _AF_ANCHOR = ts
+            _af_emit(ts, sharp, bright, chroma, pooled, y[::8, ::8].copy(), cb)
+        except Exception:
+            pass
 
     def _start_streaming(self, mode: str = "default") -> None:
         """Start the MJPEG stream. This is where persistent controls are sent to camera.
@@ -1097,7 +1258,7 @@ class PiCameraHQ(StreamingPiCamera2):
                 bit_depth=10,
                 use_lores_as_preview=False,
                 scaler_crop=None,
-                frame_rate=90.0,
+                frame_rate=120.0,
             ),
         }
 
