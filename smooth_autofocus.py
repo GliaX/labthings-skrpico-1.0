@@ -273,16 +273,6 @@ def _log(line: str) -> None:
         pass
 
 
-def _dump_json(name: str, payload: dict) -> None:
-    try:
-        with open(
-            f"/home/admin/openflexure-microscope-server/{name}", "w"
-        ) as f:
-            json.dump(payload, f)
-    except Exception:
-        pass
-
-
 def _probe_regime(prev_gain, prev_exp):
     """Probe imaging regime from the pre-AF state: gain doubled, exposure
     halved (less motion blur), clamped to keep 120fps and sane frames."""
@@ -291,6 +281,16 @@ def _probe_regime(prev_gain, prev_exp):
     e = (prev_exp / 2.0) if prev_exp else 1000.0
     e = max(100.0, min(8000.0, e))
     return g, int(e)
+
+
+def _dump_json(name: str, payload: dict) -> None:
+    try:
+        with open(
+            f"/home/admin/openflexure-microscope-server/{name}", "w"
+        ) as f:
+            json.dump(payload, f)
+    except Exception:
+        pass
 
 
 class SmoothAutofocusThing(lt.Thing):
@@ -309,6 +309,8 @@ class SmoothAutofocusThing(lt.Thing):
     _SESS_Z: Optional[float] = None
     _SESS_STATIC: float = 0.0
     _SESS_TS: float = 0.0
+    _cached_accel: Optional[float] = None
+    _leg_certified: bool = False
     _FAR_DIR: int = 1
     _CAL_FWHM: Optional[float] = None
     _CAL_CONTRAST: Optional[float] = None
@@ -321,11 +323,6 @@ class SmoothAutofocusThing(lt.Thing):
 
     def _stage_z(self) -> float:
         try:
-            if hasattr(self._stage, "update_position"):
-                self._stage.update_position()
-        except Exception:
-            pass
-        try:
             return float(self._stage.position["z"])
         except Exception:
             return float("nan")
@@ -336,21 +333,29 @@ class SmoothAutofocusThing(lt.Thing):
         target: float,
         velocity: float,
         mark: int,
+        labeled: bool = True,
     ):
         """One leg: queue the move (non-blocking POST), then wait for the
         motion_report websocket telemetry to show the motion start and
         drain. Labels come from real reported positions, not a modeled
-        window. The OFM cache is re-synced after every exit."""
+        window. The OFM cache is re-synced after every exit unless the
+        falling-edge push certified it or an unlabeled leg completed on
+        geometry (commanded target is then the truth)."""
+        self._leg_certified = False
         try:
             return self._sync_move_inner(
-                monitor, target, velocity, mark
+                monitor, target, velocity, mark, labeled
             )
         finally:
-            try:
-                if hasattr(self._stage, "update_position"):
-                    self._stage.update_position()
-            except Exception:
-                pass
+            if not self._leg_certified:
+                if not labeled:
+                    self._last_hw = target
+                else:
+                    try:
+                        if hasattr(self._stage, "update_position"):
+                            self._stage.update_position()
+                    except Exception:
+                        pass
 
     def _sync_move_inner(
         self,
@@ -358,6 +363,7 @@ class SmoothAutofocusThing(lt.Thing):
         target: float,
         velocity: float,
         mark: int,
+        labeled: bool = True,
     ):
         cur = self._last_hw
         delta = target - cur
@@ -381,31 +387,50 @@ class SmoothAutofocusThing(lt.Thing):
         samples = []
         moving_seen = False
         t_open = t_post + 0.5 * seconds
-        # motion end is known from geometry: commanded time + accel corners.
-        # Once past it (+ one status tick slack), the leg IS done — do not sit
-        # waiting for the v=0 push (it can lag true stop by a full tick).
+        # Motion end is known from geometry: commanded time + accel corners.
+        # Labeled legs give the v=0 push one status tick (~0.27s) to land
+        # for end-position certification; unlabeled legs (approach, park,
+        # return) need no push and break right at motion end.
+        accel = type(self)._cached_accel
+        if accel is None:
+            _ag = getattr(self._stage, "printer_max_accel", None)
+            if callable(_ag):
+                try:
+                    _a = _ag()
+                    if _a and 0.0 < _a < 1e7:
+                        type(self)._cached_accel = float(_a)
+                        accel = float(_a)
+                except Exception:
+                    accel = None
         corner = 0.0
-        _ag = getattr(self._stage, "printer_max_accel", None)
-        if callable(_ag):
-            _a = _ag()
-            if _a and 0.0 < _a < 1e7 and velocity > _a * seconds:
-                pass
-        if seconds > 0.02:
-            corner = 0.266 if velocity >= 4000 else max(0.0, 0.06 * velocity / 1000.0)
+        if accel and seconds > 0.0:
+            t_acc = velocity / accel
+            if velocity * t_acc < abs(delta):
+                corner = 2.0 * t_acc
+        slack = 0.27 if labeled else 0.03
         expected_end = t_post + seconds + corner
-        deadline = min(t_post + seconds + 2.0, expected_end + 0.9)
+        deadline = min(
+            t_post + seconds + 2.0,
+            expected_end + (0.9 if labeled else slack + 0.6),
+        )
         while time.monotonic() < deadline:
             new = motion_since(t_open)
             if len(new) == len(samples):
-                if (
-                    moving_seen
-                    and time.monotonic() > expected_end + 0.26
-                ):
+                if moving_seen and time.monotonic() > expected_end + slack:
                     break
                 if motion_wait is None:
                     continue
                 motion_wait(
-                    timeout=min(0.5, max(0.01, deadline - time.monotonic()))
+                    timeout=min(
+                        0.5,
+                        max(
+                            0.01,
+                            min(
+                                deadline - time.monotonic(),
+                                expected_end + slack - time.monotonic(),
+                            ),
+                        ),
+                    )
                 )
                 new = motion_since(t_open)
                 if not new:
@@ -415,8 +440,15 @@ class SmoothAutofocusThing(lt.Thing):
                 moving_seen = True
             elif moving_seen:
                 break
-            if moving_seen and time.monotonic() > expected_end + 0.26:
+            if not labeled and time.monotonic() > expected_end + slack:
                 break
+        _log(
+            f"LEG EXIT labeled={labeled} n_samples={len(samples)} "
+            f"moving_seen={moving_seen} "
+            f"last_v={samples[-1][2] if samples else None} "
+            f"waited={time.monotonic() - t_post:.3f} cmd={seconds:.3f} "
+            f"t={time.time():.3f}"
+        )
         falling = None
         mids = []
         if moving_seen and samples and abs(samples[-1][2]) < 0.5:
@@ -425,6 +457,12 @@ class SmoothAutofocusThing(lt.Thing):
             samples[-1][1] - cur
         ) > 0.5 * abs(delta):
             falling = samples[-1]
+        elif moving_seen and samples and abs(samples[-1][2]) >= 0.5:
+            _log(
+                f"LEG GEOMFALL cmd={seconds:.3f} "
+                f"last_v={samples[-1][2]:.1f} t={time.time():.3f}"
+            )
+            falling = (expected_end, cur + delta, 0.0, 0.0, None)
         if falling is None:
             return None, []
         t_fall, z_end = falling[0], falling[1]
@@ -452,18 +490,33 @@ class SmoothAutofocusThing(lt.Thing):
             return (s[0], s[1], s[2], s[3], None)
 
         slope_cmd = delta / seconds
+        _ho = getattr(self._stage, "handshake_offset", None)
+        hoff = _ho() if callable(_ho) else None
+        if hoff is not None:
+            remapped = []
+            for s in samples:
+                if len(s) > 4 and s[4] is not None:
+                    remapped.append((s[4] - hoff,) + tuple(s[1:]))
+                else:
+                    remapped.append(s)
+            samples = remapped
         mids = [
             s for s in (_s5(q) for q in samples[:-1])
             if abs(s[2]) > 0.5
             and not s[3]
+            and abs(s[1] - cur) > min(2.0, 0.02 * abs(delta))
             and abs(abs(s[2]) - abs(slope_cmd)) <= 0.05 * abs(slope_cmd)
         ]
-        accel = None
-        _ag = getattr(self._stage, "printer_max_accel", None)
-        if callable(_ag):
-            accel = _ag()
-        if accel is not None and not (0.0 < accel < 1e7):
-            accel = None
+        if not mids and samples:
+            _sps = [
+                _s5(s) for s in samples
+                if abs(s[2]) > 0.5
+                and not _s5(s)[3]
+                and abs(_s5(s)[1] - cur) > min(2.0, 0.02 * abs(delta))
+            ]
+            if _sps:
+                mids = [_sps[-1]]
+        accel = type(self)._cached_accel
 
         def _build(ts_, te_, v_abs):
             total = z_end - cur
@@ -500,43 +553,40 @@ class SmoothAutofocusThing(lt.Thing):
             return pts, frames
 
         if mids:
-            ta, za = mids[0][0], mids[0][1]
-            tb, zb = mids[-1][0], mids[-1][1]
-            slope = None
-            if len(mids) >= 2 and abs(tb - ta) > 1e-6:
-                slope = (zb - za) / (tb - ta)
-                if abs(abs(slope) - abs(slope_cmd)) > 0.05 * abs(slope_cmd):
-                    for (t, z, v, _c, _e) in mids:
-                        _log(
-                            f"MID t={t:.3f} z={z:.2f} v={v:.1f}"
-                        )
-                    _log(
-                        f"LEG SLOPEBAD slope={slope:.1f} want={slope_cmd:.1f}"
-                        f" t={time.time():.3f}"
-                    )
-                    slope = None
-                ta, za = mids[-1][0], mids[-1][1]
-                tb, zb = ta, za
-                slope = slope_cmd
+            ta, za = mids[-1][0], mids[-1][1]
+            if accel:
+                t_acc = min(velocity / accel, (abs(delta) / accel) ** 0.5)
+                d_acc = 0.5 * accel * t_acc * t_acc
             else:
-                slope = slope_cmd
-            if slope is not None:
-                t_start = ta - (za - cur) / slope
-                t_fall = tb + (z_end - zb) / slope
-                if off is not None:
-                    _log(
-                        f"LEG off={off:.4f} spr={spr:.4f} mids={len(mids)}"
-                        f" t={time.time():.3f}"
-                    )
-                return _build(t_start, t_fall, abs(slope))
+                t_acc, d_acc = 0.0, 0.0
+            sgn = 1.0 if delta >= 0 else -1.0
+            z_rel = (za - cur) * sgn
+            t_acc2 = t_acc * t_acc
+            if z_rel <= d_acc:
+                tau = (2.0 * z_rel / accel) ** 0.5 if accel else 0.0
+            elif z_rel >= abs(delta) - d_acc:
+                z_left = abs(delta) - z_rel
+                tau = (
+                    t_acc + (abs(delta) - 2.0 * d_acc) / velocity
+                    + t_acc - (2.0 * z_left / accel) ** 0.5
+                ) if accel else seconds
+                tau = min(tau, seconds + 2.0 * t_acc)
+            else:
+                tau = t_acc + (z_rel - d_acc) / velocity
+            T_total = seconds + (2.0 * t_acc if accel else 0.0)
+            t_start = min(max(ta - tau, ta - T_total), ta)
+            t_fall = t_start + T_total
+            _log(
+                f"LEG TRAPANCHOR tau={tau:.3f} T={T_total:.3f} "
+                f"t={time.time():.3f}"
+            )
+            return _build(t_start, t_fall, velocity)
         elif off is not None:
             _log(
                 f"LEG off={off:.4f} spr={spr:.4f} mids=0 t={time.time():.3f}"
             )
         t_start = None
         fall_et = falling[4] if len(falling) > 4 else None
-        _ho = getattr(self._stage, "handshake_offset", None)
-        hoff = _ho() if callable(_ho) else None
         if fall_et is not None and hoff is not None:
             t_fall = fall_et - hoff
             t_acc_extra = 2.0 * (abs(delta) / 2.0) / velocity if False else 0.0
@@ -557,6 +607,22 @@ class SmoothAutofocusThing(lt.Thing):
             f for f in monitor.frames_since(mark)
             if t_start + margin <= f[0] <= t_fall - margin
         ]
+        try:
+            _dump_json("smooth_af_legdump.json", {
+                "leg": [cur, target, velocity, seconds],
+                "mids": [[s[0], s[1], s[2], s[3], s[4]] for s in mids],
+                "samples": [
+                    [s[0], s[1], s[2], s[3],
+                     s[4] if len(s) > 4 else None] for s in samples
+                ],
+                "hoff": hoff,
+                "traj": traj,
+                "n_frames": len(frames),
+                "t0f": frames[0][0] if frames else None,
+                "tNf": frames[-1][0] if frames else None,
+            })
+        except Exception:
+            pass
         return traj, frames
 
     def _label_leg(self, frames, z_a: float, z_b: float, traj,
@@ -565,7 +631,7 @@ class SmoothAutofocusThing(lt.Thing):
         each frame's timestamp. traj is the telemetry sample list."""
         if len(frames) < 6 or not traj:
             return []
-        zs = sorted((t, z) for (t, z) in traj)
+        zs = [(t, z) for (t, z) in traj]
         t0, t1 = zs[0][0], zs[-1][0]
         if t1 <= t0:
             return []
@@ -663,7 +729,7 @@ class SmoothAutofocusThing(lt.Thing):
         250 u/s and collapses by 413 u/s -> 12 u/s per u of FWHM.
         """
         fwhm = type(self)._CAL_FWHM
-        if not fwhm:
+        if not fwhm or not type(self)._CAL_CONTRAST:
             return 250.0
         return max(150.0, min(1000.0, 12.0 * fwhm))
 
@@ -700,12 +766,26 @@ class SmoothAutofocusThing(lt.Thing):
         if (fit.r2 is None or fit.r2 < 0.5) or (
             fit.snr is None or fit.snr < 1.2
         ):
-            return None
+            if best < 1.6 * max(s_med, 1e-9):
+                return None
+            top = sorted(pts, key=lambda q: q[2], reverse=True)
+            top_n = top[: max(2, len(top) // 5)]
+            wsum = sum(q[2] for q in top_n)
+            z_fit = (
+                sum(q[0] * q[2] for q in top_n) / wsum if wsum > 0 else arg
+            )
+            mode += "|argmax"
+            return (
+                FitOutcome(
+                    ok=True, peak=z_fit, fwhm=None, r2=fit.r2, snr=fit.snr
+                ),
+                best,
+            )
         return fit, best
 
     def _park(self, monitor: StreamSharpnessMonitor, target: float, mark: int):
         """Blocking park; settled means the move returned (trailing sync)."""
-        self._sync_move(monitor, target, _PARK_VELOCITY, mark)
+        self._sync_move(monitor, target, _PARK_VELOCITY, mark, labeled=False)
         return self._stage_z()
 
     def _save_last_focus(
@@ -763,12 +843,12 @@ class SmoothAutofocusThing(lt.Thing):
         mode += f"|static{static_med:.0f}"
 
         d_near = 1 if type(self)._FAR_DIR == 1 else -1
+        near_v = self._cal_near_velocity()
         near_mark = len(monitor.times)
         self._sync_move(
-            monitor, z0 + d_near * _NEAR_SPAN, self._cal_near_velocity(), near_mark
+            monitor, z0 + d_near * _NEAR_SPAN, near_v, near_mark, labeled=False
         )
         near_mark2 = len(monitor.times)
-        near_v = self._cal_near_velocity()
         traj, frames = self._sync_move(
             monitor, z0 - d_near * _NEAR_SPAN, near_v, near_mark2
         )
@@ -840,27 +920,20 @@ class SmoothAutofocusThing(lt.Thing):
 
         if claw_z is not None:
             if "claw_far" in mode:
-                conf_mark = len(monitor.times)
-                self._sync_move(monitor, claw_z, _PARK_VELOCITY, conf_mark)
                 conf_a = max(claw_z - 60.0, min(leg_a, leg_b) - 20.0)
                 conf_b = min(claw_z + 60.0, max(leg_a, leg_b) + 20.0)
+                conf_mark = len(monitor.times)
+                self._sync_move(
+                    monitor, conf_a, _PARK_VELOCITY, conf_mark, labeled=False
+                )
                 conf_mark2 = len(monitor.times)
                 traj_c1, frames_c1 = self._sync_move(
-                    monitor, conf_a, self._cal_near_velocity(), conf_mark2
+                    monitor, conf_b, self._cal_near_velocity(), conf_mark2
                 )
-                pts_c1 = self._label_leg(
-                    frames_c1, claw_z, conf_a, traj_c1,
+                conf_pts = self._label_leg(
+                    frames_c1, conf_a, conf_b, traj_c1,
                     self._cal_near_velocity(),
                 )
-                conf_mark3 = len(monitor.times)
-                traj_c2, frames_c2 = self._sync_move(
-                    monitor, conf_b, self._cal_near_velocity(), conf_mark3
-                )
-                pts_c2 = self._label_leg(
-                    frames_c2, conf_a, conf_b, traj_c2,
-                    self._cal_near_velocity(),
-                )
-                conf_pts = pts_c1 + pts_c2
                 _dump_json("smooth_af_seekpts_confirm.json", {
                     "z": [q[0] for q in conf_pts],
                     "s": [q[2] for q in conf_pts],
@@ -877,20 +950,22 @@ class SmoothAutofocusThing(lt.Thing):
                 else:
                     mode += "|confirm_empty"
                     claw_z = None
-            fwhm = type(self)._CAL_FWHM
-            span_h = max(15.0, min(_TINY_SPAN, (fwhm * 1.25) if fwhm else _TINY_SPAN))
+            fwhm = (
+                type(self)._CAL_FWHM if type(self)._CAL_CONTRAST else None
+            )
+            span_h = max(15.0, min(_TINY_SPAN, (fwhm * 1.25) if fwhm else 50.0))
             tiny_lo = max(claw_z - span_h, min(leg_a, leg_b))
             tiny_hi = min(claw_z + span_h, max(leg_a, leg_b))
-            tiny_a = tiny_lo
-            tiny_b = tiny_hi
             tiny_v = max(_TINY_MIN_V, min(_TINY_VELOCITY, (tiny_hi - tiny_lo) / _TINY_BUDGET))
             tiny_mark = len(monitor.times)
-            self._sync_move(monitor, tiny_a, _PARK_VELOCITY, tiny_mark)
+            self._sync_move(
+                monitor, tiny_lo, _PARK_VELOCITY, tiny_mark, labeled=False
+            )
             tiny_mark2 = len(monitor.times)
             traj3, frames3 = self._sync_move(
-                monitor, tiny_b, tiny_v, tiny_mark2
+                monitor, tiny_hi, tiny_v, tiny_mark2
             )
-            tiny_pts = self._label_leg(frames3, tiny_a, tiny_b, traj3,
+            tiny_pts = self._label_leg(frames3, tiny_lo, tiny_hi, traj3,
                                        tiny_v)
             _dump_json("smooth_af_seekpts_tiny.json", {
                 "z": [q[0] for q in tiny_pts],
@@ -921,7 +996,7 @@ class SmoothAutofocusThing(lt.Thing):
 
         mode += "|no_anchor_refuse"
         ret_mark = len(monitor.times)
-        self._sync_move(monitor, z0, _PARK_VELOCITY, ret_mark)
+        self._sync_move(monitor, z0, _PARK_VELOCITY, ret_mark, labeled=False)
         mode += f"|return{self._stage_z():.1f}"
         raise NoFocusFoundError(mode)
 
@@ -948,15 +1023,25 @@ class SmoothAutofocusThing(lt.Thing):
         except Exception:
             pass
         try:
-            self._last_hw = self._stage_z()
+            if hasattr(self._stage, "update_position"):
+                self._stage.update_position()
         except Exception:
-            self._last_hw = 0.0
+            pass
+        self._last_hw = self._stage_z()
         try:
             monitor = StreamSharpnessMonitor(self._cam)
+            _t_switch = time.monotonic()
             with self._fast_stream(
                 restore=True, mode_name="crop990"
             ) as _fast, monitor:
+                _log(
+                    f"SETUP mode_ready t={time.monotonic() - _t_switch:.3f}"
+                )
+                _t_burst = time.monotonic()
                 with _EncoderBurst(self._cam, burst):
+                    _log(
+                        f"SETUP burst_ready t={time.monotonic() - _t_burst:.3f}"
+                    )
                     try:
                         _g, _e = _probe_regime(prev_gain, prev_exp)
                         self._cam.analogue_gain = _g
@@ -971,10 +1056,10 @@ class SmoothAutofocusThing(lt.Thing):
                             f"mode={result.mode}"
                         )
                         return result
-                    except NoFocusFoundError:
+                    except NoFocusFoundError as exc:
                         _log(
                             f"RUN total={time.monotonic() - t0:.2f} "
-                            f"mode=REFUSED"
+                            f"mode={exc}"
                         )
                         raise
         finally:
