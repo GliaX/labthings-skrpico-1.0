@@ -323,9 +323,12 @@ class SmoothAutofocusThing(lt.Thing):
 
     def _stage_z(self) -> float:
         try:
-            return float(self._stage.position["z"])
+            return float(self._last_hw)
         except Exception:
-            return float("nan")
+            try:
+                return float(self._stage.position["z"])
+            except Exception:
+                return float("nan")
 
     def _sync_move(
         self,
@@ -743,12 +746,11 @@ class SmoothAutofocusThing(lt.Thing):
         if not fit.ok:
             return None
         s_vals = [q[2] for q in pts]
-        s_med = statistics.median(s_vals)
+        s_sorted = sorted(s_vals)
+        s_floor = s_sorted[max(0, len(s_sorted) * 3 // 10 - 1)]
         best = max(s_vals)
         contrast = type(self)._CAL_CONTRAST
-        bar = ((contrast * 0.85) if contrast else _MEDIAN_BAR) * max(
-            s_med, 1e-9
-        )
+        bar = ((contrast * 0.85) if contrast else 1.5) * max(s_floor, 1e-9)
         if best < bar:
             return None
         cal_peak = type(self)._CAL_PEAK_SHARP
@@ -766,7 +768,7 @@ class SmoothAutofocusThing(lt.Thing):
         if (fit.r2 is None or fit.r2 < 0.5) or (
             fit.snr is None or fit.snr < 1.2
         ):
-            if best < 1.6 * max(s_med, 1e-9):
+            if best < 1.6 * max(s_floor, 1e-9):
                 return None
             top = sorted(pts, key=lambda q: q[2], reverse=True)
             top_n = top[: max(2, len(top) // 5)]
@@ -842,39 +844,45 @@ class SmoothAutofocusThing(lt.Thing):
         )
         mode += f"|static{static_med:.0f}"
 
-        d_near = 1 if type(self)._FAR_DIR == 1 else -1
-        near_v = self._cal_near_velocity()
-        near_mark = len(monitor.times)
-        self._sync_move(
-            monitor, z0 + d_near * _NEAR_SPAN, near_v, near_mark, labeled=False
-        )
-        near_mark2 = len(monitor.times)
-        traj, frames = self._sync_move(
-            monitor, z0 - d_near * _NEAR_SPAN, near_v, near_mark2
-        )
-        near_pts = self._label_leg(
-            frames, z0 + d_near * _NEAR_SPAN, z0 - d_near * _NEAR_SPAN,
-            traj, near_v
-        )
-        _dump_json("smooth_af_seekpts_near.json", {
-            "z": [q[0] for q in near_pts],
-            "s": [q[2] for q in near_pts],
-            "c": [q[1] for q in near_pts],
-            "p": [q[3] for q in near_pts],
-        })
-        gate = self._fit_gate(near_pts, static_med)
-        if gate is not None:
-            fit, best = gate
-            mode += f"|near_fit{fit.peak:.1f}"
-            park_z = self._park(monitor, fit.peak, len(monitor.times))
-            mode += f"|park{park_z:.1f}"
-            self._save_last_focus(fit.peak, static_med, best)
-            return SmoothFocusResult(
-                peak_z=park_z, mode=mode, fit=fit,
-                curve=[CurvePoint(z=q[0], sharpness=q[2]) for q in near_pts],
-                elapsed_s=time.monotonic() - t0,
+        sess_ref = type(self)._SESS_STATIC
+        if not (
+            static_med > 0 and sess_ref > 0 and static_med >= 0.7 * sess_ref
+        ):
+            mode += "|near_skip"
+        else:
+            d_near = 1 if type(self)._FAR_DIR == 1 else -1
+            near_v = self._cal_near_velocity()
+            near_mark = len(monitor.times)
+            self._sync_move(
+                monitor, z0 + d_near * _NEAR_SPAN, near_v, near_mark, labeled=False
             )
-        mode += "|near_miss"
+            near_mark2 = len(monitor.times)
+            traj, frames = self._sync_move(
+                monitor, z0 - d_near * _NEAR_SPAN, near_v, near_mark2
+            )
+            near_pts = self._label_leg(
+                frames, z0 + d_near * _NEAR_SPAN, z0 - d_near * _NEAR_SPAN,
+                traj, near_v
+            )
+            _dump_json("smooth_af_seekpts_near.json", {
+                "z": [q[0] for q in near_pts],
+                "s": [q[2] for q in near_pts],
+                "c": [q[1] for q in near_pts],
+                "p": [q[3] for q in near_pts],
+            })
+            gate = self._fit_gate(near_pts, static_med)
+            if gate is not None:
+                fit, best = gate
+                mode += f"|near_fit{fit.peak:.1f}"
+                park_z = self._park(monitor, fit.peak, len(monitor.times))
+                mode += f"|park{park_z:.1f}"
+                self._save_last_focus(fit.peak, static_med, best)
+                return SmoothFocusResult(
+                    peak_z=park_z, mode=mode, fit=fit,
+                    curve=[CurvePoint(z=q[0], sharpness=q[2]) for q in near_pts],
+                    elapsed_s=time.monotonic() - t0,
+                )
+            mode += "|near_miss"
 
         anchor = type(self)._SESS_Z
         cur = self._stage_z()
@@ -919,37 +927,6 @@ class SmoothAutofocusThing(lt.Thing):
             mode += claw_tag2
 
         if claw_z is not None:
-            if "claw_far" in mode:
-                conf_a = max(claw_z - 60.0, min(leg_a, leg_b) - 20.0)
-                conf_b = min(claw_z + 60.0, max(leg_a, leg_b) + 20.0)
-                conf_mark = len(monitor.times)
-                self._sync_move(
-                    monitor, conf_a, _PARK_VELOCITY, conf_mark, labeled=False
-                )
-                conf_mark2 = len(monitor.times)
-                traj_c1, frames_c1 = self._sync_move(
-                    monitor, conf_b, self._cal_near_velocity(), conf_mark2
-                )
-                conf_pts = self._label_leg(
-                    frames_c1, conf_a, conf_b, traj_c1,
-                    self._cal_near_velocity(),
-                )
-                _dump_json("smooth_af_seekpts_confirm.json", {
-                    "z": [q[0] for q in conf_pts],
-                    "s": [q[2] for q in conf_pts],
-                    "c": [q[1] for q in conf_pts],
-                    "p": [q[3] for q in conf_pts],
-                })
-                if conf_pts:
-                    s_best = max(q[2] for q in conf_pts)
-                    z_best = next(
-                        q[0] for q in conf_pts if q[2] == s_best
-                    )
-                    mode += f"|confirm{s_best:.0f}@{z_best:.0f}"
-                    claw_z = z_best
-                else:
-                    mode += "|confirm_empty"
-                    claw_z = None
             fwhm = (
                 type(self)._CAL_FWHM if type(self)._CAL_CONTRAST else None
             )
