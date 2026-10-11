@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import httpx
+import json
+import threading
+import asyncio
+import collections
 import time
 from types import TracebackType
 from typing import Any, Literal, Mapping, Optional, Self, Sequence
@@ -25,15 +29,64 @@ class SkrPicoThing(BaseStage):
         self.acceleration = kwargs.get("acceleration", 45000)
         self.speed = kwargs.get("speed", 1000)
         self.timeout = httpx.Timeout(60.0)
-        self._step_time = 0.000001
         self._client = httpx.Client(
             base_url=self.baseurl + ":" + self.port, timeout=self.timeout
         )
         super().__init__(thing_server_interface)
 
     def __enter__(self) -> Self:
-        self.set_homed()
+        for attempt in range(30):
+            try:
+                self.set_homed()
+                self.update_position()
+                break
+            except Exception:
+                if attempt == 29:
+                    try:
+                        with open("/home/admin/openflexure-microscope-server/smooth_af_moves.log", "a") as f:
+                            f.write("BOOTSYNC FAIL t=%.3f\n" % time.time())
+                    except Exception:
+                        pass
+                    break
+                time.sleep(2.0)
+        self.start_motion_telemetry()
+        self._load_cal()
         return self
+
+    _CAL_PATH = "/home/admin/openflexure-microscope-server/smooth_af_cal.json"
+
+    def _load_cal(self) -> None:
+        try:
+            with open(self._CAL_PATH) as f:
+                d = json.load(f)
+            from openflexure_microscope_server.things.smooth_autofocus import (
+                SmoothCompatAutofocus,
+            )
+            cls = SmoothCompatAutofocus
+            cls._CAL_FWHM = d.get("fwhm_u")
+            cls._CAL_CONTRAST = d.get("contrast")
+            cls._CAL_BACKLASH = d.get("backlash_u")
+            cls._CAL_PEAK_SHARP = d.get("peak_sharpness")
+            try:
+                with open("/home/admin/openflexure-microscope-server/smooth_af_moves.log", "a") as f:
+                    f.write("CALLOAD %s t=%.3f\n" % (d.get("contrast"), time.time()))
+            except Exception:
+                pass
+        except FileNotFoundError:
+            pass
+        except Exception:
+            try:
+                with open("/home/admin/openflexure-microscope-server/smooth_af_moves.log", "a") as f:
+                    f.write("CALLOAD FAIL t=%.3f\n" % time.time())
+            except Exception:
+                pass
+
+    def _save_cal(self, d: dict) -> None:
+        try:
+            with open(self._CAL_PATH, "w") as f:
+                json.dump(d, f)
+        except Exception:
+            pass
     def __exit__(
             self,
             _exc_type: type[BaseException],
@@ -68,6 +121,187 @@ class SkrPicoThing(BaseStage):
                                timeout=self.timeout, json=payload or {})
         response.raise_for_status()
         return response.json()
+
+    def start_motion_telemetry(self) -> None:
+        """Subscribe to motion_report over the Moonraker websocket.
+
+        Keeps a small deque of (monotonic_t, live_position_z, live_velocity)
+        samples pushed by klippy itself -- no polling, no sleeps. The
+        subscription lives for the process lifetime.
+        """
+        if getattr(self, "_motion_ws_thread", None) and self._motion_ws_thread.is_alive():
+            return
+        self._motion_samples = collections.deque(maxlen=4096)
+        self._clock_offsets = collections.deque(maxlen=64)
+        self._motion_ws_lock = threading.Lock()
+        self._motion_ws_cond = threading.Condition(self._motion_ws_lock)
+        self._motion_ws_stop = threading.Event()
+        self._motion_ws_thread = threading.Thread(
+            target=self._motion_ws_main, daemon=True, name="moonraker-motion-ws"
+        )
+        self._motion_ws_thread.start()
+
+    def _motion_ws_main(self) -> None:
+        async def _run() -> None:
+            uri = "ws://127.0.0.1:%s/websocket" % self.port
+
+            def _wlog(line: str) -> None:
+                try:
+                    with open("/home/admin/openflexure-microscope-server/smooth_af_moves.log", "a") as f:
+                        f.write("WS %s t=%.3f\n" % (line, time.time()))
+                except Exception:
+                    pass
+
+            while not self._motion_ws_stop.is_set():
+                try:
+                    import websockets
+                    async with websockets.connect(uri) as ws:
+                        _wlog("CONNECTED")
+                        sub = json.dumps({
+                            "jsonrpc": "2.0", "method": "printer.objects.subscribe",
+                            "params": {"objects": {"motion_report": None}}, "id": 1,
+                        })
+                        subscribed = False
+                        for _ in range(5):
+                            await ws.send(sub)
+                            resp = json.loads(await asyncio.wait_for(ws.recv(), 5.0))
+                            if resp.get("id") == 1 and "error" in resp:
+                                _wlog("SUBERR %s" % (resp["error"],))
+                                await asyncio.sleep(1.0)
+                                continue
+                            if resp.get("id") == 1:
+                                subscribed = True
+                                break
+                        if not subscribed:
+                            _wlog("SUBGIVEUP")
+                            continue
+                        self._et_handshake = None
+                        try:
+                            with self._motion_ws_lock:
+                                self._et_handshake = (
+                                    float(resp["result"]["eventtime"])
+                                    - time.monotonic()
+                                )
+                            _wlog("HANDSHAKE %.4f" % (self._et_handshake,))
+                        except (KeyError, TypeError, ValueError):
+                            _wlog("HANDSHAKE MISS")
+                        first = True
+                        async for raw in ws:
+                            if self._motion_ws_stop.is_set():
+                                break
+                            try:
+                                msg = json.loads(raw)
+                            except Exception:
+                                continue
+                            params = msg.get("params") or []
+                            p0 = params[0] if params else None
+                            if not isinstance(p0, dict):
+                                continue
+                            mr = p0.get("motion_report")
+                            if mr is None:
+                                st = p0.get("status")
+                                if isinstance(st, dict):
+                                    mr = st.get("motion_report")
+                            if not isinstance(mr, dict):
+                                continue
+                            lp = mr.get("live_position")
+                            if lp is None:
+                                continue
+                            et = None
+                            if len(params) > 1:
+                                try:
+                                    et = float(params[1])
+                                except (TypeError, ValueError):
+                                    et = None
+                            v_raw = mr.get("live_velocity")
+                            if v_raw is not None:
+                                v_now = float(v_raw)
+                                carried = 0.0
+                            else:
+                                v_now = getattr(self, "_motion_last_v", 0.0)
+                                carried = 1.0
+                            with self._motion_ws_lock:
+                                self._motion_last_v = v_now
+                                t_mono = time.monotonic()
+                                self._motion_samples.append(
+                                    (t_mono, float(lp[2]), v_now, carried, et)
+                                )
+                                if et is not None:
+                                    self._clock_offsets.append(et - t_mono)
+                                self._motion_ws_cond.notify_all()
+                            if first:
+                                first = False
+                                _wlog("FIRST_SAMPLE")
+                except Exception as e:
+                    _wlog("ERR %r" % (e,))
+                if self._motion_ws_stop.wait(2.0):
+                    break
+
+        asyncio.run(_run())
+
+    def motion_since(self, t0: float) -> list:
+        """Return telemetry samples with sample time > t0 (thread-safe copy)."""
+        seq = getattr(self, "_motion_samples", None)
+        if seq is None:
+            return []
+        lock = getattr(self, "_motion_ws_lock", None)
+        if lock is None:
+            return list(seq)
+        with lock:
+            return [s for s in seq if s[0] > t0]
+
+    def motion_drained(self, t_after: float) -> bool:
+        """True once live_velocity returned to 0 after being non-zero past t_after."""
+        seq = getattr(self, "_motion_samples", None)
+        if not seq:
+            return False
+        moved = any(abs(v) > 0.5 for (t, _z, v) in seq if t > t_after)
+        if not moved:
+            return False
+        last = seq[-1]
+        return last[0] > t_after and abs(last[2]) < 0.5
+
+    def motion_wait(self, timeout: float = 0.5) -> bool:
+        """Block until a new telemetry sample arrives (Condition wait)."""
+        cond = getattr(self, "_motion_ws_cond", None)
+        if cond is None:
+            time.sleep(min(timeout, 0.05))
+            return False
+        with cond:
+            cond.wait(timeout)
+        return True
+
+    def clock_offset(self):
+        """Median klippy-eventtime minus local-monotonic over recent pushes."""
+        seq = getattr(self, "_clock_offsets", None)
+        if not seq:
+            return None
+        vals = sorted(seq)
+        return vals[len(vals) // 2]
+
+    def handshake_offset(self):
+        """Klippy-eventtime minus local-monotonic from the subscribe
+        handshake -- an independent one-shot clock bridge (uncircular)."""
+        v = getattr(self, "_et_handshake", None)
+        return float(v) if v is not None else None
+
+    def clock_spread(self):
+        """Robust spread (max-median deviation) of the clock offset, seconds."""
+        seq = getattr(self, "_clock_offsets", None)
+        if not seq:
+            return None
+        vals = sorted(seq)
+        med = vals[len(vals) // 2]
+        return max(abs(v - med) for v in vals)
+
+    def printer_max_accel(self):
+        """Live accel limit from klippy's toolhead, or None."""
+        try:
+            st = self._get_status(payload={"objects": {"toolhead": None}})
+            return float(st["result"]["status"]["toolhead"]["max_accel"])
+        except Exception:
+            return None
+
 
     class MovementType(Enum):
         ABSOLUTE = "G90"
@@ -189,7 +423,7 @@ class SkrPicoThing(BaseStage):
         self.move_gcode(self.MovementType.RELATIVE, block_cancellation, planned=True, **kwargs)
 
     def move_relative_z_timed(
-        self, steps: float, seconds: float, trailing_sync: bool = False
+        self, steps: float, seconds: float
     ) -> None:
         steps = float(steps)
         seconds = float(seconds)
@@ -201,33 +435,20 @@ class SkrPicoThing(BaseStage):
         script = (
             "G91\n"
             f"G1 Z{steps:.3f} S{speed:.6f} F{speed * 60.0:.3f}\n"
-            + ("\nM400\n" if trailing_sync else "")
         )
         t_send = time.time()
         try:
             with open("/home/admin/openflexure-microscope-server/smooth_af_moves.log", "a") as f:
-                f.write(f"SEND steps={steps} seconds={seconds} sync={trailing_sync} t={t_send:.3f}\n")
+                f.write(f"SEND steps={steps} seconds={seconds} t={t_send:.3f}\n")
         except Exception:
             pass
-        client = self._client
-        self._send_gcode_script(
-            client, script, timeout=httpx.Timeout(30.0 + seconds)
-        )
+        self._send_gcode_script(self._client, script)
         try:
             with open("/home/admin/openflexure-microscope-server/smooth_af_moves.log", "a") as f:
                 f.write(f"SENT ok t={time.time():.3f}\n")
         except Exception:
             pass
-        self.move_started_at = t_send + 0.02
-        self.move_ended_at = t_send + 0.02 + seconds
 
-    move_started_at: float = 0.0
-    move_ended_at: float = 0.0
-
-    def move_gcode_sync(self) -> None:
-        """Block until the printer's motion queue is fully drained (M400)."""
-        client = self._client
-        self._send_gcode_script(client, "M400")
 
     def z_live_velocity(self) -> float:
         """Current Z velocity from klippy's motion_report (planned moves only)."""

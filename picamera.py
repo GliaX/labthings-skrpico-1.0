@@ -63,13 +63,15 @@ _AF_FRAME_STASH = None
 _AF_TSKEYS_DONE = False
 _AF_PEND = []
 _AF_ANCHOR = None
+_AF_CBTRACE_N = 0
 
 
 def _frame_stash_start() -> None:
-    global _AF_FRAME_STASH, _AF_PEND, _AF_ANCHOR
+    global _AF_FRAME_STASH, _AF_PEND, _AF_ANCHOR, _AF_CBTRACE_N
     _AF_FRAME_STASH = []
     _AF_PEND = []
     _AF_ANCHOR = None
+    _AF_CBTRACE_N = 0
 
 
 def _frame_stash_dump(path: str) -> int:
@@ -539,13 +541,15 @@ class StreamingPiCamera2(BaseCamera, ABC):
 
     def _af_pre_callback(self, request) -> None:
         import numpy as _np
-        global _AF_TSKEYS_DONE, _AF_PEND, _AF_ANCHOR
+        global _AF_TSKEYS_DONE, _AF_PEND, _AF_ANCHOR, _AF_CBTRACE_N
 
         cb = getattr(self, "_af_metric_hook", None)
         if cb is None:
             return
+        _t0 = time.monotonic()
         try:
             arr = request.make_array("lores")
+            _t1 = time.monotonic()
             rows, stride = arr.shape[0], arr.shape[1]
             y_rows = rows * 2 // 3
             y = arr[:y_rows, :stride].astype(_np.uint8, copy=False)
@@ -553,7 +557,9 @@ class StreamingPiCamera2(BaseCamera, ABC):
             dx = a[:, 1:] - a[:, :-1]
             dy = a[1:, :] - a[:-1, :]
             sharp = float((dx * dx).mean() + (dy * dy).mean())
+            small = y.copy()
             bright = float(y.mean())
+            _t2 = time.monotonic()
             chroma = 0.0
             pooled = 0.0
             try:
@@ -589,6 +595,7 @@ class StreamingPiCamera2(BaseCamera, ABC):
                     pooled = float(eb.std())
             except Exception:
                 pass
+            _t3 = time.monotonic()
             try:
                 _md = request.get_metadata()
             except Exception:
@@ -598,6 +605,19 @@ class StreamingPiCamera2(BaseCamera, ABC):
                     _md = dict(request.metadata)
                 except Exception:
                     _md = None
+            _t4 = time.monotonic()
+            if _AF_CBTRACE_N < 8:
+                try:
+                    with open(
+                        "/home/admin/openflexure-microscope-server/"
+                        "af_cb_trace.txt", "a"
+                    ) as _f:
+                        _f.write("n=%d arr=%.4f math=%.4f blk=%.4f meta=%.4f tot=%.4f\n" % (
+                            _AF_CBTRACE_N, _t1 - _t0, _t2 - _t1,
+                            _t3 - _t2, _t4 - _t3, _t4 - _t0))
+                except Exception:
+                    pass
+                _AF_CBTRACE_N += 1
             if _md is not None and not _AF_TSKEYS_DONE:
                 try:
                     _lines = "".join(
@@ -618,7 +638,7 @@ class StreamingPiCamera2(BaseCamera, ABC):
                         break
             if not _st_ns:
                 _AF_PEND.append(
-                    (sharp, bright, chroma, pooled, y[::8, ::8].copy())
+                    (sharp, bright, chroma, pooled, small)
                 )
                 return
             ts = float(_st_ns) / 1e9
@@ -632,7 +652,7 @@ class StreamingPiCamera2(BaseCamera, ABC):
                     _af_emit(ts - step * (n_pend - i), s, b, c, p, small, cb)
                 _AF_PEND = []
             _AF_ANCHOR = ts
-            _af_emit(ts, sharp, bright, chroma, pooled, y[::8, ::8].copy(), cb)
+            _af_emit(ts, sharp, bright, chroma, pooled, small, cb)
         except Exception:
             pass
 

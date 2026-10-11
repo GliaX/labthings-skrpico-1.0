@@ -37,14 +37,18 @@ from .smooth_af_core import (
 LOGGER = logging.getLogger(__name__)
 
 _FAR_SPAN = 1024.0
-_FAR_VELOCITY = 2000.0
+_FAR_VELOCITY = 6000.0
+_FAR_MEDIAN_BAR = 1.12
 _NEAR_SPAN = 110.0
-_NEAR_VELOCITY = 900.0
+_NEAR_VELOCITY = 250.0
 _TINY_SPAN = 180.0
 _TINY_VELOCITY = 700.0
+_TINY_BUDGET = 0.3
+_TINY_MIN_V = 100.0
 _PARK_VELOCITY = 3000.0
 _MEDIAN_BAR = 1.6
 _EDGE_MARGIN = 0.12
+FPS = 120.0
 
 
 class NoFocusFoundError(RuntimeError):
@@ -92,6 +96,21 @@ class MetricProbeResult:
     streaming_mode: str
     chroma: float = 0.0
     pooled: float = 0.0
+
+
+@dataclass
+class GateCalibration:
+    fwhm_u: float
+    contrast: float
+    peak_sharpness: float
+    floor_sharpness: float
+    peak_z: float
+    sweep_error_u: float
+    backlash_u: float
+    near_velocity: float
+    tiny_velocity: float
+    tiny_span: float
+    mode: str
 
 
 class FollowParams(BaseModel):
@@ -197,9 +216,11 @@ class _EncoderBurst:
                 if picam.started:
                     try:
                         picam.stop_encoder()
+                        _log("BURST stop_encoder t=%.3f" % (time.monotonic(),))
                     except Exception:
                         return self
                 _frame_stash_start()
+                _log("BURST stash_start t=%.3f" % (time.monotonic(),))
             self._stopped = True
         except Exception:
             self._stopped = False
@@ -292,14 +313,21 @@ class SmoothAutofocusThing(lt.Thing):
     _SESS_STATIC: float = 0.0
     _SESS_TS: float = 0.0
     _FAR_DIR: int = 1
-    _MOVE_LAG: float = 0.45
-    _fps_cap: float = 90.0
+    _CAL_FWHM: Optional[float] = None
+    _CAL_CONTRAST: Optional[float] = None
+    _CAL_BACKLASH: Optional[float] = None
+    _CAL_PEAK_SHARP: Optional[float] = None
 
     def _hw_steps_param(self, delta_hw):
         inv = getattr(self._stage, "axis_inverted", {}) or {}
         return -delta_hw if inv.get("z", False) else delta_hw
 
     def _stage_z(self) -> float:
+        try:
+            if hasattr(self._stage, "update_position"):
+                self._stage.update_position()
+        except Exception:
+            pass
         try:
             return float(self._stage.position["z"])
         except Exception:
@@ -312,56 +340,236 @@ class SmoothAutofocusThing(lt.Thing):
         velocity: float,
         mark: int,
     ):
-        """One blocking leg. Returns (traj, frames) with the window fully
-        closed — the move's own trailing-sync return is the happens-before."""
+        """One leg: queue the move (non-blocking POST), then wait for the
+        motion_report websocket telemetry to show the motion start and
+        drain. Labels come from real reported positions, not a modeled
+        window. The OFM cache is re-synced after every exit."""
+        try:
+            return self._sync_move_inner(
+                monitor, target, velocity, mark
+            )
+        finally:
+            try:
+                if hasattr(self._stage, "update_position"):
+                    self._stage.update_position()
+            except Exception:
+                pass
+
+    def _sync_move_inner(
+        self,
+        monitor: StreamSharpnessMonitor,
+        target: float,
+        velocity: float,
+        mark: int,
+    ):
         cur = self._last_hw
         delta = target - cur
         if abs(delta) < 0.5:
             return None, []
-        seconds = max(0.15, abs(delta) / velocity)
+        seconds = abs(delta) / velocity
         _log(
             f"move target={target:.2f} cur={cur:.2f} delta={delta:.2f} "
-            f"v={velocity:.0f} t={time.time():.3f} "
-            f"lag={type(self)._MOVE_LAG:.3f}"
+            f"v={velocity:.0f} t={time.time():.3f}"
         )
+        motion_since = getattr(self._stage, "motion_since", None)
+        drained = getattr(self._stage, "motion_drained", None)
         t_post = time.monotonic()
         self._stage.move_relative_z_timed(
-            self._hw_steps_param(int(round(delta))), seconds,
-            trailing_sync=True,
+            self._hw_steps_param(int(round(delta))), seconds
         )
-        t_ret = time.monotonic()
-        lag_sample = t_ret - t_post - seconds
-        if 0.0 < lag_sample < 2.0:
-            type(self)._MOVE_LAG = min(
-                1.0, max(0.05, 0.7 * type(self)._MOVE_LAG + 0.3 * lag_sample)
+        self._last_hw = target
+        if motion_since is None or drained is None:
+            return None, []
+        motion_wait = getattr(self._stage, "motion_wait", None)
+        samples = []
+        moving_seen = False
+        t_open = t_post + 0.5 * seconds
+        deadline = t_post + seconds + 2.0
+        while time.monotonic() < deadline:
+            new = motion_since(t_open)
+            if len(new) == len(samples):
+                if motion_wait is None:
+                    continue
+                motion_wait(
+                    timeout=min(0.5, max(0.01, deadline - time.monotonic()))
+                )
+                new = motion_since(t_open)
+                if not new:
+                    continue
+            samples = new
+            if abs(samples[-1][2]) > 0.5:
+                moving_seen = True
+            elif moving_seen:
+                break
+        falling = None
+        mids = []
+        if moving_seen and samples and abs(samples[-1][2]) < 0.5:
+            falling = samples[-1]
+        elif not moving_seen and len(samples) == 1 and abs(
+            samples[-1][1] - cur
+        ) > 0.5 * abs(delta):
+            falling = samples[-1]
+        if falling is None:
+            return None, []
+        t_fall, z_end = falling[0], falling[1]
+        if abs(z_end - (cur + delta)) > max(2.0, 0.05 * abs(delta)):
+            _log(
+                f"LEG MISMATCH end={z_end:.2f} want={cur + delta:.2f}"
+                f" delta={delta:.2f} t={time.time():.3f}"
             )
-        t_end = t_post + seconds + lag_sample
-        t_start = t_end - seconds
-        z_end = cur + delta
-        self._last_hw = z_end
-        traj = [(t_start, float(cur)), (t_end, float(z_end))]
+            return None, []
+        margin = 1.0 / FPS
+        clock_off = getattr(self._stage, "clock_offset", None)
+        clock_spread = getattr(self._stage, "clock_spread", None)
+        off = clock_off() if callable(clock_off) else None
+        spr = clock_spread() if callable(clock_spread) else None
+        if off is not None and (spr is None or spr > 0.05):
+            _log(
+                f"LEG OFFUNSTABLE off={off:.4f} spr={spr if spr is not None else -1:.4f}"
+                f" t={time.time():.3f}"
+            )
+            off = None
+
+        def _s5(s):
+            if len(s) > 4:
+                return s
+            return (s[0], s[1], s[2], s[3], None)
+
+        slope_cmd = delta / seconds
+        mids = [
+            s for s in (_s5(q) for q in samples[:-1])
+            if abs(s[2]) > 0.5
+            and not s[3]
+            and abs(abs(s[2]) - abs(slope_cmd)) <= 0.05 * abs(slope_cmd)
+        ]
+        accel = None
+        _ag = getattr(self._stage, "printer_max_accel", None)
+        if callable(_ag):
+            accel = _ag()
+        if accel is not None and not (0.0 < accel < 1e7):
+            accel = None
+
+        def _build(ts_, te_, v_abs):
+            total = z_end - cur
+            sgn = 1.0 if total >= 0 else -1.0
+            if accel:
+                t_acc = v_abs / accel
+                d_acc = 0.5 * v_abs * t_acc
+                if 2.0 * d_acc >= abs(total):
+                    t_acc = (abs(total) / accel) ** 0.5
+                    pts = [
+                        (ts_, cur),
+                        (ts_ + t_acc, cur + sgn * 0.5 * accel * t_acc * t_acc),
+                        (te_, z_end),
+                    ]
+                else:
+                    z_mc = z_end - sgn * d_acc
+                    pts = [
+                        (ts_, cur),
+                        (ts_ + t_acc, cur + sgn * d_acc),
+                        (
+                            ts_ + t_acc + (abs(total) - 2.0 * d_acc) / v_abs,
+                            z_mc,
+                        ),
+                        (te_, z_end),
+                    ]
+                ta_ = t_acc
+            else:
+                pts = [(ts_, cur), (te_, z_end)]
+                ta_ = 0.0
+            frames = [
+                f for f in monitor.frames_since(mark)
+                if ts_ + margin <= f[0] <= te_ - margin
+            ]
+            return pts, frames
+
+        if mids:
+            ta, za = mids[0][0], mids[0][1]
+            tb, zb = mids[-1][0], mids[-1][1]
+            slope = None
+            if len(mids) >= 2 and abs(tb - ta) > 1e-6:
+                slope = (zb - za) / (tb - ta)
+                if abs(abs(slope) - abs(slope_cmd)) > 0.05 * abs(slope_cmd):
+                    for (t, z, v, _c, _e) in mids:
+                        _log(
+                            f"MID t={t:.3f} z={z:.2f} v={v:.1f}"
+                        )
+                    _log(
+                        f"LEG SLOPEBAD slope={slope:.1f} want={slope_cmd:.1f}"
+                        f" t={time.time():.3f}"
+                    )
+                    slope = None
+                ta, za = mids[-1][0], mids[-1][1]
+                tb, zb = ta, za
+                slope = slope_cmd
+            else:
+                slope = slope_cmd
+            if slope is not None:
+                t_start = ta - (za - cur) / slope
+                t_fall = tb + (z_end - zb) / slope
+                if off is not None:
+                    _log(
+                        f"LEG off={off:.4f} spr={spr:.4f} mids={len(mids)}"
+                        f" t={time.time():.3f}"
+                    )
+                return _build(t_start, t_fall, abs(slope))
+        elif off is not None:
+            _log(
+                f"LEG off={off:.4f} spr={spr:.4f} mids=0 t={time.time():.3f}"
+            )
+        t_start = None
+        fall_et = falling[4] if len(falling) > 4 else None
+        _ho = getattr(self._stage, "handshake_offset", None)
+        hoff = _ho() if callable(_ho) else None
+        if fall_et is not None and hoff is not None:
+            t_fall = fall_et - hoff
+            t_acc_extra = 2.0 * (abs(delta) / 2.0) / velocity if False else 0.0
+            if accel:
+                t_acc = velocity / accel
+                d_acc = 0.5 * velocity * t_acc
+                if 2.0 * d_acc < abs(delta):
+                    t_acc_extra = 2.0 * t_acc
+            t_start = t_fall - seconds - t_acc_extra
+            _log(
+                f"LEG ETANCHOR dt={falling[0] - t_fall:.3f} "
+                f"acc={t_acc_extra:.3f} t={time.time():.3f}"
+            )
+        if t_start is None:
+            t_start = t_fall - seconds
+        traj = [(t_start, cur), (t_fall, z_end)]
         frames = [
             f for f in monitor.frames_since(mark)
-            if t_start + 0.05 * seconds <= f[0] <= t_end - 0.02
+            if t_start + margin <= f[0] <= t_fall - margin
         ]
         return traj, frames
 
     def _label_leg(self, frames, z_a: float, z_b: float, traj,
                    velocity: float = 0.0):
-        """Dead-reckoning labels over the leg span; median-filtered below 1000 u/s."""
-        if len(frames) < 6 or traj is None:
+        """Label frames by interpolating real motion_report positions at
+        each frame's timestamp. traj is the telemetry sample list."""
+        if len(frames) < 6 or not traj:
             return []
-        t0, t1 = traj[0][0], traj[-1][0]
+        zs = [(t, z) for (t, z) in traj]
+        t0, t1 = zs[0][0], zs[-1][0]
         if t1 <= t0:
             return []
-        pts = [
-            (
-                z_a + (z_b - z_a) * (t - t0) / (t1 - t0),
-                cbr, s, p,
-            )
-            for (t, cbr, s, p) in frames
-        ]
+        pts = []
+        for (t, cbr, s, p) in frames:
+            if t < t0 or t > t1:
+                continue
+            zq = zs[0][1]
+            for i in range(1, len(zs)):
+                if zs[i - 1][0] <= t <= zs[i][0]:
+                    dt = zs[i][0] - zs[i - 1][0]
+                    f = 0.0 if dt <= 0 else (t - zs[i - 1][0]) / dt
+                    zq = zs[i - 1][1] + f * (zs[i][1] - zs[i - 1][1])
+                    break
+            pts.append((zq, cbr, s, p))
         pts.sort()
+        b = type(self)._CAL_BACKLASH
+        if b:
+            shift = b if z_b > z_a else -b
+            pts = [(q[0] + shift,) + tuple(q[1:]) for q in pts]
         if velocity <= 1000.0:
             _cp = median_filter_curve(
                 [CurvePoint(z=q[0], sharpness=q[2]) for q in pts], window=3
@@ -389,7 +597,10 @@ class SmoothAutofocusThing(lt.Thing):
                 return hit, f"|claw_pool{hit:.0f}(dp{p_max - p_med:.2f}){tag}"
         s_vals = [s for (_z, _c, s, _p) in pts]
         s_med = statistics.median(s_vals)
-        bar = _MEDIAN_BAR * max(s_med, 1e-9)
+        contrast = type(self)._CAL_CONTRAST
+        bar = ((contrast * 0.85) if contrast else _MEDIAN_BAR) * max(
+            s_med, 1e-9
+        )
         above = [i for i, q in enumerate(pts) if q[2] >= bar]
         runs = []
         run = []
@@ -408,10 +619,41 @@ class SmoothAutofocusThing(lt.Thing):
                 hit = sum(pts[i][0] * pts[i][2] for i in cl) / sum(
                     pts[i][2] for i in cl)
                 return hit, f"|claw_sharp{hit:.0f}{tag}"
+        far_bar = (
+            (contrast * 0.45) if contrast else _FAR_MEDIAN_BAR
+        ) * max(s_med, 1e-9)
+        singles = [
+            pts[i] for i in range(len(pts)) if pts[i][2] >= far_bar
+        ]
+        if singles:
+            s_best = max(q[2] for q in singles)
+            z_best = next(q[0] for q in singles if q[2] == s_best)
+            return z_best, f"|claw_far{s_best:.0f}@{z_best:.0f}{tag}"
         return None, "|pooledflat" + tag
 
-    def _fit_gate(self, pts) -> Optional[tuple]:
-        """Curve-relative acceptance: gaussian fit + median bar + edge margin."""
+    def _refine_hit(self, pts, claw_z: float) -> float:
+        """Re-center a claw hit on the sharpest frame within +-60u."""
+        if not pts:
+            return claw_z
+        local = [q for q in pts if abs(q[0] - claw_z) <= 60.0]
+        if not local:
+            return claw_z
+        return max(local, key=lambda q: q[2])[0]
+
+    def _cal_near_velocity(self) -> float:
+        """Near sweep speed at the measured dynamic-hysteresis knee.
+
+        Benchmarked on the 20.7u-FWHM peak: full contrast holds to
+        250 u/s and collapses by 413 u/s -> 12 u/s per u of FWHM.
+        """
+        fwhm = type(self)._CAL_FWHM
+        if not fwhm:
+            return 250.0
+        return max(150.0, min(1000.0, 12.0 * fwhm))
+
+    def _fit_gate(self, pts, static_ref: float = 0.0) -> Optional[tuple]:
+        """Curve-relative acceptance: gaussian fit + median bar + edge margin,
+        plus an absolute bar against the static reference."""
         if len(pts) < 6:
             return None
         cp = [CurvePoint(z=q[0], sharpness=q[2]) for q in pts]
@@ -421,7 +663,16 @@ class SmoothAutofocusThing(lt.Thing):
         s_vals = [q[2] for q in pts]
         s_med = statistics.median(s_vals)
         best = max(s_vals)
-        if best < _MEDIAN_BAR * max(s_med, 1e-9):
+        contrast = type(self)._CAL_CONTRAST
+        bar = ((contrast * 0.85) if contrast else _MEDIAN_BAR) * max(
+            s_med, 1e-9
+        )
+        if best < bar:
+            return None
+        cal_peak = type(self)._CAL_PEAK_SHARP
+        if cal_peak and static_ref > 0:
+            cal_peak = min(cal_peak, 1.9 * static_ref)
+        if cal_peak and best < 0.85 * cal_peak:
             return None
         z_lo, z_hi = pts[0][0], pts[-1][0]
         arg = max(pts, key=lambda q: q[2])[0]
@@ -489,9 +740,7 @@ class SmoothAutofocusThing(lt.Thing):
         mode = ""
         z0 = self._last_hw
 
-        mark0 = len(monitor.times)
-        monitor.wait_frames(8, mark0, timeout=2.0)
-        pre = monitor.frames_since(mark0)
+        pre = monitor.frames_since(0)[-8:]
         static_med = (
             statistics.median([f[2] for f in pre]) if len(pre) >= 4 else 0.0
         )
@@ -500,15 +749,16 @@ class SmoothAutofocusThing(lt.Thing):
         d_near = 1 if type(self)._FAR_DIR == 1 else -1
         near_mark = len(monitor.times)
         self._sync_move(
-            monitor, z0 + d_near * _NEAR_SPAN, _NEAR_VELOCITY, near_mark
+            monitor, z0 + d_near * _NEAR_SPAN, self._cal_near_velocity(), near_mark
         )
         near_mark2 = len(monitor.times)
+        near_v = self._cal_near_velocity()
         traj, frames = self._sync_move(
-            monitor, z0 - d_near * _NEAR_SPAN, _NEAR_VELOCITY, near_mark2
+            monitor, z0 - d_near * _NEAR_SPAN, near_v, near_mark2
         )
         near_pts = self._label_leg(
             frames, z0 + d_near * _NEAR_SPAN, z0 - d_near * _NEAR_SPAN,
-            traj, _NEAR_VELOCITY
+            traj, near_v
         )
         _dump_json("smooth_af_seekpts_near.json", {
             "z": [q[0] for q in near_pts],
@@ -516,7 +766,7 @@ class SmoothAutofocusThing(lt.Thing):
             "c": [q[1] for q in near_pts],
             "p": [q[3] for q in near_pts],
         })
-        gate = self._fit_gate(near_pts)
+        gate = self._fit_gate(near_pts, static_med)
         if gate is not None:
             fit, best = gate
             mode += f"|near_fit{fit.peak:.1f}"
@@ -531,11 +781,12 @@ class SmoothAutofocusThing(lt.Thing):
         mode += "|near_miss"
 
         anchor = type(self)._SESS_Z
-        cur = self._last_hw
+        cur = self._stage_z()
+        if not (cur == cur):
+            cur = self._last_hw
         if anchor is not None and abs(anchor - cur) > 8.0:
             dirn = 1 if anchor > cur else -1
         else:
-            type(self)._FAR_DIR = -type(self)._FAR_DIR
             dirn = type(self)._FAR_DIR
         leg_a = cur + dirn * _FAR_SPAN
         leg_b = cur - dirn * _FAR_SPAN
@@ -550,6 +801,8 @@ class SmoothAutofocusThing(lt.Thing):
             "p": [q[3] for q in leg1_pts],
         })
         claw_z, claw_tag = self._claw(leg1_pts, "far")
+        if claw_z is not None:
+            claw_z = self._refine_hit(leg1_pts, claw_z)
         mode += claw_tag
         if claw_z is None:
             far_mark2 = len(monitor.times)
@@ -565,21 +818,64 @@ class SmoothAutofocusThing(lt.Thing):
                 "p": [q[3] for q in leg2_pts],
             })
             claw_z, claw_tag2 = self._claw(leg2_pts, "far2")
+            if claw_z is not None:
+                claw_z = self._refine_hit(leg2_pts, claw_z)
             mode += claw_tag2
 
         if claw_z is not None:
-            tiny_lo = max(claw_z - _TINY_SPAN, min(leg_a, leg_b))
-            tiny_hi = min(claw_z + _TINY_SPAN, max(leg_a, leg_b))
-            tiny_a = tiny_lo if dirn > 0 else tiny_hi
-            tiny_b = tiny_hi if dirn > 0 else tiny_lo
+            if "claw_far" in mode:
+                conf_mark = len(monitor.times)
+                self._sync_move(monitor, claw_z, _PARK_VELOCITY, conf_mark)
+                conf_a = max(claw_z - 60.0, min(leg_a, leg_b) - 20.0)
+                conf_b = min(claw_z + 60.0, max(leg_a, leg_b) + 20.0)
+                conf_mark2 = len(monitor.times)
+                traj_c1, frames_c1 = self._sync_move(
+                    monitor, conf_a, self._cal_near_velocity(), conf_mark2
+                )
+                pts_c1 = self._label_leg(
+                    frames_c1, claw_z, conf_a, traj_c1,
+                    self._cal_near_velocity(),
+                )
+                conf_mark3 = len(monitor.times)
+                traj_c2, frames_c2 = self._sync_move(
+                    monitor, conf_b, self._cal_near_velocity(), conf_mark3
+                )
+                pts_c2 = self._label_leg(
+                    frames_c2, conf_a, conf_b, traj_c2,
+                    self._cal_near_velocity(),
+                )
+                conf_pts = pts_c1 + pts_c2
+                _dump_json("smooth_af_seekpts_confirm.json", {
+                    "z": [q[0] for q in conf_pts],
+                    "s": [q[2] for q in conf_pts],
+                    "c": [q[1] for q in conf_pts],
+                    "p": [q[3] for q in conf_pts],
+                })
+                if conf_pts:
+                    s_best = max(q[2] for q in conf_pts)
+                    z_best = next(
+                        q[0] for q in conf_pts if q[2] == s_best
+                    )
+                    mode += f"|confirm{s_best:.0f}@{z_best:.0f}"
+                    claw_z = z_best
+                else:
+                    mode += "|confirm_empty"
+                    claw_z = None
+            fwhm = type(self)._CAL_FWHM
+            span_h = max(15.0, min(_TINY_SPAN, (fwhm * 1.25) if fwhm else _TINY_SPAN))
+            tiny_lo = max(claw_z - span_h, min(leg_a, leg_b))
+            tiny_hi = min(claw_z + span_h, max(leg_a, leg_b))
+            tiny_a = tiny_lo
+            tiny_b = tiny_hi
+            tiny_v = max(_TINY_MIN_V, min(_TINY_VELOCITY, (tiny_hi - tiny_lo) / _TINY_BUDGET))
             tiny_mark = len(monitor.times)
             self._sync_move(monitor, tiny_a, _PARK_VELOCITY, tiny_mark)
             tiny_mark2 = len(monitor.times)
             traj3, frames3 = self._sync_move(
-                monitor, tiny_b, _TINY_VELOCITY, tiny_mark2
+                monitor, tiny_b, tiny_v, tiny_mark2
             )
             tiny_pts = self._label_leg(frames3, tiny_a, tiny_b, traj3,
-                                       _TINY_VELOCITY)
+                                       tiny_v)
             _dump_json("smooth_af_seekpts_tiny.json", {
                 "z": [q[0] for q in tiny_pts],
                 "s": [q[2] for q in tiny_pts],
@@ -633,10 +929,13 @@ class SmoothAutofocusThing(lt.Thing):
         try:
             if hasattr(self._stage, "set_homed"):
                 self._stage.set_homed()
-            try:
-                self._last_hw = float(self._stage.position["z"])
-            except Exception:
-                self._last_hw = 0.0
+        except Exception:
+            pass
+        try:
+            self._last_hw = self._stage_z()
+        except Exception:
+            self._last_hw = 0.0
+        try:
             monitor = StreamSharpnessMonitor(self._cam)
             with self._fast_stream(
                 restore=True, mode_name="crop990"
@@ -644,9 +943,7 @@ class SmoothAutofocusThing(lt.Thing):
                 with _EncoderBurst(self._cam, burst):
                     try:
                         self._cam.analogue_gain = 2.0
-                        cur_exp = self._cam.exposure_time
-                        if cur_exp is None or cur_exp > 1000:
-                            self._cam.exposure_time = 1000
+                        self._cam.exposure_time = 1000
                         result = self._run_flow(monitor)
                         LOGGER.info(
                             "AF total=%.2fs mode=%s",
@@ -680,15 +977,14 @@ class SmoothAutofocusThing(lt.Thing):
     @lt.action
     def metric_probe(
         self,
-        dwell_s: float = 0.8,
+        n_frames: int = 100,
         burst_fps: float = 0.0,
     ) -> MetricProbeResult:
-        """Read-only: median raw-Y sharpness at the current position.
+        """Diagnostic: median raw-Y sharpness at the current position.
 
-        Calibration instrument — collects frames until the requested frame
-        budget (dwell_s at ~100fps) is met, without moving the stage.
+        Collects exactly ``n_frames`` frames without moving the stage.
         """
-        burst = float(burst_fps or 120.0)
+        burst = float(burst_fps or FPS)
         monitor = StreamSharpnessMonitor(self._cam)
         try:
             prev_gain = self._cam.analogue_gain
@@ -699,13 +995,14 @@ class SmoothAutofocusThing(lt.Thing):
         except Exception:
             prev_exp = None
         with self._fast_stream(restore=True, mode_name="crop990"):
+            _log("PROBE mode_switched t=%.3f" % (time.monotonic(),))
             with _EncoderBurst(self._cam, burst), monitor:
                 try:
                     self._cam.analogue_gain = 2.0
-                    if prev_exp is None or prev_exp > 1000:
-                        self._cam.exposure_time = 1000
+                    self._cam.exposure_time = 1000
                     monitor.wait_frames(
-                        max(8, int(dwell_s * 100)), 0, timeout=dwell_s * 2.5
+                        max(8, int(n_frames)), 0,
+                        timeout=max(2.0, 4.0 * max(8, int(n_frames)) / FPS),
                     )
                 finally:
                     try:
@@ -746,6 +1043,192 @@ class SmoothAutofocusThing(lt.Thing):
             streaming_mode=str(mode),
             chroma=chroma,
             pooled=pooled,
+        )
+
+    @lt.action
+    def calibrate_gates(
+        self, sweep_velocity: float = 80.0, sweep_span: float = 40.0
+    ) -> GateCalibration:
+        """Measure focus-curve width and contrast on the current view.
+
+        Focus the sample by eye, zero the stage there, then run this: it
+        sweeps +-40u through focus at 80 u/s inside a 120fps burst, folds
+        the frames into stage coordinates, and stores FWHM/contrast as
+        gate settings for near/tiny velocity and claw bars.
+        """
+        t0 = time.monotonic()
+        monitor = StreamSharpnessMonitor(self._cam)
+        try:
+            prev_exp = self._cam.exposure_time
+            prev_gain = self._cam.analogue_gain
+        except Exception:
+            prev_exp = prev_gain = None
+        mode = ""
+        pts = []
+        try:
+            try:
+                if hasattr(self._stage, "set_homed"):
+                    self._stage.set_homed()
+                z0 = self._stage_z()
+            except Exception:
+                z0 = self._last_hw if hasattr(self, "_last_hw") else 0.0
+            self._last_hw = z0
+            d_near = 1 if type(self)._FAR_DIR == 1 else -1
+            with self._fast_stream(
+                restore=True, mode_name="crop990"
+            ) as _fast, monitor:
+                with _EncoderBurst(self._cam, 120.0):
+                    try:
+                        self._cam.analogue_gain = 2.0
+                        self._cam.exposure_time = 1000
+                        m1 = len(monitor.times)
+                        self._sync_move(
+                            monitor, z0 + d_near * sweep_span, sweep_velocity, m1
+                        )
+                        m2 = len(monitor.times)
+                        traj_b, frames_b = self._sync_move(
+                            monitor, z0 - d_near * sweep_span, sweep_velocity, m2
+                        )
+                        pts_b = self._label_leg(
+                            frames_b,
+                            z0 + d_near * sweep_span, z0 - d_near * sweep_span,
+                            traj_b, sweep_velocity,
+                        )
+                        m3 = len(monitor.times)
+                        traj_c, frames_c = self._sync_move(
+                            monitor, z0, sweep_velocity, m3
+                        )
+                        pts_c = self._label_leg(
+                            frames_c,
+                            z0 - d_near * sweep_span, z0,
+                            traj_c, sweep_velocity,
+                        )
+                        mode = f"|cal nb={len(pts_b)} nc={len(pts_c)}"
+                    except NoFocusFoundError:
+                        raise
+                    except Exception:
+                        try:
+                            mrec = len(monitor.times)
+                            self._sync_move(monitor, z0, 300.0, mrec)
+                            _log(
+                                f"RECOVER to {z0:.1f} t={time.time():.3f}"
+                            )
+                        except Exception:
+                            _log(
+                                f"RECOVER FAILED t={time.time():.3f}"
+                            )
+                        raise
+        finally:
+            try:
+                if prev_exp is not None:
+                    self._cam.exposure_time = int(prev_exp)
+                if prev_gain is not None:
+                    self._cam.analogue_gain = prev_gain
+            except Exception:
+                LOGGER.warning("Exposure/gain restore failed", exc_info=True)
+            try:
+                if hasattr(self._stage, "update_position"):
+                    self._stage.update_position()
+            except Exception:
+                LOGGER.warning("Stage position sync failed", exc_info=True)
+        if len(pts_b) < 8 or len(pts_c) < 8:
+            raise NoFocusFoundError("cal: too few frames" + mode)
+
+        def _leg_centroid(points):
+            zs = [q[0] for q in points]
+            lo, hi = min(zs), max(zs)
+            span = hi - lo
+            inner = [
+                q for q in points
+                if lo + 0.1 * span <= q[0] <= hi - 0.1 * span
+            ]
+            if len(inner) < 4:
+                return None
+            ss = sorted((q[2] for q in inner), reverse=True)
+            bar = ss[max(0, len(ss) // 4)]
+            top = [q for q in inner if q[2] >= bar]
+            wsum = sum(q[2] for q in top)
+            if wsum <= 0:
+                return None
+            return sum(q[0] * q[2] for q in top) / wsum
+
+        cb = _leg_centroid(pts_b)
+        cc = _leg_centroid(pts_c)
+        if cb is None or cc is None:
+            raise NoFocusFoundError("cal: no inner frames" + mode)
+        sweep_raw = float(cb) - float(cc)
+        b = abs(sweep_raw) / 2.0
+        d_near = 1 if type(self)._FAR_DIR == 1 else -1
+        if b > 0.25:
+            pts_b = (
+                [(q[0] - b,) + tuple(q[1:]) for q in pts_b]
+                if d_near == 1
+                else [(q[0],) + tuple(q[1:]) for q in pts_b]
+            )
+            pts_c = (
+                [(q[0],) + tuple(q[1:]) for q in pts_c]
+                if d_near == 1
+                else [(q[0] + b,) + tuple(q[1:]) for q in pts_c]
+            )
+        cb = _leg_centroid(pts_b)
+        cc = _leg_centroid(pts_c)
+        zb, zc = float(cb), float(cc)
+        sweep_err = zb - zc
+        zpk = (zb + zc) / 2.0
+        merged = (
+            [(q[0] - sweep_err / 2.0, q[2]) for q in pts_b]
+            + [(q[0] + sweep_err / 2.0, q[2]) for q in pts_c]
+        )
+        merged.sort()
+        az = np.array([q[0] for q in merged])
+        as_ = np.array([q[1] for q in merged])
+        pk = float(as_.max())
+        far_mask = np.abs(az - zpk) > 30.0
+        floor = (
+            float(np.median(as_[far_mask]))
+            if int(far_mask.sum()) >= 6
+            else float(np.median(as_))
+        )
+        contrast = pk / max(floor, 1e-9)
+        half = floor + (pk - floor) / 2.0
+        above = az[as_ >= half]
+        fwhm = float(above.max() - above.min()) if len(above) >= 2 else 0.0
+        type(self)._CAL_FWHM = fwhm if fwhm > 0 else None
+        type(self)._CAL_CONTRAST = contrast if contrast > 1.05 else None
+        type(self)._CAL_BACKLASH = b if contrast > 1.05 else None
+        type(self)._CAL_PEAK_SHARP = pk if contrast > 1.05 else None
+        try:
+            save = getattr(self._stage, "_save_cal", None)
+            if callable(save):
+                save({
+                    "fwhm_u": type(self)._CAL_FWHM,
+                    "contrast": type(self)._CAL_CONTRAST,
+                    "backlash_u": type(self)._CAL_BACKLASH,
+                    "peak_sharpness": type(self)._CAL_PEAK_SHARP,
+                })
+        except Exception:
+            pass
+        near_v = self._cal_near_velocity()
+        span_h = max(15.0, min(_TINY_SPAN, (fwhm * 1.25) if fwhm else _TINY_SPAN))
+        tiny_v = max(_TINY_MIN_V, min(_TINY_VELOCITY, (2 * span_h) / _TINY_BUDGET))
+        mode += f"|fwhm{fwhm:.1f}|c{contrast:.2f}|err{sweep_err:+.1f}|b{b:.1f}"
+        _log(
+            f"CAL fwhm={fwhm:.1f} contrast={contrast:.2f} zpk={zpk:.1f} "
+            f"err={sweep_err:+.1f} b={b:.1f} near_v={near_v:.0f} "
+            f"tiny_span={2 * span_h:.0f} tiny_v={tiny_v:.0f}"
+        )
+        return GateCalibration(
+            fwhm_u=round(fwhm, 1),
+            contrast=round(contrast, 3),
+            peak_sharpness=round(pk, 1),
+            floor_sharpness=round(floor, 1),
+            peak_z=round(zpk, 1),
+            sweep_error_u=round(sweep_err, 1),
+            backlash_u=round(b, 1),
+            near_velocity=round(near_v, 0),
+            tiny_velocity=round(tiny_v, 0),
+            tiny_span=round(2 * span_h, 0),
+            mode=mode,
         )
 
     @lt.action
