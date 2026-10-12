@@ -42,11 +42,6 @@ class SkrPicoThing(BaseStage):
                 break
             except Exception:
                 if attempt == 29:
-                    try:
-                        with open("/home/admin/openflexure-microscope-server/smooth_af_moves.log", "a") as f:
-                            f.write("BOOTSYNC FAIL t=%.3f\n" % time.time())
-                    except Exception:
-                        pass
                     break
                 time.sleep(2.0)
         self.start_motion_telemetry()
@@ -54,32 +49,30 @@ class SkrPicoThing(BaseStage):
         return self
 
     _CAL_PATH = "/home/admin/openflexure-microscope-server/smooth_af_cal.json"
+    MOVES_LOG = "/home/admin/openflexure-microscope-server/smooth_af_moves.log"
 
     def _load_cal(self) -> None:
         try:
             with open(self._CAL_PATH) as f:
                 d = json.load(f)
+        except Exception:
+            return
+        try:
             from openflexure_microscope_server.things.smooth_autofocus import (
                 SmoothCompatAutofocus,
             )
-            cls = SmoothCompatAutofocus
-            cls._CAL_FWHM = d.get("fwhm_u")
-            cls._CAL_CONTRAST = d.get("contrast")
-            cls._CAL_BACKLASH = d.get("backlash_u")
-            cls._CAL_PEAK_SHARP = d.get("peak_sharpness")
-            try:
-                with open("/home/admin/openflexure-microscope-server/smooth_af_moves.log", "a") as f:
-                    f.write("CALLOAD %s t=%.3f\n" % (d.get("contrast"), time.time()))
-            except Exception:
-                pass
-        except FileNotFoundError:
-            pass
         except Exception:
-            try:
-                with open("/home/admin/openflexure-microscope-server/smooth_af_moves.log", "a") as f:
-                    f.write("CALLOAD FAIL t=%.3f\n" % time.time())
-            except Exception:
-                pass
+            return
+        cls = SmoothCompatAutofocus
+        for attr, key in (
+            ("_CAL_FWHM", "fwhm_u"),
+            ("_CAL_CONTRAST", "contrast"),
+            ("_CAL_BACKLASH", "backlash_u"),
+            ("_CAL_PEAK_SHARP", "peak_sharpness"),
+            ("_CAL_ACCEL", "accel"),
+        ):
+            if d.get(key) is not None:
+                setattr(cls, attr, d[key])
 
     def _save_cal(self, d: dict) -> None:
         try:
@@ -147,7 +140,7 @@ class SkrPicoThing(BaseStage):
 
             def _wlog(line: str) -> None:
                 try:
-                    with open("/home/admin/openflexure-microscope-server/smooth_af_moves.log", "a") as f:
+                    with open(self.MOVES_LOG, "a") as f:
                         f.write("WS %s t=%.3f\n" % (line, time.time()))
                 except Exception:
                     pass
@@ -205,8 +198,14 @@ class SkrPicoThing(BaseStage):
                             if not isinstance(mr, dict):
                                 continue
                             lp = mr.get("live_position")
+                            lz = getattr(self, "_motion_last_z", None)
                             if lp is None:
-                                continue
+                                if lz is None:
+                                    continue
+                                lp = [0.0, 0.0, lz]
+                                zcar = 2.0
+                            else:
+                                zcar = 0.0
                             et = None
                             if len(params) > 1:
                                 try:
@@ -222,10 +221,13 @@ class SkrPicoThing(BaseStage):
                                 carried = 1.0
                             with self._motion_ws_lock:
                                 self._motion_last_v = v_now
+                                if zcar == 0.0:
+                                    try:
+                                        self._motion_last_z = float(lp[2])
+                                    except Exception:
+                                        pass
                                 t_mono = time.monotonic()
-                                self._motion_samples.append(
-                                    (t_mono, float(lp[2]), v_now, carried, et)
-                                )
+                                self._motion_samples.append((self._stamp_for(et), float(lp[2]), v_now, carried or zcar, et))
                                 if et is not None:
                                     self._clock_offsets.append(et - t_mono)
                                 self._motion_ws_cond.notify_all()
@@ -238,6 +240,12 @@ class SkrPicoThing(BaseStage):
                     break
 
         asyncio.run(_run())
+
+    def _stamp_for(self, et) -> float:
+        h = getattr(self, "_et_handshake", None)
+        if et is not None and h is not None:
+            return et - h
+        return time.monotonic()
 
     def motion_since(self, t0: float) -> list:
         """Return telemetry samples with sample time > t0 (thread-safe copy)."""
@@ -265,7 +273,6 @@ class SkrPicoThing(BaseStage):
         """Block until a new telemetry sample arrives (Condition wait)."""
         cond = getattr(self, "_motion_ws_cond", None)
         if cond is None:
-            time.sleep(min(timeout, 0.05))
             return False
         with cond:
             cond.wait(timeout)
@@ -438,13 +445,13 @@ class SkrPicoThing(BaseStage):
         )
         t_send = time.time()
         try:
-            with open("/home/admin/openflexure-microscope-server/smooth_af_moves.log", "a") as f:
+            with open(self.MOVES_LOG, "a") as f:
                 f.write(f"SEND steps={steps} seconds={seconds} t={t_send:.3f}\n")
         except Exception:
             pass
         self._send_gcode_script(self._client, script)
         try:
-            with open("/home/admin/openflexure-microscope-server/smooth_af_moves.log", "a") as f:
+            with open(self.MOVES_LOG, "a") as f:
                 f.write(f"SENT ok t={time.time():.3f}\n")
         except Exception:
             pass
