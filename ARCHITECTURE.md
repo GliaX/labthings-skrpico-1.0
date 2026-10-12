@@ -1,0 +1,148 @@
+# Smooth Autofocus — Architecture & Implementation
+
+Scope x-003 · OFM server (openflexure-microscope-server) + Kalico/Klippy stage
+over Moonraker · fully event-driven chain; validated end-to-end from blur:
+far legs at 9000 u/s, park on peak, zero sleeps / M400 / clock-based waits
+anywhere in the motion path.
+
+## What it does
+
+`smooth_focus` acquires focus from an arbitrary starting defocus:
+
+1. **near** — ±110u sweep at the calibrated knee velocity; if the sample's
+   focus is inside, fit + park directly (rarely taken at high mag).
+2. **far** — on near-miss, ±1024u legs at **9000 u/s** when
+   `smooth_af_cal.json["accel"]` exists, **6000 u/s** otherwise (the
+   calibration run). A strong leg-1 hit (≥1.35× leg median) skips leg 2
+   (`|far1_skip`); weak hits run both + widen tiny (`|tiny_wide`).
+3. **claw** — pooled-region hits, or sharpness hits over a far-field bar
+   (0.45 × calibrated contrast × median). Blur-tolerant by design.
+4. **tiny** — ±(fwhm × 1.25, min 60u; ×2 on weak claw hits) sweep,
+   gaussian fit through the gate (absolute bar, curve-relative bar, edge
+   margin, r²/SNR). A fit both verifies the hit and **re-measures FWHM on
+   the go** (persisted, tagged `|fwhm…` — stale calibrations self-heal
+   under current optics).
+5. **park** — two-stage: 9000 u/s to 30u short, creep 300 u/s for the
+   final approach; OFM cache synced.
+
+Any refusal returns the stage to its start; retries happen only on
+`tiny_fail` (`NORETRY` on structural failures); the pre-AF camera regime
+is restored 10s after the last run by the cooler, with readback verify.
+
+## The motion chain (event-driven, the heart of it)
+
+The only wait is the telemetry reader thread's push-arrival Condition.
+`et` (klippy motion-report encoder time) does all sequencing; host
+arrival order is treated as unreliable (pushes arrive 0.3–0.5s late and
+bundled under load).
+
+1. **Telemetry** (`skrPico.start_motion_telemetry`): one websocket to
+   Moonraker, `motion_report` pushed on change (10ms STATUS_REFRESH_TIME,
+   8ms webhooks SUBSCRIPTION_REFRESH_TIME — both tuned 2026-10-11). Pushes
+   carry only changed fields — absent `live_velocity` mid-cruise is
+   *carried* from the previous push and flagged, never read as 0.
+2. **Completion marker**: a leg is over when a push arrives with
+   `v≈0 ∧ z≈target ∧ et > previous marker et`. Waited on via the push
+   Condition. A stale bundle from the previous leg cannot satisfy it (its
+   z is the wrong target).
+3. **Segmentation**: leg N's samples = pushes with `et ∈ (marker[N-1],
+   marker[N]]`. `et` slicing is exact regardless of delivery timing.
+4. **Labeling**: frames interpolate the *sampled* (et−hoff, z) trajectory
+   — no rebuilt trapezoid, no accel model in the label path.
+5. **Starvation guard**: 3 consecutive event-waits with no new pushes
+   (`TELESTALL`) abort the run (`|far_abort`).
+6. **Calibration from telemetry** (`_accel_from_telemetry`): per far leg,
+   plateau = max|v|, rise distance to ≥90% plateau, `a = v_p²/(2·d_rise)`;
+   both legs averaged, range-gated, persisted to `smooth_af_cal.json`
+   (`ACCELTEL … SAVED`). Estimates that disagree wildly are refused and
+   the persisted cal kept. The persisted cal is what flips far speed to
+   9000.
+
+## Camera metric
+
+- `crop990` mode (1332×990 @120fps), lores YUV420 350×350 via
+  `make_array("lores")` — straight from the ISP, encoder not in the path.
+- **Sharpness**: full-plane gradient energy on the luma.
+- **pooled16**: defocus-tolerant structure channel for far direction.
+  Blind beyond ~±600u true defocus on pale H&E at this mag.
+- **Regime**: gain 2.0, exposure = pre-AF exposure / 2, clamped to
+  100–8000µs (halving keeps motion smear at ~4.5u during the 9000 u/s
+  far legs; the clamp exists because letting AE run once collapsed to
+  200µs → black field).
+- **Thermal housekeeping** (`_quiet_camera`): sticky 120fps during AF
+  sessions; a daemon timer 10s after the last run restores 20fps, ensures
+  both MJPEG encoders run, and re-applies the pre-AF gain/exposure with
+  readback verify (`COOL regime … verify=ok` in `smooth_af_moves.log`).
+  A new run cancels the pending timer, so back-to-back runs keep
+  sticky 120fps.
+- `_AF_SINK` hook: an optional external sink receives every pre-callback
+  frame + sensor timestamp — the way to see the AF's point of view, since
+  the encoder is paused during AF.
+
+## Calibration (`smooth_af_cal.json`)
+
+| key | meaning | derived |
+|---|---|---|
+| `accel` | measured stage accel (u/s²) | telemetry rise-fit; gates far speed 6000→9000 |
+| `fwhm_u` | optics PSF width | re-measured by every accepted tiny fit; near_v = 12·FWHM; tiny span = 1.25·FWHM |
+| `contrast` | peak/floor | claw bar 0.45× (far), gate bar 0.85× (near) |
+
+Loaded lazily at first far sweep; written by the telemetry solver and the
+tiny fit.
+
+## Position integrity
+
+- `__enter__` retries homing + `update_position()` up to 60s (boot race).
+- The OFM cache is re-synced via `update_position()` after legs that did
+  not complete on a certified marker (fallback paths only).
+- UI-equivalent moves only for point tests: `move_relative`/`move_absolute`
+  through the OFM API — raw kalico POSTs bypass position tracking.
+- Known open behavior: anchor drifts ~50u/day, direction consistent,
+  cause unknown (no thermal correlate — the microscope has no fans or
+  thermal probes).
+
+## Hard rules encoded
+
+- Happens-before only: waits are data-arrival events (push Condition);
+  frame-count waits and clock waits are banned in the motion chain.
+- User-stated focus is ground truth (±20u); failures are pipeline failures.
+- Full-res data always; nothing subsampled.
+- Git is the operator's; deploys are file copies, commits are manual.
+
+## Files (repo shape)
+
+- `src/openflexure_microscope_server/things/` (deployed to the scope):
+  - `smooth_autofocus.py` — the thing: flow, marker waits, telemetry
+    accel cal, claw/tiny gates, scanner-compat shim.
+  - `smooth_af_core.py` — log-gaussian fit + median filter (pure math).
+  - `camera/picamera.py` — camera thing: 120fps crop990, AF metric
+    callback, `_AF_SINK` hook, sensor-timestamp interpolation.
+  - `stage/skrPico.py` — stage thing (scope-live; also mirrored at
+    `src/labthings_sangaboard/skrPico.py`): Moonraker client, telemetry
+    websocket reader (push Condition), cal persistence, `_stamp_for`.
+- `ofm/` (this repo) — deployed copies of the above + unit tests.
+- `funData/` — motion-data playground: `scripts/` (story chart, history
+  charts, HUD slowmo burner + its test), `data/` (pulled artifacts),
+  `charts/` (outputs).
+- Kalico side: user fork `apopanda/kalico`, base a7e74c5c; live mods vs
+  upstream are the two refresh constants (motion_report 10ms, webhooks
+  8ms) + `webhooks.py get_status` reports `ready` while in jog mode
+  (jog mode sets an internal state string stock moonraker cannot parse;
+  translating at this single source keeps every websocket client fed).
+
+## Known interop constraint
+
+Klippy printer-state strings cross a language boundary into moonraker's
+`KlippyState` enum. Any new state a fork introduces must be either added
+to that enum or translated in `webhooks.get_status` (the sole source of
+the pushed `state` field) — an unparseable state aborts moonraker's
+status fan-out, starving every websocket client of telemetry mid-motion.
+
+## Open items
+
+- Full-rate telemetry recorder (jsonl dump of every motion_report push
+  during a capture) — would give measured per-frame z/v for the HUD and
+  true per-leg accel stats; parked by operator request.
+- External sink durability: a sink that writes from the pre-callback must
+  use a queued writer thread; direct SD writes from the callback stall
+  frame delivery (observed: every ~8th frame doubled its interval).

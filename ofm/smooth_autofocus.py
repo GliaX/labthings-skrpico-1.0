@@ -1,6 +1,8 @@
 import json
 import logging
+import queue
 import statistics
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -23,6 +25,8 @@ from .autofocus import (
     SharpnessDataArrays,
 )
 from .camera import BaseCamera
+
+sys.setswitchinterval(0.001)
 from .stage import BaseStage
 from .smooth_af_core import (
     CurvePoint,
@@ -42,6 +46,7 @@ _TINY_SPAN = 180.0
 _TINY_VELOCITY = 700.0
 _TINY_MIN_V = 100.0
 _PARK_VELOCITY = 9000.0
+_PARK_CREEP = 300.0
 _CAL_V_ACCEL = 6000.0
 _MEDIAN_BAR = 1.6
 _EDGE_MARGIN = 0.12
@@ -134,19 +139,16 @@ class StreamSharpnessMonitor:
 class _EncoderBurst:
     """Throttle sensor fps for a high-fps metric burst, restore after.
 
-    The camera lives in crop990 with the encoders running at preview
-    fps; the burst raises the sensor to the metric rate and stops the
-    encoders (nobody consumes the UI stream mid-AF). Restore restarts
-    the encoders and drops back to preview fps — both live controls,
-    no reconfigure.
+    The camera lives in crop990; the burst stops the encoders (nobody
+    consumes the UI stream mid-AF) and the sensor stays at the metric
+    rate across runs — restoring a lower FrameRate forces a sensor
+    re-clock (~0.4s) on the next run, so it is deliberately not done.
+    Restore restarts the encoders only.
     """
 
-    def __init__(
-        self, camera, fps: float, restore_fps: float = 20.0
-    ) -> None:
+    def __init__(self, camera, fps: float) -> None:
         self._cam = camera
         self.fps = float(fps)
-        self.restore_fps = float(restore_fps)
         self._stopped = False
 
     def __enter__(self) -> "_EncoderBurst":
@@ -202,20 +204,72 @@ class _EncoderBurst:
                     )
                 except Exception as e:
                     LOGGER.error("AF burst: lores encoder restore failed: %s", e)
-                try:
-                    picam.set_controls({"FrameRate": float(self.restore_fps)})
-                except Exception:
-                    pass
         except Exception as e:
             LOGGER.error("AF burst: camera restore failed: %s", e)
         return False
 
 
+_LOGQ: "queue.Queue[str]" = queue.Queue()
+_DUMPQ: "queue.Queue[tuple]" = queue.Queue()
+
+
+def _writer_loop() -> None:
+    """Background flusher for the AF hot-path writes.
+
+    Synchronous SD writes between sweep legs stall the event chain
+    (proven by the capture throttle incident); every hot-path write
+    goes through these queues instead and is flushed off-thread.
+    """
+    while True:
+        try:
+            line = _LOGQ.get(timeout=0.5)
+        except queue.Empty:
+            line = None
+        batch = []
+        if line is not None:
+            batch.append(line)
+        try:
+            while True:
+                batch.append(_LOGQ.get_nowait())
+        except queue.Empty:
+            pass
+        if batch:
+            try:
+                Path(__file__).resolve().parents[3].joinpath(
+                    "smooth_af_moves.log"
+                ).open("a").write("\n".join(batch) + "\n")
+            except Exception:
+                pass
+        dumps = []
+        try:
+            while True:
+                dumps.append(_DUMPQ.get_nowait())
+        except queue.Empty:
+            pass
+        for name, payload in dumps:
+            try:
+                with open(
+                    f"/home/admin/openflexure-microscope-server/{name}", "w"
+                ) as f:
+                    json.dump(payload, f)
+            except Exception:
+                pass
+
+
+WRITER_THREAD = threading.Thread(
+    target=_writer_loop, daemon=True, name="smooth-af-writer"
+)
+
+
+def _writer_kick() -> None:
+    if not WRITER_THREAD.is_alive():
+        WRITER_THREAD.start()
+
+
 def _log(line: str) -> None:
     try:
-        Path(__file__).resolve().parents[3].joinpath(
-            "smooth_af_moves.log"
-        ).open("a").write(line + "\n")
+        _LOGQ.put(line)
+        _writer_kick()
     except Exception:
         pass
 
@@ -232,10 +286,8 @@ def _probe_regime(prev_gain, prev_exp):
 
 def _dump_json(name: str, payload: dict) -> None:
     try:
-        with open(
-            f"/home/admin/openflexure-microscope-server/{name}", "w"
-        ) as f:
-            json.dump(payload, f)
+        _DUMPQ.put((name, payload))
+        _writer_kick()
     except Exception:
         pass
 
@@ -243,11 +295,10 @@ def _dump_json(name: str, payload: dict) -> None:
 class SmoothAutofocusThing(lt.Thing):
     """Autofocus from a continuous sharpness curve sampled while the stage sweeps.
 
-    Flow (AF_GOALS.md): static reference frames (calibration, never parks) ->
-    near sweep +-110u -> far sweep 2048u -> claw (sharp, pooled16 ballpark) ->
-    tiny sweep +-180u -> park. Every wait is a happens-before: an
-    M400-blocked move return or a frame-count Event predicate. No timed
-    sleeps in the flow.
+    Flow: static reference -> far sweep (both legs, 9000 or 6000 when
+    accel cal is missing; early exit after leg 1 on a strong hit) ->
+    claw -> tiny sweep -> two-stage park. Every wait is a happens-before
+    on telemetry events; no timed waits, no M400.
     """
 
     _class_settings = {"validate_properties_on_set": True}
@@ -262,6 +313,10 @@ class SmoothAutofocusThing(lt.Thing):
     _CAL_BACKLASH: Optional[float] = None
     _CAL_PEAK_SHARP: Optional[float] = None
     _CAL_ACCEL: Optional[float] = None
+    _COOL_TIMER: Optional[threading.Timer] = None
+    _AF_BUSY: bool = False
+    _LAST_REGIME: Optional[tuple] = None
+    _COOL_DELAY: float = 10.0
     _CAL_LOADED: bool = False
     _seg_floor_et: Optional[float] = None
     _last_leg_samples: list = []
@@ -366,6 +421,7 @@ class SmoothAutofocusThing(lt.Thing):
                 f"LEG TELESTALL target={target:.1f} "
                 f"t={time.time():.3f}"
             )
+            self._telestall_run = True
             return None, []
         m_et = marker[4]
         self._seg_floor_et = m_et
@@ -584,9 +640,104 @@ class SmoothAutofocusThing(lt.Thing):
             )
         return fit, best
 
+    def _cancel_cooler(self) -> None:
+        t = type(self)._COOL_TIMER
+        if t is not None:
+            t.cancel()
+            type(self)._COOL_TIMER = None
+
+    def _arm_cooler(self) -> None:
+        self._cancel_cooler()
+        t = threading.Timer(self._COOL_DELAY, self._quiet_camera)
+        t.daemon = True
+        type(self)._COOL_TIMER = t
+        t.start()
+
+    def _quiet_camera(self) -> None:
+        """10s after the last AF: sensor to 20fps, encoders ensured
+        running, gain/exposure re-applied with readback. Deferred
+        housekeeping outside the sweep chain; a new AF run cancels it."""
+        type(self)._COOL_TIMER = None
+        if getattr(self, "_AF_BUSY", False):
+            return
+        try:
+            with self._cam._streaming_picamera() as picam:
+                if not picam.started:
+                    try:
+                        picam.start()
+                    except Exception as e:
+                        LOGGER.error("AF cooler: camera start failed: %s", e)
+                if not getattr(picam, "is_recording", False):
+                    bitrate = getattr(self._cam, "mjpeg_bitrate", 10000000)
+                    mode_info = getattr(self._cam, "streaming_modes", {}).get(
+                        getattr(self._cam, "streaming_mode", "default")
+                    )
+                    use_lores = (
+                        mode_info is not None
+                        and getattr(mode_info, "use_lores_as_preview", False)
+                    )
+                    stream_name = "lores" if use_lores else "main"
+                    enc1 = MJPEGEncoder(bitrate)
+                    try:
+                        picam.start_recording(
+                            enc1,
+                            PicameraStreamOutput(
+                                self._cam.mjpeg_stream, enc1
+                            ),
+                            name=stream_name,
+                        )
+                    except Exception as e:
+                        LOGGER.error(
+                            "AF cooler: main encoder start failed: %s", e)
+                    enc2 = MJPEGEncoder(100000000)
+                    try:
+                        picam.start_encoder(
+                            enc2,
+                            PicameraStreamOutput(
+                                self._cam.lores_mjpeg_stream, enc2
+                            ),
+                            name="lores",
+                        )
+                    except Exception as e:
+                        LOGGER.error(
+                            "AF cooler: lores encoder start failed: %s", e)
+                try:
+                    picam.set_controls({"FrameRate": 20.0})
+                    _log("COOL fps=20 enc=on")
+                except Exception as e:
+                    LOGGER.error("AF cooler: fps restore failed: %s", e)
+        except Exception as e:
+            LOGGER.error("AF cooler failed: %s", e)
+        reg = type(self)._LAST_REGIME
+        if not reg:
+            return
+        try:
+            self._cam.analogue_gain = reg[0]
+            self._cam.exposure_time = int(reg[1])
+            g2 = float(self._cam.analogue_gain)
+            e2 = int(self._cam.exposure_time)
+            ok = abs(g2 - reg[0]) < 0.05 and abs(e2 - int(reg[1])) <= 2
+            _log(
+                f"COOL regime g={reg[0]:.2f} e={reg[1]} "
+                f"readback=({g2:.2f},{e2}) verify={'ok' if ok else 'MISMATCH'}"
+            )
+        except Exception:
+            LOGGER.warning("AF cooler: regime restore failed", exc_info=True)
+
     def _park(self, monitor: StreamSharpnessMonitor, target: float, mark: int):
-        """Blocking park; settled means the move returned (trailing sync)."""
-        self._sync_move(monitor, target, _PARK_VELOCITY, mark, labeled=False)
+        """Two-stage park: fast to 30u short, then creep the last 30u at
+        low speed approaching from one side — no overshoot, no backlash
+        flip, park lands where tiny fit said."""
+        cur = self._stage_z()
+        sgn = 1.0 if target >= cur else -1.0
+        near = target - sgn * 30.0
+        if abs(near - cur) > 1.0:
+            self._sync_move(
+                monitor, near, _PARK_VELOCITY, mark, labeled=False
+            )
+        self._sync_move(
+            monitor, target, _PARK_CREEP, len(monitor.times), labeled=False
+        )
         return self._stage_z()
 
     def _load_cal(self) -> None:
@@ -796,25 +947,34 @@ class SmoothAutofocusThing(lt.Thing):
         )
 
         segs = {}
+        self._telestall_run = False
         best_hit = None
         best_pts = None
         leg_hits = []
         far_exp_prev = None
-        far_gain_prev = None
-        try:
-            far_exp_prev = self._cam.exposure_time
-            far_gain_prev = self._cam.analogue_gain
-        except Exception:
-            far_exp_prev = far_gain_prev = None
+        reg = type(self)._LAST_REGIME
+        if reg is not None:
+            far_exp_prev = reg[1]
+        if far_exp_prev is None:
+            try:
+                far_exp_prev = self._cam.exposure_time
+            except Exception:
+                far_exp_prev = None
         far_exp = 1000
+        if far_exp_prev:
+            far_exp = max(100, min(8000, far_exp_prev / 2))
         far_gain = 2.0
         try:
             self._cam.analogue_gain = far_gain
             self._cam.exposure_time = far_exp
-            _log(f"FARREGIME exp={far_exp} gain={far_gain}")
-        except Exception:
-            LOGGER.warning("Far exposure regime failed", exc_info=True)
+        except Exception as e:
+            _log(f"FARREGIME SETFAIL {e!r}")
+        _log(f"FARREGIME exp={far_exp} gain={far_gain} "
+             f"prev={far_exp_prev}")
         for tag, target, prev_end in (("far", leg_a, cur), ("far2", leg_b, leg_a)):
+            if self._telestall_run:
+                mode += f"|{tag}_abort"
+                break
             far_mark = len(monitor.times)
             traj, frames = self._sync_move(
                 monitor, target, far_v, far_mark
@@ -841,6 +1001,12 @@ class SmoothAutofocusThing(lt.Thing):
                     best_pts = (max(q[2] for q in leg_pts), leg_pts, tag)
             else:
                 mode += "|nohit"
+            if (tag == "far" and hit is not None and leg_pts):
+                s_med1 = statistics.median(
+                    [q[2] for q in leg_pts]) or 1e-9
+                if max(q[2] for q in leg_pts) >= 1.35 * s_med1:
+                    mode += "|far1_skip"
+                    break
 
         try:
             if far_exp_prev is not None:
@@ -866,9 +1032,22 @@ class SmoothAutofocusThing(lt.Thing):
             fwhm = (
                 type(self)._CAL_FWHM if type(self)._CAL_CONTRAST else None
             )
-            span_h = max(
-                60.0, min(_TINY_SPAN, (fwhm * 1.25) if fwhm else 60.0)
+            if best_pts and leg_hits and leg_hits[0][0] == "far1":
+                s_med_c = (
+                    statistics.median([q[2] for q in best_pts[1]]) or 1e-9
+                )
+            else:
+                s_med_c = None
+            weak_claw = (
+                s_med_c is not None
+                and best_pts[0] < 1.35 * s_med_c
             )
+            win_mult = 2.0 if weak_claw else 1.25
+            span_h = max(
+                60.0, min(_TINY_SPAN, (fwhm * win_mult) if fwhm else 60.0)
+            )
+            if weak_claw:
+                mode += "|tiny_wide"
             tiny_lo = max(claw_z - span_h, min(leg_a, leg_b))
             tiny_hi = min(claw_z + span_h, max(leg_a, leg_b))
             f_ref = fwhm if fwhm else 20.0
@@ -961,8 +1140,12 @@ class SmoothAutofocusThing(lt.Thing):
         try:
             prev_exp = self._cam.exposure_time
             prev_gain = self._cam.analogue_gain
+            if prev_gain is not None and prev_exp is not None:
+                type(self)._LAST_REGIME = (float(prev_gain), int(prev_exp))
         except Exception:
             prev_exp = prev_gain = None
+        type(self)._AF_BUSY = True
+        self._cancel_cooler()
         try:
             if hasattr(self._stage, "set_homed"):
                 self._stage.set_homed()
@@ -1006,6 +1189,12 @@ class SmoothAutofocusThing(lt.Thing):
                         try:
                             result = self._run_flow(monitor)
                         except NoFocusFoundError as exc:
+                            if "tiny_fail" not in str(exc):
+                                _log(
+                                    f"RUN total={time.monotonic() - t0:.2f} "
+                                    f"mode={exc} NORETRY"
+                                )
+                                raise
                             _log(
                                 f"RUN total={time.monotonic() - t0:.2f} "
                                 f"mode={exc} RETRY1"
@@ -1044,6 +1233,8 @@ class SmoothAutofocusThing(lt.Thing):
                     self._stage.update_position()
             except Exception:
                 LOGGER.warning("Stage position sync failed", exc_info=True)
+            type(self)._AF_BUSY = False
+            self._arm_cooler()
 
 class SmoothCompatAutofocus(SmoothAutofocusThing, AutofocusThing):
     """Drop-in AutofocusThing backed by the smooth autofocus engine.
