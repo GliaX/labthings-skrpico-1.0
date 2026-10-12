@@ -68,7 +68,8 @@ class EncodeResult(BaseModel):
 class AfVideoThing(lt.Thing):
     """Captures the AF lores NV12 stream and encodes it to video."""
 
-    def __init__(self):
+    def __init__(self, thing_server_interface=None):
+        super().__init__(thing_server_interface=thing_server_interface)
         self._lock = threading.Lock()
         self._f = None
         self._ts_f = None
