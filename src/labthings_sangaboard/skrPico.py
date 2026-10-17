@@ -344,25 +344,29 @@ class SkrPicoThing(BaseStage):
             self.move_gcode(self.MovementType.RELATIVE, False, displacement)
 
 
-    def _hardware_stop(self) -> None:
+    def _hardware_stop(self, jog_gen: int | None = None) -> None:
         """Stop any motion of the stage as soon as possible."""
         with self._hardware_lock:
             client = self._client
             try:
-                self._send_gcode_script(client, "JOG_INTERRUPT")
+                if jog_gen is None or jog_gen == getattr(self, "_jog_gen", None):
+                    self._send_gcode_script(client, "JOG_INTERRUPT")
+                    self.unset_jog()
             finally:
-                self.unset_jog()
                 self.moving = False
                 self.update_position()
 
     def _jog_loop(self, first_command: JogCommand) -> None:
+        with self._hardware_lock:
+            self._jog_gen = getattr(self, "_jog_gen", 0) + 1
+            jog_gen = self._jog_gen
+            self._send_gcode_script(self._client, "JOG VALUE=1")
         try:
-            self.set_jog()
             super()._jog_loop(first_command)
         finally:
             # A jog session that ends without a stop command must still
             # restore the default mode (the stop path is a no-op if nothing moves).
-            self._hardware_stop()
+            self._hardware_stop(jog_gen)
 
     def _poll_moving(self) -> bool:
         """Determine if the stage is still moving.
@@ -400,7 +404,17 @@ class SkrPicoThing(BaseStage):
             script = (f"{move_type.value}\nG1 {gcode_axes}S9000 F45000\nM400\n")
         else:
             scale = max(abs(d) for d in displacement_axis.values()) / 600
-            script = (f"JOG VALUE=1\nJOG_MOVE {jog_axes}S={self.speed * scale} F={self.acceleration * scale}\n")
+            jog_dir = [1 if d > 0 else -1 if d < 0 else 0 for d in displacement_axis.values()]
+            reversing = (
+                getattr(self, "_last_jog_dir", None) is not None
+                and any(
+                    (nd > 0) != (ld > 0) and nd != 0 and ld != 0
+                    for nd, ld in zip(jog_dir, self._last_jog_dir)
+                )
+            )
+            self._last_jog_dir = jog_dir
+            interrupt = "JOG_INTERRUPT\n" if reversing else ""
+            script = (f"{interrupt}JOG_MOVE {jog_axes}S={self.speed * scale} F={self.acceleration * scale}\n")
 
         client = self._client
         self.moving = True
@@ -525,8 +539,9 @@ class SkrPicoThing(BaseStage):
         self._send_jog_mode_command(False)
 
     def _send_jog_mode_command(self, enable: bool) -> None:
-        client = self._client
-        self._send_gcode_script(client, f"JOG VALUE={1 if enable else 0}")
+        with self._hardware_lock:
+            client = self._client
+            self._send_gcode_script(client, f"JOG VALUE={1 if enable else 0}")
         self.update_position()
 
     @lt.action
