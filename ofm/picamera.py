@@ -59,14 +59,6 @@ from . import BaseCamera, CaptureMode, StreamingMode
 from . import picamera_recalibrate_utils as recalibrate_utils
 from . import picamera_tuning_file_utils as tf_utils
 
-_AF_ANCHOR = None
-_AF_SINK = None
-
-
-def _af_emit(ts, sharp, bright, chroma, pooled, cb) -> None:
-    cb(ts, sharp, bright, chroma, pooled)
-
-
 
 if TYPE_CHECKING:
     from libcamera import Request
@@ -397,12 +389,7 @@ class StreamingPiCamera2(BaseCamera, ABC):
         """
         super().__enter__()
         self._initialise_picamera(check_sensor_model=True)
-        self._start_streaming("crop990")
-        try:
-            with self._streaming_picamera() as picam:
-                picam.set_controls({"FrameRate": 20.0})
-        except Exception:
-            LOGGER.warning("Could not set preview framerate", exc_info=True)
+        self._start_streaming()
         return self
 
     @property
@@ -484,12 +471,6 @@ class StreamingPiCamera2(BaseCamera, ABC):
         stream_config["buffer_count"] = mode_info.buffer_count
         return stream_config
 
-    def set_stream_framerate(self, fps: float) -> None:
-        """Change the live stream frame rate without reconfiguring the sensor mode."""
-        with self._streaming_picamera() as picam:
-            picam.set_controls({"FrameRate": float(fps)})
-
-
     def set_af_metric_hook(self, callback) -> None:
         """Install a per-frame sharpness callback fed from the raw lores Y plane.
 
@@ -506,16 +487,12 @@ class StreamingPiCamera2(BaseCamera, ABC):
 
     def _af_pre_callback(self, request) -> None:
         import numpy as _np
-        global _AF_ANCHOR
 
         cb = getattr(self, "_af_metric_hook", None)
         if cb is None:
             return
-        _sink = _AF_SINK
-        _t0 = time.monotonic()
         try:
             arr = request.make_array("lores")
-            _t1 = time.monotonic()
             rows, stride = arr.shape[0], arr.shape[1]
             y_rows = rows * 2 // 3
             y = arr[:y_rows, :stride].astype(_np.uint8, copy=False)
@@ -524,7 +501,6 @@ class StreamingPiCamera2(BaseCamera, ABC):
             dy = a[1:, :] - a[:-1, :]
             sharp = float((dx * dx).mean() + (dy * dy).mean())
             bright = float(y.mean())
-            _t2 = time.monotonic()
             chroma = 0.0
             pooled = 0.0
             try:
@@ -560,7 +536,6 @@ class StreamingPiCamera2(BaseCamera, ABC):
                     pooled = float(eb.std())
             except Exception:
                 pass
-            _t3 = time.monotonic()
             try:
                 _md = request.get_metadata()
             except Exception:
@@ -570,9 +545,6 @@ class StreamingPiCamera2(BaseCamera, ABC):
                     _md = dict(request.metadata)
                 except Exception:
                     _md = None
-            _t4 = time.monotonic()
-
-
             _st_ns = None
             if isinstance(_md, dict):
                 for _k in ("SensorTimestamp", "sensor_timestamp"):
@@ -580,20 +552,11 @@ class StreamingPiCamera2(BaseCamera, ABC):
                         _st_ns = _md[_k]
                         break
             if not _st_ns:
-                if _AF_ANCHOR is not None:
-                    ts = _AF_ANCHOR + 1.0 / 120.0
-                else:
-                    ts = time.monotonic()
-                if _sink is not None:
-                    _sink(ts, arr)
-                _af_emit(ts, sharp, bright, chroma, pooled, cb)
-                _AF_ANCHOR = ts
+                ts = time.monotonic()
+                cb(ts, sharp, bright, chroma, pooled)
                 return
             ts = float(_st_ns) / 1e9
-            if _sink is not None:
-                _sink(ts, arr)
-            _AF_ANCHOR = ts
-            _af_emit(ts, sharp, bright, chroma, pooled, cb)
+            cb(ts, sharp, bright, chroma, pooled)
         except Exception:
             pass
 
@@ -1209,9 +1172,8 @@ class PiCameraHQ(StreamingPiCamera2):
             ),
             "crop990": PiCamera2StreamingMode(
                 description=(
-                    "Cropped 1332x990 sensor readout for high frame rate autofocus "
-                    "experiments. Narrower field of view than fast_preview; same "
-                    "lores stream size."
+                    "Cropped 1332x990 sensor readout for high frame rate autofocus. "
+                    "Same lores stream size as the default mode."
                 ),
                 main_resolution=(700, 700),
                 lores_resolution=(350, 350),

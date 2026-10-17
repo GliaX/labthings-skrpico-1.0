@@ -5,7 +5,6 @@ import statistics
 import sys
 import threading
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Literal, Optional, Self
@@ -25,8 +24,6 @@ from .autofocus import (
     SharpnessDataArrays,
 )
 from .camera import BaseCamera
-
-sys.setswitchinterval(0.001)
 from .stage import BaseStage
 from .smooth_af_core import (
     CurvePoint,
@@ -35,13 +32,14 @@ from .smooth_af_core import (
     median_filter_curve,
 )
 
+sys.setswitchinterval(0.001)
+
 LOGGER = logging.getLogger(__name__)
 
 _FAR_SPAN = 1024.0
 _FAR_VELOCITY = 9000.0
 _FAR_MEDIAN_BAR = 1.25
 _NEAR_SPAN = 110.0
-_NEAR_VELOCITY = 250.0
 _TINY_SPAN = 180.0
 _TINY_VELOCITY = 700.0
 _TINY_MIN_V = 100.0
@@ -59,11 +57,6 @@ class NoFocusFoundError(RuntimeError):
 
 class SmoothAutofocusParams(BaseModel):
     search_span_steps: int = Field(default=32, gt=0)
-    min_r2: float = Field(default=0.5, ge=0, le=1)
-    min_snr: float = Field(default=1.4, ge=1)
-
-
-
 
 
 @dataclass
@@ -81,13 +74,11 @@ class StreamSharpnessMonitor:
 
     def __init__(self, camera: BaseCamera) -> None:
         self.camera = camera
-        self.running = False
         self.times: List[float] = []
         self.sharpness: List[float] = []
         self.brightness: List[float] = []
         self.chroma: List[float] = []
         self.pooled: List[float] = []
-        self.decoded = 0
         self._hook_lock = threading.Lock()
         self.frame_event = threading.Event()
 
@@ -98,7 +89,6 @@ class StreamSharpnessMonitor:
             self.brightness.append(bright)
             self.chroma.append(chroma)
             self.pooled.append(pooled)
-            self.decoded += 1
         self.frame_event.set()
 
     def frames_since(self, mark: int):
@@ -121,7 +111,6 @@ class StreamSharpnessMonitor:
         return True
 
     def __enter__(self) -> Self:
-        self.running = True
         set_hook = getattr(self.camera, "set_af_metric_hook", None)
         if set_hook is None:
             raise RuntimeError("AF requires a YUV metric hook camera")
@@ -129,7 +118,6 @@ class StreamSharpnessMonitor:
         return self
 
     def __exit__(self, *_exc) -> None:
-        self.running = False
         try:
             self.camera.set_af_metric_hook(None)
         except Exception:
@@ -146,10 +134,8 @@ class _EncoderBurst:
     Restore restarts the encoders only.
     """
 
-    def __init__(self, camera, fps: float) -> None:
+    def __init__(self, camera) -> None:
         self._cam = camera
-        self.fps = float(fps)
-        self._stopped = False
 
     def __enter__(self) -> "_EncoderBurst":
         try:
@@ -160,9 +146,8 @@ class _EncoderBurst:
                         _log("BURST stop_encoder t=%.3f" % (time.monotonic(),))
                     except Exception:
                         return self
-            self._stopped = True
         except Exception:
-            self._stopped = False
+            pass
         return self
 
     def __exit__(self, *exc) -> bool:
@@ -304,14 +289,9 @@ class SmoothAutofocusThing(lt.Thing):
     _class_settings = {"validate_properties_on_set": True}
     _cam: BaseCamera = lt.thing_slot()
     _stage: BaseStage = lt.thing_slot()
-    _SESS_Z: Optional[float] = None
     _SESS_STATIC: float = 0.0
-    _SESS_TS: float = 0.0
-    _FAR_DIR: int = 1
     _CAL_FWHM: Optional[float] = None
     _CAL_CONTRAST: Optional[float] = None
-    _CAL_BACKLASH: Optional[float] = None
-    _CAL_PEAK_SHARP: Optional[float] = None
     _CAL_ACCEL: Optional[float] = None
     _COOL_TIMER: Optional[threading.Timer] = None
     _AF_BUSY: bool = False
@@ -467,8 +447,7 @@ class SmoothAutofocusThing(lt.Thing):
             pass
         return traj, frames
 
-    def _label_leg(self, frames, z_a: float, z_b: float, traj,
-                   velocity: float = 0.0):
+    def _label_leg(self, frames, z_a: float, z_b: float, traj, velocity: float):
         """Label frames by interpolating real motion_report positions at
         each frame's timestamp. traj is the telemetry sample list."""
         if len(frames) < 6 or not traj:
@@ -490,10 +469,6 @@ class SmoothAutofocusThing(lt.Thing):
                     break
             pts.append((zq, cbr, s, p))
         pts.sort()
-        b = type(self)._CAL_BACKLASH
-        if b:
-            shift = b if z_b > z_a else -b
-            pts = [(q[0] + shift,) + tuple(q[1:]) for q in pts]
         if velocity <= 1000.0:
             _cp = median_filter_curve(
                 [CurvePoint(z=q[0], sharpness=q[2]) for q in pts], window=3
@@ -591,11 +566,6 @@ class SmoothAutofocusThing(lt.Thing):
         contrast = type(self)._CAL_CONTRAST
         bar = ((contrast * 0.85) if contrast else 1.5) * max(s_floor, 1e-9)
         if best < bar:
-            return None
-        cal_peak = type(self)._CAL_PEAK_SHARP
-        if cal_peak and static_ref > 0:
-            cal_peak = min(cal_peak, 1.9 * static_ref)
-        if cal_peak and best < 0.85 * cal_peak:
             return None
         z_lo, z_hi = pts[0][0], pts[-1][0]
         arg = max(pts, key=lambda q: q[2])[0]
@@ -744,9 +714,8 @@ class SmoothAutofocusThing(lt.Thing):
         try:
             p = "/home/admin/openflexure-microscope-server/"
             p += "smooth_af_cal.json"
-            import json as _json
             with open(p) as f:
-                d = _json.load(f)
+                d = json.load(f)
             a = float(d.get("accel") or 0.0)
             if 15000.0 < a < 120000.0:
                 type(self)._CAL_ACCEL = a
@@ -802,15 +771,14 @@ class SmoothAutofocusThing(lt.Thing):
         try:
             p = "/home/admin/openflexure-microscope-server/"
             p += "smooth_af_cal.json"
-            import json as _json
             try:
                 with open(p) as f:
-                    d = _json.load(f)
+                    d = json.load(f)
             except Exception:
                 d = {}
             d[key] = value
             with open(p, "w") as f:
-                _json.dump(d, f)
+                json.dump(d, f)
         except Exception:
             pass
 
@@ -827,40 +795,8 @@ class SmoothAutofocusThing(lt.Thing):
             f"SAVE anchor={peak:.1f} focus_static={focus_static:.0f} "
             f"pre_static={type(self)._SESS_STATIC:.0f}"
         )
-        type(self)._SESS_Z = float(peak)
-        type(self)._SESS_TS = time.time()
         if focus_static > 0 and focus_static > type(self)._SESS_STATIC:
             type(self)._SESS_STATIC = float(focus_static)
-
-    @contextmanager
-    def _fast_stream(self, restore: bool = True, mode_name: str = "fast_preview"):
-        prev_mode = None
-        try:
-            prev_mode = self._cam.streaming_mode
-        except Exception:
-            prev_mode = None
-        switched = False
-        try:
-            if (
-                prev_mode is not None
-                and mode_name in self._cam.streaming_modes
-                and prev_mode != mode_name
-            ):
-                self._cam._start_streaming(mode_name)
-                switched = True
-        except Exception:
-            LOGGER.warning("Could not switch to fast_preview", exc_info=True)
-            switched = False
-        try:
-            yield not switched
-        finally:
-            if switched and restore:
-                try:
-                    self._cam._start_streaming(mode_name)
-                except Exception:
-                    LOGGER.warning(
-                        "Could not restore streaming mode", exc_info=True
-                    )
 
     def _run_flow(self, monitor: StreamSharpnessMonitor) -> SmoothFocusResult:
         t0 = time.monotonic()
@@ -879,7 +815,7 @@ class SmoothAutofocusThing(lt.Thing):
         ):
             mode += "|near_skip"
         else:
-            d_near = 1 if type(self)._FAR_DIR == 1 else -1
+            d_near = 1
             near_v = self._cal_near_velocity()
             near_mark = len(monitor.times)
             traj_a, frames_a = self._sync_move(
@@ -949,17 +885,23 @@ class SmoothAutofocusThing(lt.Thing):
         segs = {}
         self._telestall_run = False
         best_hit = None
-        best_pts = None
-        leg_hits = []
+        best_sharp = 0.0
         far_exp_prev = None
+        far_gain_prev = None
         reg = type(self)._LAST_REGIME
         if reg is not None:
             far_exp_prev = reg[1]
+            far_gain_prev = reg[0]
         if far_exp_prev is None:
             try:
                 far_exp_prev = self._cam.exposure_time
             except Exception:
                 far_exp_prev = None
+        if far_gain_prev is None:
+            try:
+                far_gain_prev = self._cam.analogue_gain
+            except Exception:
+                far_gain_prev = None
         far_exp = 1000
         if far_exp_prev:
             far_exp = max(100, min(8000, far_exp_prev / 2))
@@ -993,12 +935,10 @@ class SmoothAutofocusThing(lt.Thing):
                 hit = self._refine_hit(leg_pts, hit)
             mode += claw_tag
             if hit is not None:
-                leg_hits.append((tag, hit))
-                if best_hit is None or max(
-                    q[2] for q in leg_pts
-                ) > best_pts[0]:
+                leg_best = max(q[2] for q in leg_pts)
+                if best_hit is None or leg_best > best_sharp:
                     best_hit = hit
-                    best_pts = (max(q[2] for q in leg_pts), leg_pts, tag)
+                    best_sharp = leg_best
             else:
                 mode += "|nohit"
             if (tag == "far" and hit is not None and leg_pts):
@@ -1032,22 +972,9 @@ class SmoothAutofocusThing(lt.Thing):
             fwhm = (
                 type(self)._CAL_FWHM if type(self)._CAL_CONTRAST else None
             )
-            if best_pts and leg_hits and leg_hits[0][0] == "far1":
-                s_med_c = (
-                    statistics.median([q[2] for q in best_pts[1]]) or 1e-9
-                )
-            else:
-                s_med_c = None
-            weak_claw = (
-                s_med_c is not None
-                and best_pts[0] < 1.35 * s_med_c
-            )
-            win_mult = 2.0 if weak_claw else 1.25
             span_h = max(
-                60.0, min(_TINY_SPAN, (fwhm * win_mult) if fwhm else 60.0)
+                60.0, min(_TINY_SPAN, (fwhm * 1.25) if fwhm else 60.0)
             )
-            if weak_claw:
-                mode += "|tiny_wide"
             tiny_lo = max(claw_z - span_h, min(leg_a, leg_b))
             tiny_hi = min(claw_z + span_h, max(leg_a, leg_b))
             f_ref = fwhm if fwhm else 20.0
@@ -1160,9 +1087,14 @@ class SmoothAutofocusThing(lt.Thing):
         try:
             monitor = StreamSharpnessMonitor(self._cam)
             _t_switch = time.monotonic()
-            with self._fast_stream(
-                restore=True, mode_name="crop990"
-            ) as _fast, monitor:
+            _fast = True
+            try:
+                if self._cam.streaming_mode != "crop990":
+                    self._cam._start_streaming("crop990")
+                    _fast = False
+            except Exception:
+                LOGGER.warning("Could not switch to crop990", exc_info=True)
+            with monitor:
                 with self._cam._streaming_picamera() as picam:
                     picam.set_controls({"FrameRate": float(burst)})
                 _t_ramp = time.monotonic()
@@ -1178,7 +1110,7 @@ class SmoothAutofocusThing(lt.Thing):
                 else:
                     _log("SETUP mode_ready t=0.000 (already crop990)")
                 _t_burst = time.monotonic()
-                with _EncoderBurst(self._cam, burst):
+                with _EncoderBurst(self._cam):
                     _log(
                         f"SETUP burst_ready t={time.monotonic() - _t_burst:.3f}"
                     )
@@ -1235,6 +1167,7 @@ class SmoothAutofocusThing(lt.Thing):
                 LOGGER.warning("Stage position sync failed", exc_info=True)
             type(self)._AF_BUSY = False
             self._arm_cooler()
+
 
 class SmoothCompatAutofocus(SmoothAutofocusThing, AutofocusThing):
     """Drop-in AutofocusThing backed by the smooth autofocus engine.
