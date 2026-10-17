@@ -9,28 +9,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Literal, Optional, Self
 
+import labthings_fastapi as lt
 import numpy as np
 from picamera2.encoders import MJPEGEncoder
+from pydantic import BaseModel, Field
+
 from openflexure_microscope_server.things.camera.picamera import (
     PicameraStreamOutput,
 )
-from pydantic import BaseModel, Field
-
-import labthings_fastapi as lt
-
 from .autofocus import (
     AutofocusThing,
     NoFocusFoundError as ScanNoFocusFoundError,
     SharpnessDataArrays,
 )
 from .camera import BaseCamera
-from .stage import BaseStage
 from .smooth_af_core import (
     CurvePoint,
     FitOutcome,
     fit_log_gaussian,
     median_filter_curve,
 )
+from .stage import BaseStage
 
 sys.setswitchinterval(0.001)
 
@@ -72,23 +71,28 @@ class SmoothFocusResult:
 class StreamSharpnessMonitor:
     """Per-frame metrics from the camera's raw YUV pre_callback hook."""
 
-    def __init__(self, camera: BaseCamera) -> None:
+    def __init__(self, camera: BaseCamera, plane: str = "lores") -> None:
         self.camera = camera
+        self.plane = plane
         self.times: List[float] = []
         self.sharpness: List[float] = []
         self.brightness: List[float] = []
         self.chroma: List[float] = []
         self.pooled: List[float] = []
+        self.brenner: List[float] = []
         self._hook_lock = threading.Lock()
         self.frame_event = threading.Event()
 
-    def _hook_cb(self, ts, sharp, bright, chroma=0.0, pooled=0.0) -> None:
+    def _hook_cb(
+            self, ts, sharp, bright, chroma=0.0, pooled=0.0, brenner=0.0
+    ) -> None:
         with self._hook_lock:
             self.times.append(ts)
             self.sharpness.append(sharp)
             self.brightness.append(bright)
             self.chroma.append(chroma)
             self.pooled.append(pooled)
+            self.brenner.append(brenner)
         self.frame_event.set()
 
     def frames_since(self, mark: int):
@@ -114,7 +118,7 @@ class StreamSharpnessMonitor:
         set_hook = getattr(self.camera, "set_af_metric_hook", None)
         if set_hook is None:
             raise RuntimeError("AF requires a YUV metric hook camera")
-        set_hook(self._hook_cb)
+        set_hook(self._hook_cb, plane=self.plane)
         return self
 
     def __exit__(self, *_exc) -> None:
@@ -157,8 +161,8 @@ class _EncoderBurst:
                     getattr(self._cam, "streaming_mode", "default")
                 )
                 use_lores = (
-                    mode_info is not None
-                    and getattr(mode_info, "use_lores_as_preview", False)
+                        mode_info is not None
+                        and getattr(mode_info, "use_lores_as_preview", False)
                 )
                 stream_name = "lores" if use_lores else "main"
                 if not picam.started:
@@ -234,7 +238,7 @@ def _writer_loop() -> None:
         for name, payload in dumps:
             try:
                 with open(
-                    f"/home/admin/openflexure-microscope-server/{name}", "w"
+                        f"/home/admin/openflexure-microscope-server/{name}", "w"
                 ) as f:
                     json.dump(payload, f)
             except Exception:
@@ -315,12 +319,12 @@ class SmoothAutofocusThing(lt.Thing):
                 return float("nan")
 
     def _sync_move(
-        self,
-        monitor: StreamSharpnessMonitor,
-        target: float,
-        velocity: float,
-        mark: int,
-        labeled: bool = True,
+            self,
+            monitor: StreamSharpnessMonitor,
+            target: float,
+            velocity: float,
+            mark: int,
+            labeled: bool = True,
     ):
         """One leg: queue the move (non-blocking POST), then wait for the
         motion_report websocket telemetry to show the motion start and
@@ -337,12 +341,12 @@ class SmoothAutofocusThing(lt.Thing):
                 self._last_hw = target
 
     def _sync_move_inner(
-        self,
-        monitor: StreamSharpnessMonitor,
-        target: float,
-        velocity: float,
-        mark: int,
-        labeled: bool = True,
+            self,
+            monitor: StreamSharpnessMonitor,
+            target: float,
+            velocity: float,
+            mark: int,
+            labeled: bool = True,
     ):
         cur = self._last_hw
         delta = target - cur
@@ -368,12 +372,12 @@ class SmoothAutofocusThing(lt.Thing):
         def _marker_seen():
             for s in motion_since(0):
                 if (
-                    len(s) > 4
-                    and s[4] is not None
-                    and (seg_floor is None or s[4] > seg_floor)
-                    and abs(s[2]) < 0.5
-                    and not s[3]
-                    and abs(s[1] - target) <= ztol
+                        len(s) > 4
+                        and s[4] is not None
+                        and (seg_floor is None or s[4] > seg_floor)
+                        and abs(s[2]) < 0.5
+                        and not s[3]
+                        and abs(s[1] - target) <= ztol
                 ):
                     return s
             return None
@@ -408,8 +412,8 @@ class SmoothAutofocusThing(lt.Thing):
         raw = [
             s for s in motion_since(0)
             if len(s) > 4 and s[4] is not None
-            and (seg_floor is None or s[4] > seg_floor)
-            and s[4] <= m_et
+               and (seg_floor is None or s[4] > seg_floor)
+               and s[4] <= m_et
         ]
         raw.sort(key=lambda s: s[4])
         self._last_leg_samples = raw
@@ -519,8 +523,8 @@ class SmoothAutofocusThing(lt.Thing):
                     pts[i][2] for i in cl)
                 return hit, f"|claw_sharp{hit:.0f}{tag}"
         far_bar = (
-            (contrast * 0.45) if contrast else _FAR_MEDIAN_BAR
-        ) * max(s_med, 1e-9)
+                      (contrast * 0.45) if contrast else _FAR_MEDIAN_BAR
+                  ) * max(s_med, 1e-9)
         singles = [
             pts[i] for i in range(len(pts)) if pts[i][2] >= far_bar
         ]
@@ -571,18 +575,18 @@ class SmoothAutofocusThing(lt.Thing):
         arg = max(pts, key=lambda q: q[2])[0]
         span = z_hi - z_lo
         if span > 0 and not (
-            z_lo + _EDGE_MARGIN * span <= arg <= z_hi - _EDGE_MARGIN * span
+                z_lo + _EDGE_MARGIN * span <= arg <= z_hi - _EDGE_MARGIN * span
         ):
             return None
         if fit.fwhm is not None and fit.fwhm > 60.0 and best >= 1.6 * max(
-            s_floor, 1e-9
+                s_floor, 1e-9
         ):
             top = sorted(pts, key=lambda q: q[2], reverse=True)
             top_n = top[: max(2, len(top) // 5)]
             wsum = sum(q[2] for q in top_n)
             if wsum > 0:
                 z_fit = (
-                    sum(q[0] * q[2] for q in top_n) / wsum
+                        sum(q[0] * q[2] for q in top_n) / wsum
                 )
                 return (
                     FitOutcome(
@@ -592,7 +596,7 @@ class SmoothAutofocusThing(lt.Thing):
                     best,
                 )
         if (fit.r2 is None or fit.r2 < 0.5) or (
-            fit.snr is None or fit.snr < 1.2
+                fit.snr is None or fit.snr < 1.2
         ):
             if best < 1.6 * max(s_floor, 1e-9):
                 return None
@@ -643,8 +647,8 @@ class SmoothAutofocusThing(lt.Thing):
                         getattr(self._cam, "streaming_mode", "default")
                     )
                     use_lores = (
-                        mode_info is not None
-                        and getattr(mode_info, "use_lores_as_preview", False)
+                            mode_info is not None
+                            and getattr(mode_info, "use_lores_as_preview", False)
                     )
                     stream_name = "lores" if use_lores else "main"
                     enc1 = MJPEGEncoder(bitrate)
@@ -783,7 +787,7 @@ class SmoothAutofocusThing(lt.Thing):
             pass
 
     def _save_last_focus(
-        self, monitor: "StreamSharpnessMonitor", mark: int, peak: float
+            self, monitor: "StreamSharpnessMonitor", mark: int, peak: float
     ) -> None:
         mark2 = len(monitor.times)
         monitor.wait_frames(4, mark2, timeout=0.5)
@@ -811,7 +815,7 @@ class SmoothAutofocusThing(lt.Thing):
 
         sess_ref = type(self)._SESS_STATIC
         if not (
-            static_med > 0 and sess_ref > 0 and static_med >= 0.7 * sess_ref
+                static_med > 0 and sess_ref > 0 and static_med >= 0.7 * sess_ref
         ):
             mode += "|near_skip"
         else:
@@ -1005,8 +1009,8 @@ class SmoothAutofocusThing(lt.Thing):
                 ]
                 t_arg = max(tiny_pts, key=lambda q: q[2])
                 if (
-                    t_arg[2] >= 1.25 * max(s_floor_t, 1e-9)
-                    and abs(t_arg[0] - claw_z) <= 60.0
+                        t_arg[2] >= 1.25 * max(s_floor_t, 1e-9)
+                        and abs(t_arg[0] - claw_z) <= 60.0
                 ):
                     top_t = sorted(
                         tiny_pts, key=lambda q: q[2], reverse=True
@@ -1054,7 +1058,7 @@ class SmoothAutofocusThing(lt.Thing):
 
     @lt.action
     def smooth_focus(
-        self, params: SmoothAutofocusParams
+            self, params: SmoothAutofocusParams
     ) -> SmoothFocusResult:
         """Sweep autofocus: near sweep, far sweep, claw, tiny sweep, park.
 
@@ -1198,11 +1202,11 @@ class SmoothCompatAutofocus(SmoothAutofocusThing, AutofocusThing):
 
     @lt.action
     def fast_autofocus(
-        self,
-        dz: int = 2000,
-        start: Literal["centre", "base"] = "centre",
-        sharpness_metric=None,
-        record=None,
+            self,
+            dz: int = 2000,
+            start: Literal["centre", "base"] = "centre",
+            sharpness_metric=None,
+            record=None,
     ) -> SharpnessDataArrays:
         """Autofocus with the smooth engine; dz = total search span (stage units)."""
         span = max(8, min(int(dz), 192))
@@ -1213,11 +1217,11 @@ class SmoothCompatAutofocus(SmoothAutofocusThing, AutofocusThing):
 
     @lt.action
     def looping_autofocus(
-        self,
-        dz: int = 2000,
-        start: Literal["centre", "base"] = "centre",
-        sharpness_metric=None,
-        record=None,
+            self,
+            dz: int = 2000,
+            start: Literal["centre", "base"] = "centre",
+            sharpness_metric=None,
+            record=None,
     ) -> tuple[list[float], list[float]]:
         """Run the smooth engine once; it already re-verifies and re-anchors."""
         try:
