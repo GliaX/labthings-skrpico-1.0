@@ -55,6 +55,9 @@ FIT_WINDOW = 0.7
 STATIC_FRAMES = 8
 MARKER_STALL_LIMIT = 3
 MARKER_WAIT_S = 5.0
+MAX_Z_EXCURSION = 200.0
+CANYON_REACHES = (60.0, 120.0)
+CANYON_REACH_MAX = 120.0
 
 
 class SampleNotFoundError(RuntimeError):
@@ -290,9 +293,34 @@ class ScanFocusPlaneThing(lt.Thing):
 
     _CTRL_XY: dict = {}
 
+    _SUSPECTS: dict = {}
+
     def _note_control(self, x: float, y: float, z: float) -> None:
-        """Record a successful control (stage XY, z offset) for prediction."""
-        type(self)._CTRL_XY[(round(x, 3), round(y, 3))] = float(z)
+        """Record a successful control (stage XY, z offset) for prediction.
+        A point deviating strongly from the current surface plane is stored
+        but withheld from the fit until a second nearby measurement agrees
+        (one false peak must not tilt the surface)."""
+        key = (round(x, 3), round(y, 3))
+        plane = self._surface_plane()
+        if plane is not None:
+            a, b, c = plane
+            pred = a * x + b * y + c
+            if abs(z - pred) > 100.0:
+                suspects = type(self)._SUSPECTS
+                prev = suspects.pop(key, None)
+                if prev is None or abs(prev[1] - z) > 60.0:
+                    suspects[key] = (x, y, z)
+                    LOGGER.info(
+                        "PLANE: control (%.0f,%.0f) z=%+.1f deviates "
+                        "%.0f from plane (pred %+.1f) - withheld as suspect",
+                        x, y, z, abs(z - pred), pred,
+                    )
+                    return
+                LOGGER.info(
+                    "PLANE: suspect (%.0f,%.0f) confirmed by second "
+                    "measurement - promoted to control", x, y,
+                )
+        type(self)._CTRL_XY[key] = float(z)
 
     def _surface_plane(self) -> Optional[Tuple[float, float, float]]:
         """Least-squares plane z = a*x + b*y + c through the measured
@@ -631,18 +659,30 @@ class ScanFocusPlaneThing(lt.Thing):
         if cur != cur:
             self._last_leg_status = "noz"
             return [], []
+        z_span = self._pass_z_start - MAX_Z_EXCURSION
+        z_ceiling = self._pass_z_start + MAX_Z_EXCURSION
+        clamped = max(z_span, min(z_ceiling, target))
+        if clamped != target:
+            LOGGER.info(
+                "PLANE: leg target %.1f clamped to %.1f "
+                "(+/- %d envelope)", target, clamped, MAX_Z_EXCURSION,
+            )
+            target = clamped
         delta = target - cur
         if abs(delta) < 0.5:
             self._last_leg_status = "skip"
             return [], []
-        if abs(delta) > 200.0:
+        z_span = self._pass_z_start - MAX_Z_EXCURSION
+        z_ceiling = self._pass_z_start + MAX_Z_EXCURSION
+        if not (z_span <= target <= z_ceiling):
             self._last_leg_status = "insane_delta"
             LOGGER.error(
-                "PLANE: commanded z delta %.1f exceeds sanity bound - "
-                "aborting pass", delta,
+                "PLANE: commanded z target %.1f outside sane span "
+                "[%.1f, %.1f] - aborting pass",
+                target, z_span, z_ceiling,
             )
             raise SampleNotFoundError(
-                f"z motion sanity: leg delta {delta:.1f} exceeds 200"
+                f"z motion sanity: target {target:.1f} outside sane span"
             )
         seconds = abs(delta) / velocity
         motion_since = getattr(stage, "motion_since", None)
@@ -1217,6 +1257,34 @@ class ScanFocusPlaneThing(lt.Thing):
                         self._pts_xy[(row, col)] = peak - z_start
                         self._note_control(gx, gy, peak - z_start)
                     continue
+                canyon_hit = False
+                for reach in CANYON_REACHES:
+                    self._sweep_leg(
+                        monitor, anchor - reach, RETURN_VELOCITY,
+                        move_only=True,
+                    )
+                    if not self._sample_present(
+                            monitor, len(monitor.times)
+                    ):
+                        continue
+                    peak, reason = self._measure_point(
+                        monitor, anchor - reach
+                    )
+                    fits.append({
+                        "x": gx,
+                        "y": gy,
+                        "z": None if peak is None else peak - z_start,
+                        "reason": f"canyon:{reason}",
+                        "diag": getattr(self, "_last_point_diag", None),
+                    })
+                    if peak is not None:
+                        self._pts_xy[(row, col)] = peak - z_start
+                        self._note_control(gx, gy, peak - z_start)
+                    canyon_hit = True
+                    break
+                if canyon_hit:
+                    cur_x, cur_y = self._xy_tracked()
+                    continue
                 edge = self._find_nearest_sample(
                     monitor, gx, gy, done
                 )
@@ -1249,6 +1317,14 @@ class ScanFocusPlaneThing(lt.Thing):
             for dx, dy in reversed(done):
                 if dx or dy:
                     self._relative_move_xy(-dx, -dy)
+            try:
+                self._sweep_leg(
+                    monitor, z_start, RETURN_VELOCITY, move_only=True
+                )
+            except Exception:
+                LOGGER.warning(
+                    "PLANE: z restore after abort failed", exc_info=True
+                )
         self._sweep_leg(
             monitor, anchor, RETURN_VELOCITY, move_only=True
         )
