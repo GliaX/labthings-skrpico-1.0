@@ -2,27 +2,29 @@
 
 from __future__ import annotations
 
-import httpx
-import json
-import threading
 import asyncio
 import collections
+import json
+import threading
 import time
+from enum import Enum
 from types import TracebackType
 from typing import Any, Literal, Mapping, Optional, Self, Sequence
-from enum import Enum
 
+import httpx
 import labthings_fastapi as lt
 
 from . import BaseStage, JogCommand
 
+
 class SkrPicoThing(BaseStage):
     """A Thing to manage a SKR Pico v1.0 motor controller using Moonraker.
     """
+
     def __init__(
-        self,
-        thing_server_interface: lt.ThingServerInterface,
-        **kwargs: Any,
+            self,
+            thing_server_interface: lt.ThingServerInterface,
+            **kwargs: Any,
     ) -> None:
         self.port = kwargs.get("moonrakerport", "7125")
         self.baseurl = kwargs.get("baseurl", "http://127.0.0.1")
@@ -65,9 +67,9 @@ class SkrPicoThing(BaseStage):
             return
         cls = SmoothCompatAutofocus
         for attr, key in (
-            ("_CAL_FWHM", "fwhm_u"),
-            ("_CAL_CONTRAST", "contrast"),
-            ("_CAL_ACCEL", "accel"),
+                ("_CAL_FWHM", "fwhm_u"),
+                ("_CAL_CONTRAST", "contrast"),
+                ("_CAL_ACCEL", "accel"),
         ):
             if d.get(key) is not None:
                 setattr(cls, attr, d[key])
@@ -86,7 +88,8 @@ class SkrPicoThing(BaseStage):
         default_factory=lambda: {"x": True, "y": False, "z": True}, readonly=True
     )
 
-    def _send_gcode_script(self, client: Optional[httpx.Client] = None, script: str = "", timeout: Optional[httpx.Timeout] = None) -> dict:
+    def _send_gcode_script(self, client: Optional[httpx.Client] = None, script: str = "",
+                           timeout: Optional[httpx.Timeout] = None) -> dict:
         """Send a gcode script to Moonraker, raising if the request fails."""
         if client is None:
             client = self._client
@@ -164,8 +167,8 @@ class SkrPicoThing(BaseStage):
                         try:
                             with self._motion_ws_lock:
                                 self._et_handshake = (
-                                    float(resp["result"]["eventtime"])
-                                    - time.monotonic()
+                                        float(resp["result"]["eventtime"])
+                                        - time.monotonic()
                                 )
                             _wlog("HANDSHAKE %.4f" % (self._et_handshake,))
                         except (KeyError, TypeError, ValueError):
@@ -219,7 +222,8 @@ class SkrPicoThing(BaseStage):
                                     except Exception:
                                         pass
                                 t_mono = time.monotonic()
-                                self._motion_samples.append((self._stamp_for(et), float(lp[2]), v_now, carried or zcar, et))
+                                self._motion_samples.append(
+                                    (self._stamp_for(et), float(lp[2]), v_now, carried or zcar, et))
                                 if et is not None:
                                     self._clock_offsets.append(et - t_mono)
                                 self._motion_ws_cond.notify_all()
@@ -255,11 +259,20 @@ class SkrPicoThing(BaseStage):
         seq = getattr(self, "_motion_samples", None)
         if not seq:
             return False
-        moved = any(abs(v) > 0.5 for (t, _z, v) in seq if t > t_after)
+        lock = getattr(self, "_motion_ws_lock", None)
+        if lock is not None:
+            with lock:
+                snapshot = list(seq)
+        else:
+            snapshot = list(seq)
+        moved = any(
+            abs(s[2]) > 0.5 for s in snapshot
+            if len(s) > 2 and s[0] > t_after
+        )
         if not moved:
             return False
-        last = seq[-1]
-        return last[0] > t_after and abs(last[2]) < 0.5
+        last = snapshot[-1]
+        return len(last) > 2 and last[0] > t_after and abs(last[2]) < 0.5
 
     def motion_wait(self, timeout: float = 0.5) -> bool:
         """Block until a new telemetry sample arrives (Condition wait)."""
@@ -301,7 +314,6 @@ class SkrPicoThing(BaseStage):
         except Exception:
             return None
 
-
     class MovementType(Enum):
         ABSOLUTE = "G90"
         RELATIVE = "G91"
@@ -319,7 +331,6 @@ class SkrPicoThing(BaseStage):
             zip(self.axis_names, response["result"]["status"]["toolhead"]["position"])
         )
 
-
     def check_firmware(self) -> None:
         client = self._client
         response = client.get("/printer/info", timeout=self.timeout)
@@ -334,7 +345,6 @@ class SkrPicoThing(BaseStage):
         with self._hardware_lock:
             self.moving = True
             self.move_gcode(self.MovementType.RELATIVE, False, displacement)
-
 
     def _hardware_stop(self, jog_gen: int | None = None) -> None:
         """Stop any motion of the stage as soon as possible."""
@@ -375,11 +385,11 @@ class SkrPicoThing(BaseStage):
         return 600.0 / self.speed
 
     def move_gcode(self,
-        move_type: MovementType,
-        block_cancellation: bool = False,
-        displacement=None,
-        planned: bool = False,
-        **kwargs: int,
+                   move_type: MovementType,
+                   block_cancellation: bool = False,
+                   displacement=None,
+                   planned: bool = False,
+                   **kwargs: int,
                    ) -> None:
         if displacement is None:
             displacement_axis = dict(zip(self.axis_names, [kwargs.get(axis, 0) for axis in self.axis_names]))
@@ -390,19 +400,21 @@ class SkrPicoThing(BaseStage):
         else:
             displacement_axis = dict(zip(self.axis_names, displacement))
 
-        jog_axes = "".join(f"{axis.upper()}={axisDisplacement} " for axis, axisDisplacement in displacement_axis.items())
-        gcode_axes = "".join(f"{axis.upper()}{axisDisplacement} " for axis, axisDisplacement in displacement_axis.items())
+        jog_axes = "".join(
+            f"{axis.upper()}={axisDisplacement} " for axis, axisDisplacement in displacement_axis.items())
+        gcode_axes = "".join(
+            f"{axis.upper()}{axisDisplacement} " for axis, axisDisplacement in displacement_axis.items())
         if planned:
             script = (f"{move_type.value}\nG1 {gcode_axes}S9000 F45000\nM400\n")
         else:
             scale = max(abs(d) for d in displacement_axis.values()) / 600
             jog_dir = [1 if d > 0 else -1 if d < 0 else 0 for d in displacement_axis.values()]
             reversing = (
-                getattr(self, "_last_jog_dir", None) is not None
-                and any(
-                    (nd > 0) != (ld > 0) and nd != 0 and ld != 0
-                    for nd, ld in zip(jog_dir, self._last_jog_dir)
-                )
+                    getattr(self, "_last_jog_dir", None) is not None
+                    and any(
+                (nd > 0) != (ld > 0) and nd != 0 and ld != 0
+                for nd, ld in zip(jog_dir, self._last_jog_dir)
+            )
             )
             self._last_jog_dir = jog_dir
             interrupt = "JOG_INTERRUPT\n" if reversing else ""
@@ -439,15 +451,15 @@ class SkrPicoThing(BaseStage):
             self.moving = False
 
     def _hardware_move_relative(
-        self,
-        block_cancellation: bool = False,
-        **kwargs: int,
+            self,
+            block_cancellation: bool = False,
+            **kwargs: int,
     ) -> None:
         """Make a relative move"""
         self.move_gcode(self.MovementType.RELATIVE, block_cancellation, planned=True, **kwargs)
 
     def move_relative_z_timed(
-        self, steps: float, seconds: float
+            self, steps: float, seconds: float
     ) -> None:
         steps = float(steps)
         seconds = float(seconds)
@@ -473,7 +485,6 @@ class SkrPicoThing(BaseStage):
         except Exception:
             pass
 
-
     def z_live_velocity(self) -> float:
         """Current Z velocity from klippy's motion_report (planned moves only)."""
         client = self._client
@@ -494,11 +505,10 @@ class SkrPicoThing(BaseStage):
             response["result"]["status"]["motion_report"]["live_position"][2]
         )
 
-
     def _hardware_move_absolute(
-        self,
-        block_cancellation: bool = False,
-        **kwargs: int,
+            self,
+            block_cancellation: bool = False,
+            **kwargs: int,
     ) -> None:
         """Make an absolute move."""
         self.update_position()
@@ -549,10 +559,10 @@ class SkrPicoThing(BaseStage):
 
     @lt.action
     def flash_led(
-        self,
-        number_of_flashes: int = 10,
-        dt: float = 0.5,
-        led_channel: Literal["cc"] = "cc",
+            self,
+            number_of_flashes: int = 10,
+            dt: float = 0.5,
+            led_channel: Literal["cc"] = "cc",
     ) -> None:
         """Flash the LED to identify the board.
 
@@ -562,5 +572,4 @@ class SkrPicoThing(BaseStage):
         """
 
         raise IOError("The Pico does not support LED control. Unless you have an ARGB strip connected.")
-        #todo maybe I do? beep steppers instead?
-
+        # todo maybe I do? beep steppers instead?

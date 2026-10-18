@@ -355,6 +355,17 @@ class SmoothAutofocusThing(lt.Thing):
         delta = target - cur
         if abs(delta) < 0.5:
             return None, []
+        dz0 = 0.0
+        try:
+            st = self._stage._get_status(payload={
+                "objects": {"gcode_move": None, "toolhead": None}
+            })
+            sst = st["result"]["status"]
+            dz0 = float(sst["toolhead"]["position"][2]) - float(
+                sst["gcode_move"]["position"][2]
+            )
+        except Exception:
+            dz0 = 0.0
         seconds = abs(delta) / velocity
         _log(
             f"move target={target:.2f} cur={cur:.2f} delta={delta:.2f} "
@@ -380,7 +391,7 @@ class SmoothAutofocusThing(lt.Thing):
                         and (seg_floor is None or s[4] > seg_floor)
                         and abs(s[2]) < 0.5
                         and not s[3]
-                        and abs(s[1] - target) <= ztol
+                        and abs(s[1] - (target + dz0)) <= ztol
                 ):
                     return s
             return None
@@ -804,11 +815,57 @@ class SmoothAutofocusThing(lt.Thing):
         )
         if focus_static > 0 and focus_static > type(self)._SESS_STATIC:
             type(self)._SESS_STATIC = float(focus_static)
+        try:
+            sender = getattr(self._stage, "_send_gcode_script", None)
+            pos = self._stage.position if sender is not None else None
+            if (
+                    sender is not None and pos is not None
+                    and not getattr(self, "_far_regime_active", False)
+            ):
+                sender(script="SAMPLE_MESH_RESUME")
+                st = self._stage._get_status(payload={
+                    "objects": {"sample_mesh": None}
+                })
+                sm = (
+                             (st.get("result") or {}).get("status") or {}
+                     ).get("sample_mesh") or {}
+                zref = sm.get("zref")
+                if zref is not None:
+                    delta = float(pos.get("z")) - float(zref)
+                    sender(script=f"SAMPLE_MESH_SHIFT DELTA={delta:.3f}")
+                    _log(f"MESHSHIFT delta={delta:.1f}")
+        except Exception:
+            LOGGER.warning("mesh resume/shift after AF failed", exc_info=True)
 
     def _run_flow(self, monitor: StreamSharpnessMonitor) -> SmoothFocusResult:
         t0 = time.monotonic()
         mode = ""
+        try:
+            st = self._stage._get_status(payload={
+                "objects": {"gcode_move": None}
+            })
+            self._last_hw = float(
+                st["result"]["status"]["gcode_move"]["position"][2]
+            )
+        except Exception:
+            LOGGER.warning(
+                "AF logical-z resync failed, using cached", exc_info=True
+            )
         z0 = self._last_hw
+
+        try:
+            prev_gain_af = self._cam.analogue_gain
+            prev_exp_af = self._cam.exposure_time
+            if prev_exp_af:
+                _g, _e = _probe_regime(prev_gain_af, prev_exp_af)
+                self._cam.analogue_gain = _g
+                self._cam.exposure_time = _e
+                _log(f"AFREGIME g={_g} e={_e} (from {prev_gain_af}/{prev_exp_af})")
+            else:
+                _log("AFREGIME skipped: no live exposure reading")
+        except Exception:
+            LOGGER.warning("AF regime set failed", exc_info=True)
+            _log("AFREGIME SETFAIL")
 
         pre = monitor.frames_since(0)[-4:]
         static_med = (
@@ -817,9 +874,14 @@ class SmoothAutofocusThing(lt.Thing):
         mode += f"|static{static_med:.0f}"
 
         sess_ref = type(self)._SESS_STATIC
-        if not (
-                static_med > 0 and sess_ref > 0 and static_med >= 0.7 * sess_ref
-        ):
+        near_worthy = (
+                static_med >= 30.0
+                or (
+                        static_med > 0 and sess_ref > 0
+                        and static_med >= 0.7 * sess_ref
+                )
+        )
+        if not near_worthy:
             mode += "|near_skip"
         else:
             d_near = 1
@@ -910,12 +972,15 @@ class SmoothAutofocusThing(lt.Thing):
             except Exception:
                 far_gain_prev = None
         if far_exp_prev:
-            far_exp = max(100, min(8000, far_exp_prev // 2))
+            far_gain, far_exp = _probe_regime(
+                type(self)._LAST_REGIME[0] if type(self)._LAST_REGIME else 2.0,
+                type(self)._LAST_REGIME[1] if type(self)._LAST_REGIME else far_exp_prev,
+            )
+            far_exp = max(100, min(8000, far_exp))
         else:
             raise ValueError(
                 "no live exposure reading - refusing to invent far regime"
             )
-        far_gain = 2.0
         try:
             self._cam.analogue_gain = far_gain
             self._cam.exposure_time = far_exp

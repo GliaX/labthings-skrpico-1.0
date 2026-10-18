@@ -49,6 +49,7 @@ DENSIFY_JUMP = 20.0
 DENSIFY_MAX = 2
 ENVELOPE_XY = 700.0
 MAX_RADIUS = 700.0
+Z_ANCHOR_EXT = 200.0
 POINTS_PER_LEG_MIN = 6
 FIT_WINDOW = 0.7
 STATIC_FRAMES = 8
@@ -257,9 +258,16 @@ class ScanFocusPlaneThing(lt.Thing):
 
     def _clamp_anchor(self, z: float) -> float:
         """Predicted anchors may shape the sweep center but never leave
-        the approved z envelope around the pass start."""
-        return max(self._pass_z_start - MAX_DEPTH,
-                   min(self._pass_z_start + MAX_DEPTH, z))
+        the approved z envelope around the pass start (Z_ANCHOR_MAX;
+        extended to Z_ANCHOR_EXT only when the measured surface gradient
+        actually predicts focus out there)."""
+        lo = self._pass_z_start - MAX_DEPTH
+        hi = self._pass_z_start + MAX_DEPTH
+        grad = abs(getattr(self, "_grad_reach", 0.0))
+        if grad > 0:
+            lo = self._pass_z_start - Z_ANCHOR_EXT
+            hi = self._pass_z_start + Z_ANCHOR_EXT
+        return max(lo, min(hi, z))
 
     def _predict_z(self, row: int, col: int) -> Optional[float]:
         """Surface prediction for a lattice point: least-squares plane
@@ -329,6 +337,9 @@ class ScanFocusPlaneThing(lt.Thing):
             return None
         if abs(a) > 0.5 or abs(b) > 0.5:
             return None
+        self._grad_reach = max(
+            abs(a) * ENVELOPE_XY, abs(b) * ENVELOPE_XY
+        )
         return (float(a), float(b), float(c))
 
     def _predict_xy(self, x: float, y: float) -> Optional[float]:
@@ -422,6 +433,17 @@ class ScanFocusPlaneThing(lt.Thing):
         stable (>=3 controls), +-60 while the predictor is weak."""
         return NEAR_SPAN if self._surface_plane() is not None else 2 * NEAR_SPAN
 
+    def _claw_cap(self) -> float:
+        """How far the claw may extend per direction. Base +-MAX_DEPTH
+        (90). Widens toward Z_ANCHOR_EXT (200) only when the measured
+        surface gradient predicts focus that far from the reference -
+        the extension is available, never sought."""
+        cap = MAX_DEPTH
+        grad = abs(getattr(self, "_grad_reach", 0.0))
+        if grad > MAX_DEPTH:
+            cap = min(Z_ANCHOR_EXT, grad)
+        return cap
+
     def _measure_point(
             self, monitor: StreamSharpnessMonitor, anchor: float
     ) -> Tuple[Optional[float], str]:
@@ -461,11 +483,21 @@ class ScanFocusPlaneThing(lt.Thing):
             monitor, anchor - self._sweep_halfspan(),
             max(SWEEP_VELOCITY, _sweep_velocity())
         )
+        if not traj and getattr(self, "_last_leg_status", "") == "telestall":
+            LOGGER.info("PLANE: telestall retry once")
+            traj, frames = self._sweep_leg(
+                monitor, anchor - self._sweep_halfspan(),
+                max(SWEEP_VELOCITY, _sweep_velocity())
+            )
         if not traj:
             return None, f"sweep:{getattr(self, '_last_leg_status', 'notraj')}"
         pts = self._label_leg(frames, traj)
         depth = self._sweep_halfspan()
-        while len(pts) >= 12 and depth < MAX_DEPTH and self._still_rising(pts):
+        claw_cap = self._claw_cap()
+        while (
+                len(pts) >= 12 and depth < claw_cap
+                and self._still_rising(pts)
+        ):
             traj2, frames2 = self._sweep_leg(
                 monitor, anchor - depth - NEAR_SPAN,
                 max(SWEEP_VELOCITY, _sweep_velocity())
@@ -476,7 +508,7 @@ class ScanFocusPlaneThing(lt.Thing):
             depth += NEAR_SPAN
         depth_up = 0.0
         while (
-                len(pts) >= 12 and depth_up < MAX_DEPTH
+                len(pts) >= 12 and depth_up < claw_cap
                 and self._still_rising_top(pts)
         ):
             top_z = max(p[0] for p in pts)
@@ -631,7 +663,6 @@ class ScanFocusPlaneThing(lt.Thing):
                         and s[1] is not None
                         and (seg_floor is None or s[4] > seg_floor)
                         and abs(s[2]) < 0.5
-                        and not s[3]
                         and abs(s[1] - target) <= ztol
                 ):
                     return s
@@ -640,27 +671,49 @@ class ScanFocusPlaneThing(lt.Thing):
         stage.move_relative_z_timed(self._hw_steps_param(delta), seconds)
         self._last_hw = target
         marker = None
-        stall = 0
         prev_n = None
+        moved_seen = False
         t_wait0 = time.monotonic()
-        while marker is None and stall < MARKER_STALL_LIMIT:
+        wall_deadline = t_wait0 + seconds + 2.0
+        while marker is None:
+            if time.monotonic() > wall_deadline:
+                break
             if not move_only:
                 monitor.wait_frames(4, mark, timeout=0.5)
             motion_wait(timeout=0.5)
-            n = len(motion_since(0))
-            if prev_n is not None and n == prev_n:
-                stall += 1
-            else:
-                stall = 0
-            prev_n = n
+            seq = motion_since(0)
+            n = len(seq)
+            if n:
+                moved_seen = moved_seen or any(
+                    len(s) > 2 and abs(s[2]) > 0.5 for s in seq
+                )
             marker = _marker_seen()
+            if marker is not None:
+                break
+            drained = getattr(stage, "motion_drained", None)
+            if (
+                    moved_seen
+                    and drained is not None
+                    and drained(self._seg_floor_et or 0.0)
+            ):
+                break
+            if prev_n is not None and n == prev_n:
+                pass
+            prev_n = n
         _t_wait = time.monotonic() - t_wait0
         if marker is None:
-            LOGGER.info(
-                "PLANE: TELESTALL target=%.1f waited=%.2fs samples=%d",
-                target, _t_wait, len(motion_since(0)),
+            drained = getattr(stage, "motion_drained", None)
+            reason = (
+                "uncertified"
+                if moved_seen and drained is not None
+                   and drained(self._seg_floor_et or 0.0)
+                else "telestall"
             )
-            self._last_leg_status = "telestall"
+            LOGGER.info(
+                "PLANE: %s target=%.1f waited=%.2fs samples=%d",
+                reason.upper(), target, _t_wait, len(motion_since(0)),
+            )
+            self._last_leg_status = reason
             return [], []
         m_et = marker[4]
         self._seg_floor_et = m_et
@@ -777,11 +830,15 @@ class ScanFocusPlaneThing(lt.Thing):
             px: float,
             py: float,
             step: float,
+            z_start: float = 0.0,
     ) -> dict:
         measured = [
             (f["x"], f["y"], f["z"])
             for f in fits
-            if f["z"] is not None and "densify_level" not in f
+            if f["z"] is not None
+               and str(f.get("reason", "")).split(":")[0] in (
+                   "ok", "anchored", "static_ok", "edge", "late"
+               )
         ]
         if len(measured) < 4:
             raise SampleNotFoundError(
@@ -797,13 +854,31 @@ class ScanFocusPlaneThing(lt.Thing):
                 f"(x span {bx1 - bx0:.0f}, y span {by1 - by0:.0f}) - "
                 "surface is degenerate, need extent in both axes"
             )
-        cols = max(2, int(round((bx1 - bx0) / step)) + 1)
-        rows = max(2, int(round((by1 - by0) / step)) + 1)
+        cols = max(2, int(round((bx1 - bx0) / (step / 2.0))) + 1)
+        rows = max(2, int(round((by1 - by0) / (step / 2.0))) + 1)
         cell_x = (bx1 - bx0) / (cols - 1)
         cell_y = (by1 - by0) / (rows - 1)
 
         def _lat(ci: int, ri: int) -> Tuple[float, float]:
             return (bx0 + ci * cell_x, by0 + ri * cell_y)
+
+        def _idw(lx: float, ly: float) -> Tuple[float, int]:
+            """Inverse-distance interpolation over the K nearest controls;
+            exact control value when a lattice point sits on one."""
+            ranked = sorted(
+                measured,
+                key=lambda p: (p[0] - lx) ** 2 + (p[1] - ly) ** 2,
+            )
+            near = ranked[:4]
+            d0 = math.hypot(near[0][0] - lx, near[0][1] - ly)
+            if d0 < 1e-6:
+                return near[0][2], 0
+            num = den = 0.0
+            for px, py, pz in near:
+                w = 1.0 / ((px - lx) ** 2 + (py - ly) ** 2)
+                num += w * pz
+                den += w
+            return num / den, d0
 
         lookup: dict = {}
         direct = 0
@@ -811,25 +886,22 @@ class ScanFocusPlaneThing(lt.Thing):
         for ri in range(rows):
             for ci in range(cols):
                 lx, ly = _lat(ci, ri)
-                cand = min(
-                    measured,
-                    key=lambda p: (p[0] - lx) ** 2 + (p[1] - ly) ** 2,
-                )
-                lookup[(ci, ri)] = cand[2]
-                if math.hypot(cand[0] - lx, cand[1] - ly) <= step * 0.5:
+                z_val, d0 = _idw(lx, ly)
+                lookup[(ci, ri)] = z_val
+                if d0 <= step * 0.25:
                     direct += 1
                 else:
-                    indirect.append((lx, ly, cand[2]))
+                    indirect.append((lx, ly, round(z_val, 1)))
         if indirect:
             LOGGER.info(
-                "PLANE: %d/%d cells mapped from nearest control: %s",
-                len(indirect), cols * rows, indirect,
+                "PLANE: %d/%d cells interpolated between controls",
+                len(indirect), cols * rows,
             )
         LOGGER.info(
-            "PLANE: %d controls, %d/%d cells direct on %dx%d lattice, "
-            "bounds (%.0f,%.0f)-(%.0f,%.0f)",
+            "PLANE: %d controls, %d/%d cells direct on %dx%d lattice "
+            "(cell %.0fx%.0f), bounds (%.0f,%.0f)-(%.0f,%.0f)",
             len(measured), direct, cols * rows, cols, rows,
-            bx0, by0, bx1, by1,
+            cell_x, cell_y, bx0, by0, bx1, by1,
         )
         xs = [_lat(ci, 0)[0] for ci in range(cols)]
         ys = [_lat(0, ri)[1] for ri in range(rows)]
@@ -859,6 +931,7 @@ class ScanFocusPlaneThing(lt.Thing):
             f"SAMPLE_MESH COLS={len(xs)} ROWS={len(matrix)} "
             f"MIN_X={xs[0]:.3f} MAX_X={xs[-1]:.3f} "
             f"MIN_Y={ys[0]:.3f} MAX_Y={ys[-1]:.3f} "
+            f"ZREF={z_start:.3f} "
             f"GRID=\"{grid_s}\""
         )
         LOGGER.info(
@@ -1002,12 +1075,9 @@ class ScanFocusPlaneThing(lt.Thing):
                 result["ok"] = False
                 return result
             try:
-                coarse = [
-                    f for f in fits
-                    if "densify_level" not in f and f["z"] is not None
-                ]
                 result["install_response"] = self._install_from_fits(
-                    coarse, self._px, self._py, step
+                    fits, self._px, self._py, step,
+                    z_start=self._pass_z_start,
                 )
                 result["installed"] = True
             except SampleNotFoundError as exc:
@@ -1209,10 +1279,11 @@ class ScanFocusPlaneThing(lt.Thing):
             step: float,
             z_start: float,
     ) -> None:
-        """Sparse-first adaptive density: only where neighbors disagree
-        beyond DENSIFY_JUMP, insert midpoints and resolve them cheaply -
-        static verification against the interpolated prediction first,
-        full sweep only when that gate fails. Levels capped at DENSIFY_MAX.
+        """Adaptive density: level 1 measures every lattice midpoint
+        (halving effective spacing), deeper levels only where neighbors
+        disagree beyond DENSIFY_JUMP. Midpoints resolve cheaply - static
+        verification against the interpolated prediction first, full
+        sweep only when that gate fails. Levels capped at DENSIFY_MAX.
         """
         if DENSIFY_MAX <= 0:
             return
@@ -1237,7 +1308,7 @@ class ScanFocusPlaneThing(lt.Thing):
                         continue
                     seen.add(pair)
                     z1, z2 = pts[k1], pts[k2]
-                    if abs(z2 - z1) <= DENSIFY_JUMP:
+                    if level > 1 and abs(z2 - z1) <= DENSIFY_JUMP:
                         continue
                     pending.append(
                         (((k1[0] + k2[0]) / 2, (k1[1] + k2[1]) / 2),
