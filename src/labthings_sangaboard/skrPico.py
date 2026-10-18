@@ -67,19 +67,11 @@ class SkrPicoThing(BaseStage):
         for attr, key in (
             ("_CAL_FWHM", "fwhm_u"),
             ("_CAL_CONTRAST", "contrast"),
-            ("_CAL_BACKLASH", "backlash_u"),
-            ("_CAL_PEAK_SHARP", "peak_sharpness"),
             ("_CAL_ACCEL", "accel"),
         ):
             if d.get(key) is not None:
                 setattr(cls, attr, d[key])
 
-    def _save_cal(self, d: dict) -> None:
-        try:
-            with open(self._CAL_PATH, "w") as f:
-                json.dump(d, f)
-        except Exception:
-            pass
     def __exit__(
             self,
             _exc_type: type[BaseException],
@@ -434,6 +426,17 @@ class SkrPicoThing(BaseStage):
         finally:
             self.moving = False
             self.update_position()
+
+    def move_relative_xy_noblock(self, dx: int, dy: int) -> None:
+        client = self._client
+        self.moving = True
+        try:
+            self._send_gcode_script(
+                client,
+                f"G91\nG1 X{int(dx)} Y{int(dy)} S9000 F45000\nG90\n",
+            )
+        finally:
+            self.moving = False
 
     def _hardware_move_relative(
         self,

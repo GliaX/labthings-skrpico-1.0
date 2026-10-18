@@ -505,7 +505,12 @@ class StreamingPiCamera2(BaseCamera, ABC):
                     m = request.make_array("main")
                     m_rows, m_stride = m.shape[0], m.shape[1]
                     m_y_rows = m_rows * 2 // 3
-                    a = m[:m_y_rows, :m_stride].astype(_np.int16)
+                    m_y = m[:m_y_rows, :m_stride]
+                    win = 350
+                    r0 = max(0, (m_y_rows - win) // 2)
+                    c0 = max(0, (m_stride - win) // 2)
+                    a = m_y[r0:r0 + win, c0:c0 + win].astype(
+                        _np.int16)
                 except Exception:
                     a = y
             dx = a[:, 1:] - a[:, :-1]

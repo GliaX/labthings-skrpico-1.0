@@ -268,8 +268,11 @@ def _probe_regime(prev_gain, prev_exp):
     halved (less motion blur), clamped to keep 120fps and sane frames."""
     g = 2.0 * prev_gain if prev_gain else 2.0
     g = max(1.0, min(16.0, g))
-    e = (prev_exp / 2.0) if prev_exp else 1000.0
-    e = max(100.0, min(8000.0, e))
+    if not prev_exp:
+        raise ValueError(
+            "no live exposure reading - refusing to invent an AF regime"
+        )
+    e = max(100.0, min(8000.0, prev_exp // 2))
     return g, int(e)
 
 
@@ -300,7 +303,7 @@ class SmoothAutofocusThing(lt.Thing):
     _COOL_TIMER: Optional[threading.Timer] = None
     _AF_BUSY: bool = False
     _LAST_REGIME: Optional[tuple] = None
-    _COOL_DELAY: float = 10.0
+    _COOL_DELAY: float = 3.0
     _CAL_LOADED: bool = False
     _seg_floor_et: Optional[float] = None
     _last_leg_samples: list = []
@@ -906,9 +909,12 @@ class SmoothAutofocusThing(lt.Thing):
                 far_gain_prev = self._cam.analogue_gain
             except Exception:
                 far_gain_prev = None
-        far_exp = 1000
         if far_exp_prev:
-            far_exp = max(100, min(8000, far_exp_prev / 2))
+            far_exp = max(100, min(8000, far_exp_prev // 2))
+        else:
+            raise ValueError(
+                "no live exposure reading - refusing to invent far regime"
+            )
         far_gain = 2.0
         try:
             self._cam.analogue_gain = far_gain
