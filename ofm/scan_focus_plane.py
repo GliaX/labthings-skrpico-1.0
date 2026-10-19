@@ -52,8 +52,13 @@ DENSIFY_JUMP = 20.0
 DENSIFY_MAX = 2
 ENVELOPE_XY = 700.0
 MAX_RADIUS = 700.0
-COAST_GRID = 16
+COAST_GRID = 32
 COAST_CELL = 2.0 * MAX_RADIUS / COAST_GRID
+EDGE_WALK_STEP = 5.0
+EDGE_WALK_MAX_V = 200.0
+EDGE_WALK_POOL = 40.0
+MESH_CELLS = 128
+MESH_CELL = 2.0 * MAX_RADIUS / MESH_CELLS
 Z_ANCHOR_EXT = 200.0
 POINTS_PER_LEG_MIN = 6
 FIT_WINDOW = 0.7
@@ -889,6 +894,75 @@ class ScanFocusPlaneThing(lt.Thing):
         else:
             self._stage.move_relative(x=int(round(dx)), y=int(round(dy)))
 
+    @staticmethod
+    def _point_in_polys(x: float, y: float, polys) -> bool:
+        """Ray-casting test against the edge-walk polylines. Points on a
+        boundary count as sample (fail toward measuring)."""
+        inside = False
+        for poly in polys:
+            n = len(poly)
+            for k in range(n):
+                x1, y1 = poly[k]
+                x2, y2 = poly[(k + 1) % n]
+                if (y1 > y) != (y2 > y):
+                    xint = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+                    if x < xint:
+                        inside = not inside
+        return inside
+
+    def _build_masked_grid(
+            self, polys,
+    ) -> Tuple[List[float], List[float], List[List[bool]]]:
+        """Full-square MESH_CELLS lattice over the whole pass envelope;
+        mask[j][i] = True when the cell centre is on sample. The mask is
+        evaluated on a coarse stride (COAST_CELL) and refined by the
+        edge-walk polygons, so a 129x129 grid costs one ray-cast per
+        coarse cell plus boundary cells only."""
+        half = MAX_RADIUS
+        n = MESH_CELLS + 1
+        xs = [self._px - half + i * MESH_CELL for i in range(n)]
+        ys = [self._py - half + j * MESH_CELL for j in range(n)]
+        coarse = int(round(COAST_CELL / MESH_CELL)) or 1
+        mask: List[List[bool]] = [[False] * n for _ in range(n)]
+        for j in range(0, n, coarse):
+            for i in range(0, n, coarse):
+                on = self._point_in_polys(xs[i], ys[j], polys)
+                for dj in range(coarse):
+                    jj = j + dj
+                    if jj >= n:
+                        break
+                    row = mask[jj]
+                    for di in range(coarse):
+                        ii = i + di
+                        if ii < n:
+                            row[ii] = on
+        # boundary cells: exact ray-cast where the coarse fill meets its
+        # opposite (keeps edges at polygon precision, not COAST_CELL)
+        for j in range(n):
+            for i in range(n):
+                m = mask[j][i]
+                nb = (
+                    mask[j + 1][i] if j + 1 < n else m,
+                    mask[j - 1][i] if j > 0 else m,
+                    mask[j][i + 1] if i + 1 < n else m,
+                    mask[j][i - 1] if i > 0 else m,
+                )
+                if any(b != m for b in nb):
+                    mask[j][i] = self._point_in_polys(
+                        xs[i], ys[j], polys
+                    )
+        return xs, ys, mask
+
+    @staticmethod
+    def _near_boundary(mask, ri: int, ci: int) -> bool:
+        rows, cols = len(mask), len(mask[0])
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                r, c = ri + dr, ci + dc
+                if 0 <= r < rows and 0 <= c < cols and not mask[r][c]:
+                    return True
+        return False
+
     def _install_from_fits(
             self,
             fits: List[dict],
@@ -896,40 +970,28 @@ class ScanFocusPlaneThing(lt.Thing):
             py: float,
             step: float,
             z_start: float = 0.0,
+            polys=None,
     ) -> dict:
         measured = [
             (f["x"], f["y"], f["z"])
             for f in fits
             if f["z"] is not None
                and str(f.get("reason", "")).split(":")[0] in (
-                   "ok", "anchored", "static_ok", "edge", "late"
+                   "ok", "anchored", "static_ok", "edge", "late",
+                   "canyon", "holeedge", "coast",
                )
         ]
         if len(measured) < 4:
             raise SampleNotFoundError(
                 f"only {len(measured)} usable control points - need >= 4"
             )
-        bx0 = min(p[0] for p in measured)
-        bx1 = max(p[0] for p in measured)
-        by0 = min(p[1] for p in measured)
-        by1 = max(p[1] for p in measured)
-        if bx1 - bx0 < 1e-6 or by1 - by0 < 1e-6:
-            raise SampleNotFoundError(
-                f"measured controls are 1-D "
-                f"(x span {bx1 - bx0:.0f}, y span {by1 - by0:.0f}) - "
-                "surface is degenerate, need extent in both axes"
-            )
-        cols = max(2, int(round((bx1 - bx0) / (step / 2.0))) + 1)
-        rows = max(2, int(round((by1 - by0) / (step / 2.0))) + 1)
-        cell_x = (bx1 - bx0) / (cols - 1)
-        cell_y = (by1 - by0) / (rows - 1)
+        if polys:
+            xs, ys, mask = self._build_masked_grid(polys)
+        else:
+            xs, ys, mask = self._build_masked_grid([])
+        cols, rows = len(xs), len(ys)
 
-        def _lat(ci: int, ri: int) -> Tuple[float, float]:
-            return (bx0 + ci * cell_x, by0 + ri * cell_y)
-
-        def _idw(lx: float, ly: float) -> Tuple[float, int]:
-            """Inverse-distance interpolation over the K nearest controls;
-            exact control value when a lattice point sits on one."""
+        def _idw(lx: float, ly: float) -> float:
             ranked = sorted(
                 measured,
                 key=lambda p: (p[0] - lx) ** 2 + (p[1] - ly) ** 2,
@@ -937,66 +999,90 @@ class ScanFocusPlaneThing(lt.Thing):
             near = ranked[:4]
             d0 = math.hypot(near[0][0] - lx, near[0][1] - ly)
             if d0 < 1e-6:
-                return near[0][2], 0
+                return near[0][2]
             num = den = 0.0
-            for px, py, pz in near:
-                w = 1.0 / ((px - lx) ** 2 + (py - ly) ** 2)
-                num += w * pz
+            for cx_, cy_, cz_ in near:
+                w = 1.0 / ((cx_ - lx) ** 2 + (cy_ - ly) ** 2)
+                num += w * cz_
                 den += w
-            return num / den, d0
+            return num / den
 
-        lookup: dict = {}
+        sample_cells = sum(1 for row in mask for m in row if m)
+        matrix = [[0.0] * cols for _ in range(rows)]
         direct = 0
-        indirect: List[tuple] = []
+        boundary_z = 0
         for ri in range(rows):
             for ci in range(cols):
-                lx, ly = _lat(ci, ri)
-                z_val, d0 = _idw(lx, ly)
-                lookup[(ci, ri)] = z_val
-                if d0 <= step * 0.25:
+                if not mask[ri][ci]:
+                    continue
+                lx, ly = xs[ci], ys[ri]
+                ranked = sorted(
+                    measured,
+                    key=lambda p: (p[0] - lx) ** 2 + (p[1] - ly) ** 2,
+                )
+                d0 = math.hypot(ranked[0][0] - lx, ranked[0][1] - ly)
+                if d0 < 1e-6:
                     direct += 1
-                else:
-                    indirect.append((lx, ly, round(z_val, 1)))
-        if indirect:
-            LOGGER.info(
-                "PLANE: %d/%d cells interpolated between controls",
-                len(indirect), cols * rows,
+                    matrix[ri][ci] = ranked[0][2]
+                    continue
+                if self._near_boundary(mask, ri, ci) and d0 <= 2 * MESH_CELL:
+                    matrix[ri][ci] = ranked[0][2]
+                    boundary_z += 1
+                    continue
+                matrix[ri][ci] = _idw(lx, ly)
+        if sample_cells < 4:
+            raise SampleNotFoundError(
+                f"edge-walk mask leaves only {sample_cells} sample cells"
             )
         LOGGER.info(
-            "PLANE: %d controls, %d/%d cells direct on %dx%d lattice "
-            "(cell %.0fx%.0f), bounds (%.0f,%.0f)-(%.0f,%.0f)",
-            len(measured), direct, cols * rows, cols, rows,
-            cell_x, cell_y, bx0, by0, bx1, by1,
+            "PLANE: %d controls, %d/%d cells on sample over full "
+            "%dx%d square (cell %.1f), %d cells masked as glass, "
+            "%d boundary cells pinned",
+            len(measured), direct, sample_cells, cols, rows,
+            MESH_CELL, cols * rows - sample_cells, boundary_z,
         )
-        xs = [_lat(ci, 0)[0] for ci in range(cols)]
-        ys = [_lat(0, ri)[1] for ri in range(rows)]
-        matrix = [[lookup[(ci, ri)] for ci in range(cols)] for ri in range(rows)]
-        flat = [z for row in matrix for z in row]
+        flat = [
+            z
+            for row, row_m in zip(matrix, mask)
+            for z, m in zip(row, row_m)
+            if m
+        ]
         if max(flat) - min(flat) > MAX_PEAK_PTP:
             raise SampleNotFoundError(
                 f"focus range {max(flat) - min(flat):.1f} exceeds "
                 f"{MAX_PEAK_PTP:.0f} - refusing to install"
             )
+        def _m(r, c):
+            return mask[r][c]
+
         for r in range(len(matrix)):
             for c in range(len(xs) - 1):
-                if abs(matrix[r][c + 1] - matrix[r][c]) > MAX_NEIGHBOUR_JUMP:
+                if _m(r, c) and _m(r, c + 1) and abs(
+                        matrix[r][c + 1] - matrix[r][c]
+                ) > MAX_NEIGHBOUR_JUMP:
                     raise SampleNotFoundError(
                         f"x jump at row {r} col {c} exceeds "
                         f"{MAX_NEIGHBOUR_JUMP:.0f} - refusing to install"
                     )
         for r in range(len(matrix) - 1):
             for c in range(len(xs)):
-                if abs(matrix[r + 1][c] - matrix[r][c]) > MAX_NEIGHBOUR_JUMP:
+                if _m(r, c) and _m(r + 1, c) and abs(
+                        matrix[r + 1][c] - matrix[r][c]
+                ) > MAX_NEIGHBOUR_JUMP:
                     raise SampleNotFoundError(
                         f"y jump at row {r} col {c} exceeds "
                         f"{MAX_NEIGHBOUR_JUMP:.0f} - refusing to install"
                     )
         grid_s = " ".join(f"{z:.3f}" for z in flat)
+        mask_s = "".join(
+            "1" if m else "0" for row in mask for m in row
+        )
         script = (
             f"SAMPLE_MESH COLS={len(xs)} ROWS={len(matrix)} "
             f"MIN_X={xs[0]:.3f} MAX_X={xs[-1]:.3f} "
             f"MIN_Y={ys[0]:.3f} MAX_Y={ys[-1]:.3f} "
             f"ZREF={z_start:.3f} "
+            f"MASK=\"{mask_s}\" "
             f"GRID=\"{grid_s}\""
         )
         LOGGER.info(
@@ -1169,6 +1255,7 @@ class ScanFocusPlaneThing(lt.Thing):
                 result["install_response"] = self._install_from_fits(
                     fits, self._px, self._py, step,
                     z_start=self._pass_z_start,
+                    polys=getattr(self, "_coast_polys", None) or None,
                 )
                 result["installed"] = True
                 self._run_post_pass_af(result)
@@ -1208,6 +1295,7 @@ class ScanFocusPlaneThing(lt.Thing):
         self._grid_n = grid
         self._step_u = step
         type(self)._CTRL_XY = {}
+        self._coast_polys = []
         half = (grid - 1) / 2.0
 
         plan: List[Tuple[int, int, float, float, bool]] = []
@@ -1232,6 +1320,10 @@ class ScanFocusPlaneThing(lt.Thing):
         cur_x, cur_y = self._xy_tracked()
         try:
             occ = self._occupancy_map(monitor, done)
+            coasts = self._trace_coastlines(occ)
+            self._coast_polys = self._refine_coastlines(
+                monitor, coasts, done
+            )
             coasts = self._trace_coastlines(occ)
             cur_x, cur_y = self._xy_tracked()
             LOGGER.info(
@@ -1543,7 +1635,7 @@ class ScanFocusPlaneThing(lt.Thing):
         if z_hit is not None:
             self._note_control(ex, ey, z_hit - self._pass_z_start)
 
-    OCC_SWEEP_VELOCITY = 3000.0
+    OCC_SWEEP_VELOCITY = 1700.0
 
     def _occupancy_map(
             self, monitor, done,
@@ -1673,6 +1765,104 @@ class ScanFocusPlaneThing(lt.Thing):
                 cur = nxt
             coasts.append(coast)
         return coasts
+
+    def _refine_coastlines(
+            self, monitor, coasts, done,
+    ) -> List[List[Tuple[float, float]]]:
+        """Precision edge walk: follow each traced coastline as a chain of
+        short continuous hops (EDGE_WALK_STEP apart), classifying each hop
+        from the live stream - no stops, no sweeps. Emits ordered
+        polylines of boundary points (+/- half a hop). Hops never leave
+        the mapped disk; the envelope law outranks the walk."""
+
+        def cell_center(i, j):
+            n = COAST_GRID
+            return (
+                self._px + (i - (n - 1) / 2.0) * COAST_CELL,
+                self._py + (j - (n - 1) / 2.0) * COAST_CELL,
+            )
+
+        def classify(x: float, y: float) -> bool:
+            mark = len(monitor.times)
+            if not monitor.wait_frames(1, mark, timeout=0.25):
+                return True
+            frames = monitor.frames_since(mark)[-2:]
+            if not frames:
+                return True
+            sharp = statistics.median([f[2] for f in frames])
+            pooled = statistics.median([f[3] for f in frames])
+            return not (
+                sharp < self.BG_SHARP_MED
+                and pooled <= self.BG_POOLED_MED
+            )
+
+        polys: List[List[Tuple[float, float]]] = []
+        for coast in coasts:
+            if len(coast) < 2:
+                continue
+            poly: List[Tuple[float, float]] = []
+            pos = None
+            for i, j in coast:
+                cx, cy = cell_center(i, j)
+                if pos is None:
+                    cur_x, cur_y = self._xy_tracked()
+                    dx, dy = cx - cur_x, cy - cur_y
+                    if dx or dy:
+                        self._relative_move_xy(dx, dy)
+                        done.append((dx, dy))
+                    pos = (cx, cy)
+                    if classify(cx, cy):
+                        poly.append(pos)
+                    continue
+                seg = math.hypot(cx - pos[0], cy - pos[1])
+                if seg < 1e-9:
+                    continue
+                nsub = max(1, int(round(seg / EDGE_WALK_STEP)))
+                pool = max(1, int(EDGE_WALK_POOL / EDGE_WALK_STEP))
+                hops = [
+                    (
+                        pos[0] + (cx - pos[0]) * k / nsub,
+                        pos[1] + (cy - pos[1]) * k / nsub,
+                    )
+                    for k in range(1, nsub + 1)
+                ]
+                hops = [
+                    (wx, wy) for wx, wy in hops
+                    if math.hypot(wx - self._px, wy - self._py) <= MAX_RADIUS
+                ]
+                for b0 in range(0, len(hops), pool):
+                    batch = hops[b0:b0 + pool]
+                    dx = batch[-1][0] - pos[0]
+                    dy = batch[-1][1] - pos[1]
+                    if dx or dy:
+                        mark = len(monitor.times)
+                        self._relative_move_xy(dx, dy)
+                        done.append((dx, dy))
+                        travel = math.hypot(dx, dy) / EDGE_WALK_MAX_V
+                        t0 = time.monotonic()
+                        for hi, (wx, wy) in enumerate(batch):
+                            frac = (hi + 1) / len(batch)
+                            t_gate = t0 + frac * travel
+                            monitor.wait_until(
+                                t_gate, timeout=max(0.05, travel) + 0.05
+                            )
+                            if classify(wx, wy):
+                                poly.append((wx, wy))
+                        pos = batch[-1]
+                    else:
+                        for wx, wy in batch:
+                            if classify(wx, wy):
+                                poly.append((wx, wy))
+                        pos = batch[-1]
+                pos = (cx, cy)
+            if len(poly) >= 2:
+                polys.append(poly)
+        LOGGER.info(
+            "PLANE: edge walk traced %d coastline polylines, "
+            "%d boundary points total",
+            len(polys), sum(len(p) for p in polys),
+        )
+        return polys
 
     def _stage_x_now(self) -> float:
         return float(self._stage.position["x"])

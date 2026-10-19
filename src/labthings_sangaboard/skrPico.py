@@ -125,6 +125,7 @@ class SkrPicoThing(BaseStage):
         self._motion_samples = collections.deque(maxlen=4096)
         self._clock_offsets = collections.deque(maxlen=64)
         self._motion_ws_lock = threading.Lock()
+        self._et_handshake = 0.0
         self._motion_ws_cond = threading.Condition(self._motion_ws_lock)
         self._motion_ws_stop = threading.Event()
         self._motion_ws_thread = threading.Thread(
@@ -152,64 +153,64 @@ class SkrPicoThing(BaseStage):
         async def _run() -> None:
             import websockets
             uri = "ws://127.0.0.1:%s/websocket" % self.port
-            poll_s = 0.02
-            req_id = 10
             while not self._motion_ws_stop.is_set():
                 try:
                     async with websockets.connect(uri) as ws:
-                        _wlog("CONNECTED poll")
+                        _wlog("CONNECTED push")
+                        req_id = 10
+                        await ws.send(json.dumps({
+                            "jsonrpc": "2.0",
+                            "method": "printer.objects.subscribe",
+                            "params": {"objects": {"motion_report": None}},
+                            "id": req_id,
+                        }))
                         first = True
                         while not self._motion_ws_stop.is_set():
-                            req_id += 1
-                            query = json.dumps({
-                                "jsonrpc": "2.0",
-                                "method": "printer.objects.query",
-                                "params": {"objects": {"motion_report": None}},
-                                "id": req_id,
-                            })
-                            await ws.send(query)
-                            msg = None
-                            while not self._motion_ws_stop.is_set():
-                                raw = await asyncio.wait_for(
-                                    ws.recv(), 2.0
-                                )
-                                m = json.loads(raw)
-                                if m.get("id") == req_id:
-                                    msg = m
-                                    break
-                            if msg is None:
+                            raw = await asyncio.wait_for(ws.recv(), 2.0)
+                            m = json.loads(raw)
+                            params = m.get("params")
+                            if not isinstance(params, list) or not params:
                                 continue
-                            st = (
-                                msg.get("result", {}).get("status", {})
-                                .get("motion_report", {})
-                            )
+                            p0 = params[0]
+                            if not isinstance(p0, dict):
+                                continue
+                            st = p0.get("motion_report")
+                            if st is None and isinstance(
+                                    p0.get("status"), dict
+                            ):
+                                st = p0["status"].get("motion_report")
+                            if not isinstance(st, dict):
+                                continue
                             lp = st.get("live_position")
                             if lp is None:
                                 continue
-                            et = float(msg.get("result", {}).get("eventtime", 0.0) or 0.0)
-                            if first:
-                                first = False
-                                with self._motion_ws_lock:
-                                    self._et_handshake = et - time.monotonic()
-                                _wlog("HANDSHAKE %.4f" % (self._et_handshake,))
                             v_raw = st.get("live_velocity")
-                            v_now = float(v_raw) if v_raw is not None else 0.0
+                            v_now = (
+                                float(v_raw) if v_raw is not None else None
+                            )
+                            carried = 0.0 if v_raw is not None else 1.0
                             with self._motion_ws_lock:
-                                self._motion_last_v = v_now
                                 try:
                                     self._motion_last_z = float(lp[2])
                                 except Exception:
                                     pass
+                                self._motion_last_v = (
+                                    v_now if v_now is not None else 0.0
+                                )
                                 t_mono = time.monotonic()
                                 self._motion_samples.append(
-                                    (self._stamp_for(et), float(lp[2]), v_now, 0.0, et))
-                                if et:
-                                    self._clock_offsets.append(et - t_mono)
+                                    (
+                                        t_mono + self._et_handshake,
+                                        float(lp[2]),
+                                        v_now if v_now is not None else 0.0,
+                                        carried,
+                                        t_mono + self._et_handshake,
+                                    )
+                                )
                                 self._motion_ws_cond.notify_all()
-                            if first is False and getattr(self, "_motion_poll_logged", False) is False:
-                                self._motion_poll_logged = True
-                                _wlog("FIRST_SAMPLE poll")
-                            await asyncio.sleep(poll_s)
+                            if first:
+                                first = False
+                                _wlog("FIRST_SAMPLE push")
                 except Exception as e:
                     _wlog("ERR %r" % (e,))
                 if self._motion_ws_stop.wait(2.0):
@@ -267,6 +268,81 @@ class SkrPicoThing(BaseStage):
             return False
         last = snapshot[-1]
         return len(last) > 2 and last[0] > t_after and abs(last[2]) < 0.5
+
+    def query_motion_state(self) -> dict:
+        """One-shot motion_report query - used to certify a leg whose push
+        stream went quiet before the terminal state was pushed."""
+        client = self._client
+        response = self._get_status(client, {
+            "objects": {"motion_report": None}
+        })
+        return (
+            response.get("result", {}).get("status", {}).get(
+                "motion_report", {})
+        )
+
+    def _stage_handshake_et(self) -> float:
+        return getattr(self, "_et_handshake", 0.0)
+
+    def query_motion_state(self) -> dict:
+        """One-shot motion_report query - used to certify a leg whose push
+        stream went quiet before the terminal state was pushed."""
+        client = self._client
+        response = self._get_status(client, {
+            "objects": {"motion_report": None}
+        })
+        return (
+            response.get("result", {}).get("status", {}).get(
+                "motion_report", {})
+        )
+
+    def _stage_handshake_et(self) -> float:
+        return getattr(self, "_et_handshake", 0.0)
+
+    def query_motion_state(self) -> dict:
+        """One-shot motion_report query - used to certify a leg whose push
+        stream went quiet before the terminal state was pushed."""
+        client = self._client
+        response = self._get_status(client, {
+            "objects": {"motion_report": None}
+        })
+        return (
+            response.get("result", {}).get("status", {}).get(
+                "motion_report", {})
+        )
+
+    def _stage_handshake_et(self) -> float:
+        return getattr(self, "_et_handshake", 0.0)
+
+    def query_motion_state(self) -> dict:
+        """One-shot motion_report query - used to certify a leg whose push
+        stream went quiet before the terminal state was pushed."""
+        client = self._client
+        response = self._get_status(client, {
+            "objects": {"motion_report": None}
+        })
+        return (
+            response.get("result", {}).get("status", {}).get(
+                "motion_report", {})
+        )
+
+    def _stage_handshake_et(self) -> float:
+        return getattr(self, "_et_handshake", 0.0)
+
+    def query_motion_state(self) -> dict:
+        """One-shot motion_report query - used to certify a leg whose push
+        stream went quiet before the terminal state was pushed."""
+        client = self._client
+        response = self._get_status(client, {
+            "objects": {"motion_report": None}
+        })
+        return (
+            response.get("result", {}).get("status", {}).get(
+                "motion_report", {})
+        )
+
+    def _stage_handshake_et(self) -> float:
+        return getattr(self, "_et_handshake", 0.0)
 
     def motion_wait(self, timeout: float = 0.5) -> bool:
         """Block until a new telemetry sample arrives (Condition wait)."""

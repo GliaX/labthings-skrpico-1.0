@@ -375,17 +375,7 @@ class SmoothAutofocusThing(lt.Thing):
         delta = target - cur
         if abs(delta) < 0.5:
             return None, []
-        dz0 = 0.0
-        try:
-            st = self._stage._get_status(payload={
-                "objects": {"gcode_move": None, "toolhead": None}
-            })
-            sst = st["result"]["status"]
-            dz0 = float(sst["toolhead"]["position"][2]) - float(
-                sst["gcode_move"]["position"][2]
-            )
-        except Exception:
-            dz0 = 0.0
+        dz0 = float(getattr(self, "_frame_offset", 0.0))
         seconds = abs(delta) / velocity
         _log(
             f"move target={target:.2f} cur={cur:.2f} delta={delta:.2f} "
@@ -424,21 +414,78 @@ class SmoothAutofocusThing(lt.Thing):
             self._hw_steps_param(int(round(delta))), seconds
         )
         self._last_hw = target
-        t_leg_end = time.monotonic() + seconds + 0.2
+        # grace for the terminal push: bounded by push arrival, not clock -
+        # wait only until the first sample with v==0 shows up (the move's
+        # own completion push). Cap at 2x nominal move time as a bound.
+        grace_end = time.monotonic() + seconds * 2.0 + 0.2
         marker = _marker_seen()
-        prev_n = None
-        stall = 0
-        while marker is None and stall < 3 and time.monotonic() < t_leg_end:
+        while marker is None and time.monotonic() < grace_end:
             if motion_wait is None:
                 break
-            motion_wait(timeout=5.0)
-            n = len(motion_since(0))
-            if prev_n is not None and n == prev_n:
-                stall += 1
-            else:
-                stall = 0
-            prev_n = n
+            motion_wait(timeout=max(0.02, grace_end - time.monotonic()))
             marker = _marker_seen()
+        if marker is None:
+            query_state = getattr(
+                self._stage, "query_motion_state", None
+            )
+            if query_state is not None:
+                try:
+                    st = query_state()
+                    lp = st.get("live_position")
+                    v_raw = st.get("live_velocity")
+                    if lp is not None:
+                        z_now = float(lp[2])
+                        v_now = (
+                            float(v_raw) if v_raw is not None else None
+                        )
+                        settle_t = time.monotonic() + 2.0
+                        while v_now is not None and abs(v_now) >= 0.5:
+                            if time.monotonic() >= settle_t:
+                                break
+                            time.sleep(0.1)
+                            st = query_state()
+                            lp = st.get("live_position")
+                            v_raw = st.get("live_velocity")
+                            if lp is None:
+                                break
+                            z_now = float(lp[2])
+                            v_now = (
+                                float(v_raw)
+                                if v_raw is not None
+                                else None
+                            )
+                        z_ok = abs(z_now - (target + dz0)) <= ztol
+                        v_ok = v_now is None or abs(v_now) < 0.5
+                        if v_ok and not z_ok:
+                            self._frame_offset = z_now - target
+                            dz0 = self._frame_offset
+                            z_ok = abs(z_now - (target + dz0)) <= ztol
+                            _log(
+                                f"FRAME LEARN offset={dz0:.2f} "
+                                f"(live {z_now:.2f} vs target {target:.1f})"
+                            )
+                        if z_ok and v_ok:
+                            et = (
+                                time.monotonic()
+                                + getattr(
+                                    self._stage, "_et_handshake", 0.0
+                                )
+                            )
+                            marker = (
+                                et, z_now,
+                                v_now if v_now is not None else 0.0,
+                                0.0 if v_now is not None else 1.0,
+                                et,
+                            )
+                            _log(
+                                f"LEG QUIET-CERTIFY target={target:.1f} "
+                                f"z={z_now:.2f} v={v_now} "
+                                f"t={time.time():.3f}"
+                            )
+                except Exception:
+                    LOGGER.warning(
+                        "quiet-end motion query failed", exc_info=True
+                    )
         if marker is None:
             _log(
                 f"LEG TELESTALL target={target:.1f} "
@@ -886,6 +933,7 @@ class SmoothAutofocusThing(lt.Thing):
             LOGGER.warning(
                 "AF logical-z resync failed, using cached", exc_info=True
             )
+        self._frame_offset = 0.0
         z0 = self._last_hw
 
         self._mesh_suspended_by_af = False
