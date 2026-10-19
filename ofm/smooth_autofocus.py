@@ -325,7 +325,6 @@ class SmoothAutofocusThing(lt.Thing):
     _LAST_REGIME: Optional[tuple] = None
     _COOL_DELAY: float = 3.0
     _CAL_LOADED: bool = False
-    _seg_floor_et: Optional[float] = None
     _last_leg_samples: list = []
 
     def _hw_steps_param(self, delta_hw):
@@ -390,7 +389,6 @@ class SmoothAutofocusThing(lt.Thing):
             self._last_hw = target
             return None, []
         hoff = self._stage.handshake_offset()
-        seg_floor = self._seg_floor_et
         ztol = max(2.0, 0.005 * abs(delta))
 
         def _marker_seen():
@@ -398,7 +396,6 @@ class SmoothAutofocusThing(lt.Thing):
                 if (
                         len(s) > 4
                         and s[4] is not None
-                        and (seg_floor is None or s[4] > seg_floor)
                         and abs(s[2]) < 0.5
                         and not s[3]
                         and abs(s[1] - (target + dz0)) <= ztol
@@ -494,11 +491,9 @@ class SmoothAutofocusThing(lt.Thing):
             self._telestall_run = True
             return None, []
         m_et = marker[4]
-        self._seg_floor_et = m_et
         raw = [
             s for s in motion_since(0)
             if len(s) > 4 and s[4] is not None
-               and (seg_floor is None or s[4] > seg_floor)
                and s[4] <= m_et
         ]
         raw.sort(key=lambda s: s[4])

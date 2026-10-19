@@ -89,7 +89,6 @@ class ScanFocusPlaneThing(lt.Thing):
     _cam: BaseCamera = lt.thing_slot()
     _stage: BaseStage = lt.thing_slot()
     _af: SmoothAutofocusThing = lt.thing_slot("smooth_autofocus")
-    _seg_floor_et: Optional[float] = None
     _PASS_BUSY: bool = False
     _PASS_COOL_TIMER: Optional[threading.Timer] = None
     _PASS_COOL_DELAY: float = 3.0
@@ -708,9 +707,14 @@ class ScanFocusPlaneThing(lt.Thing):
             LOGGER.info("PLANE: no motion telemetry on stage, cannot sweep")
             self._last_leg_status = "notelemetry"
             return [], []
-        seg_floor = self._seg_floor_et
         mark = len(monitor.times)
         ztol = max(2.0, 0.05 * abs(delta))
+        frame_off = float(getattr(self, "_frame_offset", 0.0))
+
+        af_thing = getattr(self, "_af", None)
+        learned = getattr(af_thing, "_frame_offset", None) if af_thing is not None else None
+        self._frame_offset = float(learned) if learned is not None else 0.0
+        frame_off = self._frame_offset
 
         clear = getattr(stage, "clear_motion_history", None)
         if clear is not None:
@@ -719,6 +723,12 @@ class ScanFocusPlaneThing(lt.Thing):
         self._last_hw = target
         leg_start = time.monotonic()
 
+        def _motion_started():
+            return any(
+                len(sm_p) > 2 and abs(sm_p[2]) > 0.5
+                for sm_p in motion_since(0)
+            )
+
         def _marker_seen():
             for s in reversed(motion_since(0)):
                 if (
@@ -726,7 +736,7 @@ class ScanFocusPlaneThing(lt.Thing):
                         and s[4] is not None
                         and s[1] is not None
                         and abs(s[2]) < 0.5
-                        and abs(s[1] - target) <= ztol
+                        and abs(s[1] - (target + frame_off)) <= ztol
                 ):
                     return s
             return None
@@ -763,24 +773,52 @@ class ScanFocusPlaneThing(lt.Thing):
             return [], []
 
         t_wait0 = leg_start
-        wall_deadline = t_wait0 + seconds + 2.0
+        start_deadline = t_wait0 + 10.0
+        while not _motion_started():
+            if time.monotonic() > start_deadline:
+                break
+            motion_wait(timeout=0.25)
         marker = None
+        last_z = None
+        motion_seen = False
+        z_change_at = None
+        hard_end = t_wait0 + 15.0
         while marker is None:
-            if time.monotonic() > wall_deadline:
+            now = time.monotonic()
+            if now > hard_end:
+                break
+            seq = motion_since(0)
+            if seq:
+                newest_z = seq[-1][1]
+                if newest_z is not None and newest_z != last_z:
+                    if last_z is not None and not motion_seen:
+                        motion_seen = True
+                    if motion_seen:
+                        z_change_at = now
+                    last_z = newest_z
+            if motion_seen and z_change_at is not None:
+                if now - z_change_at > 1.5:
+                    break
+            elif now - t_wait0 > 6.0:
                 break
             monitor.wait_frames(4, mark, timeout=0.5)
             motion_wait(timeout=0.5)
             marker = _marker_seen()
         _t_wait = time.monotonic() - t_wait0
         if marker is None:
+            recent = motion_since(0)[-6:]
             LOGGER.info(
-                "PLANE: TELESTALL target=%.1f waited=%.2fs samples=%d",
-                target, _t_wait, len(motion_since(0)),
+                "PLANE: TELESTALL target=%.1f waited=%.2fs samples=%d "
+                "frame=%.2f recent=%s",
+                target, _t_wait, len(motion_since(0)), frame_off,
+                [
+                    (round(sm_p[1], 2), round(sm_p[2], 2))
+                    for sm_p in recent
+                ],
             )
             self._last_leg_status = "telestall"
             return [], []
         m_et = marker[4]
-        self._seg_floor_et = m_et
         raw = [
             s for s in motion_since(0)
             if len(s) > 4 and s[4] is not None and s[1] is not None
@@ -851,25 +889,16 @@ class ScanFocusPlaneThing(lt.Thing):
         """
         if not hasattr(self, "_px"):
             return
-        import traceback
-
-        tb = "".join(traceback.format_stack(limit=8)[:-1])
         if (
                 abs(x - self._px) > ENVELOPE_XY
                 or abs(y - self._py) > ENVELOPE_XY
         ):
-            LOGGER.error(
-                "PLANE: envelope call stack (axis violation)\n%s", tb
-            )
             raise SampleNotFoundError(
                 f"envelope violation: ({x:.0f},{y:.0f}) exceeds "
                 f"+/-{ENVELOPE_XY:.0f} of origin ({self._px:.0f},{self._py:.0f})"
             )
         dr = ((x - self._px) ** 2 + (y - self._py) ** 2) ** 0.5
         if dr > MAX_RADIUS:
-            LOGGER.error(
-                "PLANE: envelope call stack (radial %.0f)\n%s", dr, tb
-            )
             raise SampleNotFoundError(
                 f"envelope violation: ({x:.0f},{y:.0f}) is {dr:.0f} "
                 f"from origin, over MAX_RADIUS {MAX_RADIUS:.0f}"
@@ -1278,7 +1307,6 @@ class ScanFocusPlaneThing(lt.Thing):
         Points classified measured / anchored / skipped carry their z in
         `self._pts_xy` for the adaptive densify stage.
         """
-        self._seg_floor_et = None
         self._px = float(self._stage.position["x"])
         self._py = float(self._stage.position["y"])
         z_start = self._stage_z()
@@ -1669,6 +1697,8 @@ class ScanFocusPlaneThing(lt.Thing):
             j0, j1 = in_cells[0], in_cells[-1]
             x0 = self._px + (j0 - (n - 1) / 2.0) * cell
             x1 = self._px + (j1 - (n - 1) / 2.0) * cell
+            self._assert_envelope(x0, gy)
+            self._assert_envelope(x1, gy)
             dx = x0 - cur_x
             dy = gy - cur_y
             if dx or dy:
@@ -1805,6 +1835,10 @@ class ScanFocusPlaneThing(lt.Thing):
             for i, j in coast:
                 cx, cy = cell_center(i, j)
                 if pos is None:
+                    if (math.hypot(cx - self._px, cy - self._py) > MAX_RADIUS
+                            or abs(cx - self._px) > ENVELOPE_XY
+                            or abs(cy - self._py) > ENVELOPE_XY):
+                        continue
                     cur_x, cur_y = self._xy_tracked()
                     dx, dy = cx - cur_x, cy - cur_y
                     if dx or dy:
@@ -1829,9 +1863,14 @@ class ScanFocusPlaneThing(lt.Thing):
                 hops = [
                     (wx, wy) for wx, wy in hops
                     if math.hypot(wx - self._px, wy - self._py) <= MAX_RADIUS
+                    and abs(wx - self._px) <= ENVELOPE_XY
+                    and abs(wy - self._py) <= ENVELOPE_XY
                 ]
                 for b0 in range(0, len(hops), pool):
                     batch = hops[b0:b0 + pool]
+                    if not batch:
+                        continue
+                    self._assert_envelope(batch[-1][0], batch[-1][1])
                     dx = batch[-1][0] - pos[0]
                     dy = batch[-1][1] - pos[1]
                     if dx or dy:
