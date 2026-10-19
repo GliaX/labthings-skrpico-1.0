@@ -14,7 +14,10 @@ from openflexure_microscope_server.things.smooth_af_core import (
     fit_log_gaussian,
 )
 from openflexure_microscope_server.things.smooth_autofocus import (
+    NoFocusFoundError,
+    SmoothAutofocusParams,
     StreamSharpnessMonitor,
+    SmoothAutofocusThing,
     _EncoderBurst,
     _probe_regime,
 )
@@ -25,7 +28,7 @@ LOGGER = logging.getLogger(__name__)
 NEAR_SPAN = 30.0
 MAX_DEPTH = 90.0
 SWEEP_VELOCITY = 80.0
-RETURN_VELOCITY = 500.0
+TRANSIT_VELOCITY = 9000.0
 
 
 def _sweep_velocity() -> float:
@@ -49,6 +52,8 @@ DENSIFY_JUMP = 20.0
 DENSIFY_MAX = 2
 ENVELOPE_XY = 700.0
 MAX_RADIUS = 700.0
+COAST_GRID = 16
+COAST_CELL = 2.0 * MAX_RADIUS / COAST_GRID
 Z_ANCHOR_EXT = 200.0
 POINTS_PER_LEG_MIN = 6
 FIT_WINDOW = 0.7
@@ -56,8 +61,8 @@ STATIC_FRAMES = 8
 MARKER_STALL_LIMIT = 3
 MARKER_WAIT_S = 5.0
 MAX_Z_EXCURSION = 200.0
-CANYON_REACHES = (60.0, 120.0)
-CANYON_REACH_MAX = 120.0
+CANYON_REACHES = (60.0, 120.0, 170.0)
+CANYON_REACH_MAX = 170.0
 
 
 class SampleNotFoundError(RuntimeError):
@@ -78,6 +83,7 @@ class ScanFocusPlaneThing(lt.Thing):
     _class_settings = {"validate_properties_on_set": True}
     _cam: BaseCamera = lt.thing_slot()
     _stage: BaseStage = lt.thing_slot()
+    _af: SmoothAutofocusThing = lt.thing_slot("smooth_autofocus")
     _seg_floor_et: Optional[float] = None
     _PASS_BUSY: bool = False
     _PASS_COOL_TIMER: Optional[threading.Timer] = None
@@ -308,7 +314,7 @@ class ScanFocusPlaneThing(lt.Thing):
             if abs(z - pred) > 100.0:
                 suspects = type(self)._SUSPECTS
                 prev = suspects.pop(key, None)
-                if prev is None or abs(prev[1] - z) > 60.0:
+                if prev is None or abs(prev[2] - z) > 60.0:
                     suspects[key] = (x, y, z)
                     LOGGER.info(
                         "PLANE: control (%.0f,%.0f) z=%+.1f deviates "
@@ -427,8 +433,14 @@ class ScanFocusPlaneThing(lt.Thing):
         if not refs:
             return None
         ox = self._offsets_all()
+        in_disk = [
+            p for p in ox.values()
+            if math.hypot(p[0] - self._px, p[1] - self._py) <= MAX_RADIUS
+        ]
+        if not in_disk:
+            return None
         mx, my = min(
-            (ox[k] for k in refs),
+            in_disk,
             key=lambda p: (p[0] - gx) ** 2 + (p[1] - gy) ** 2,
         )
         lo_x, lo_y = gx, gy
@@ -443,7 +455,7 @@ class ScanFocusPlaneThing(lt.Thing):
             z_pred = self._predict_xy(t_x, t_y)
             if z_pred is not None:
                 self._sweep_leg(
-                    monitor, z_pred, RETURN_VELOCITY, move_only=True
+                    monitor, z_pred, TRANSIT_VELOCITY, move_only=True
                 )
             if self._sample_present(monitor, len(monitor.times)):
                 hi_x, hi_y = t_x, t_y
@@ -497,7 +509,7 @@ class ScanFocusPlaneThing(lt.Thing):
             )
         self._sweep_leg(
             monitor, anchor + self._sweep_halfspan(),
-            RETURN_VELOCITY, move_only=True
+            TRANSIT_VELOCITY, move_only=True
         )
         mark = len(monitor.times)
         static_med = self._sharp_at(
@@ -561,7 +573,7 @@ class ScanFocusPlaneThing(lt.Thing):
         if len(pts) < POINTS_PER_LEG_MIN:
             LOGGER.info("PLANE: sparse leg (%d pts), skipping", len(pts))
             self._sweep_leg(
-                monitor, anchor, RETURN_VELOCITY, move_only=True
+                monitor, anchor, TRANSIT_VELOCITY, move_only=True
             )
             return None, f"sparse:{len(pts)}"
         static_pooled = 0.0
@@ -585,7 +597,7 @@ class ScanFocusPlaneThing(lt.Thing):
             )
             if agree:
                 self._sweep_leg(
-                    monitor, fit_b.peak, RETURN_VELOCITY, move_only=True
+                    monitor, fit_b.peak, TRANSIT_VELOCITY, move_only=True
                 )
                 self._last_point_diag["brenner_rescue"] = True
                 LOGGER.info(
@@ -595,7 +607,7 @@ class ScanFocusPlaneThing(lt.Thing):
                 return float(fit_b.peak), "ok"
             if static_pooled > 0:
                 self._sweep_leg(
-                    monitor, anchor, RETURN_VELOCITY, move_only=True
+                    monitor, anchor, TRANSIT_VELOCITY, move_only=True
                 )
                 LOGGER.info(
                     "PLANE: flat, sample present (pooled=%.1f), anchored at start",
@@ -605,7 +617,7 @@ class ScanFocusPlaneThing(lt.Thing):
                 return float(anchor), "anchored"
             LOGGER.info("PLANE: fit rejected (%s), no sample", fit.reason)
             self._sweep_leg(
-                monitor, anchor, RETURN_VELOCITY, move_only=True
+                monitor, anchor, TRANSIT_VELOCITY, move_only=True
             )
             return None, f"fit:{fit.reason}"
         if (
@@ -619,7 +631,7 @@ class ScanFocusPlaneThing(lt.Thing):
                 fit.peak, fit_b.peak,
             )
             self._sweep_leg(
-                monitor, anchor, RETURN_VELOCITY, move_only=True
+                monitor, anchor, TRANSIT_VELOCITY, move_only=True
             )
             return None, "disagree"
         if not (
@@ -630,10 +642,10 @@ class ScanFocusPlaneThing(lt.Thing):
                 fit.peak, anchor - MAX_DEPTH, anchor + MAX_DEPTH,
             )
             self._sweep_leg(
-                monitor, anchor, RETURN_VELOCITY, move_only=True
+                monitor, anchor, TRANSIT_VELOCITY, move_only=True
             )
             return None, f"peak_outside:{fit.peak:.1f}"
-        self._sweep_leg(monitor, fit.peak, RETURN_VELOCITY, move_only=True)
+        self._sweep_leg(monitor, fit.peak, TRANSIT_VELOCITY, move_only=True)
         LOGGER.info(
             "PLANE: point fit peak=%.1f r2=%.3f snr=%.1f static=%.0f",
             fit.peak, fit.r2, fit.snr, static_med,
@@ -695,74 +707,78 @@ class ScanFocusPlaneThing(lt.Thing):
         mark = len(monitor.times)
         ztol = max(2.0, 0.05 * abs(delta))
 
+        clear = getattr(stage, "clear_motion_history", None)
+        if clear is not None:
+            clear()
+        stage.move_relative_z_timed(self._hw_steps_param(delta), seconds)
+        self._last_hw = target
+        leg_start = time.monotonic()
+
         def _marker_seen():
             for s in reversed(motion_since(0)):
                 if (
                         len(s) > 4
                         and s[4] is not None
                         and s[1] is not None
-                        and (seg_floor is None or s[4] > seg_floor)
                         and abs(s[2]) < 0.5
                         and abs(s[1] - target) <= ztol
                 ):
                     return s
             return None
 
-        stage.move_relative_z_timed(self._hw_steps_param(delta), seconds)
-        self._last_hw = target
-        marker = None
-        prev_n = None
-        moved_seen = False
-        t_wait0 = time.monotonic()
+        def _transit_drained():
+            drained = getattr(stage, "motion_drained", None)
+            return drained is not None and drained(0.0)
+
+        if move_only:
+            deadline = leg_start + max(seconds, 0.05) + 1.0
+            quiet_after = leg_start + seconds + 0.2
+            moved = False
+            while time.monotonic() < deadline:
+                motion_wait(timeout=0.1)
+                if _transit_drained():
+                    self._last_leg_status = "ok"
+                    return [], []
+                now = time.monotonic()
+                if not moved and any(
+                    len(sm_p) > 2 and abs(sm_p[2]) > 0.5
+                    for sm_p in motion_since(0)
+                ):
+                    moved = True
+                if now >= quiet_after and not moved:
+                    self._last_leg_status = "ok"
+                    return [], []
+            LOGGER.info(
+                "PLANE: transit timeout target=%.1f waited=%.2fs "
+                "samples=%d",
+                target, time.monotonic() - leg_start,
+                len(motion_since(0)),
+            )
+            self._last_leg_status = "telestall"
+            return [], []
+
+        t_wait0 = leg_start
         wall_deadline = t_wait0 + seconds + 2.0
+        marker = None
         while marker is None:
             if time.monotonic() > wall_deadline:
                 break
-            if not move_only:
-                monitor.wait_frames(4, mark, timeout=0.5)
+            monitor.wait_frames(4, mark, timeout=0.5)
             motion_wait(timeout=0.5)
-            seq = motion_since(0)
-            n = len(seq)
-            if n:
-                moved_seen = moved_seen or any(
-                    len(s) > 2 and abs(s[2]) > 0.5 for s in seq
-                )
             marker = _marker_seen()
-            if marker is not None:
-                break
-            drained = getattr(stage, "motion_drained", None)
-            if (
-                    moved_seen
-                    and drained is not None
-                    and drained(self._seg_floor_et or 0.0)
-            ):
-                break
-            if prev_n is not None and n == prev_n:
-                pass
-            prev_n = n
         _t_wait = time.monotonic() - t_wait0
         if marker is None:
-            drained = getattr(stage, "motion_drained", None)
-            reason = (
-                "uncertified"
-                if moved_seen and drained is not None
-                   and drained(self._seg_floor_et or 0.0)
-                else "telestall"
-            )
             LOGGER.info(
-                "PLANE: %s target=%.1f waited=%.2fs samples=%d",
-                reason.upper(), target, _t_wait, len(motion_since(0)),
+                "PLANE: TELESTALL target=%.1f waited=%.2fs samples=%d",
+                target, _t_wait, len(motion_since(0)),
             )
-            self._last_leg_status = reason
+            self._last_leg_status = "telestall"
             return [], []
         m_et = marker[4]
         self._seg_floor_et = m_et
-        if move_only:
-            return [], []
         raw = [
             s for s in motion_since(0)
             if len(s) > 4 and s[4] is not None and s[1] is not None
-               and (seg_floor is None or s[4] > seg_floor)
                and s[4] <= m_et
         ]
         raw.sort(key=lambda s: s[4])
@@ -830,16 +846,25 @@ class ScanFocusPlaneThing(lt.Thing):
         """
         if not hasattr(self, "_px"):
             return
+        import traceback
+
+        tb = "".join(traceback.format_stack(limit=8)[:-1])
         if (
                 abs(x - self._px) > ENVELOPE_XY
                 or abs(y - self._py) > ENVELOPE_XY
         ):
+            LOGGER.error(
+                "PLANE: envelope call stack (axis violation)\n%s", tb
+            )
             raise SampleNotFoundError(
                 f"envelope violation: ({x:.0f},{y:.0f}) exceeds "
                 f"+/-{ENVELOPE_XY:.0f} of origin ({self._px:.0f},{self._py:.0f})"
             )
         dr = ((x - self._px) ** 2 + (y - self._py) ** 2) ** 0.5
         if dr > MAX_RADIUS:
+            LOGGER.error(
+                "PLANE: envelope call stack (radial %.0f)\n%s", dr, tb
+            )
             raise SampleNotFoundError(
                 f"envelope violation: ({x:.0f},{y:.0f}) is {dr:.0f} "
                 f"from origin, over MAX_RADIUS {MAX_RADIUS:.0f}"
@@ -1026,12 +1051,36 @@ class ScanFocusPlaneThing(lt.Thing):
             )
         type(self)._PASS_BUSY = True
         self._cancel_pass_cooler()
+        try:
+            sm_st = self._stage._get_status(payload={
+                "objects": {"sample_mesh": None}
+            })
+            sm = (
+                (sm_st.get("result") or {}).get("status") or {}
+            ).get("sample_mesh") or {}
+            if sm.get("active"):
+                self._send_gcode("SAMPLE_MESH_SUSPEND")
+                type(self)._PASS_SUSPENDED_MESH = True
+                LOGGER.info(
+                    "PLANE: mesh transform suspended for pass"
+                )
+        except Exception:
+            type(self)._PASS_SUSPENDED_MESH = False
+            LOGGER.warning(
+                "mesh suspend for pass failed", exc_info=True
+            )
         prev_exp = prev_gain = None
         try:
             prev_exp = self._cam.exposure_time
             prev_gain = self._cam.analogue_gain
         except Exception:
             prev_exp = prev_gain = None
+        self._pass_base = (prev_gain, prev_exp)
+        if (prev_gain or 0.0) >= 3.5:
+            raise SampleNotFoundError(
+                "camera left in probe regime (gain %.1f) by a dead flow - "
+                "restore calibration before running a pass" % prev_gain
+            )
         try:
             if hasattr(self._stage, "set_homed"):
                 self._stage.set_homed()
@@ -1057,10 +1106,7 @@ class ScanFocusPlaneThing(lt.Thing):
                 monitor.wait_frames(4, 0, timeout=2.0)
                 with _EncoderBurst(self._cam):
                     _g, _e = _probe_regime(prev_gain, prev_exp)
-                    with self._cam._streaming_picamera() as picam:
-                        picam.set_controls(
-                            {"AnalogueGain": _g, "ExposureTime": _e}
-                        )
+                    self._cam.set_probe_controls_raw(_g, _e)
                     self._pass_inner(monitor, grid, step, fits)
                     if install:
                         self._densify(
@@ -1068,10 +1114,7 @@ class ScanFocusPlaneThing(lt.Thing):
                         )
         finally:
             try:
-                if prev_exp is not None:
-                    self._cam.exposure_time = int(prev_exp)
-                if prev_gain is not None:
-                    self._cam.analogue_gain = prev_gain
+                self._cam.restore_calibration_raw()
             except Exception:
                 LOGGER.warning("pass gain/exposure restore failed", exc_info=True)
             try:
@@ -1079,6 +1122,14 @@ class ScanFocusPlaneThing(lt.Thing):
                     self._stage.update_position()
             except Exception:
                 LOGGER.warning("Stage position sync failed", exc_info=True)
+            try:
+                if getattr(type(self), "_PASS_SUSPENDED_MESH", False):
+                    self._send_gcode("SAMPLE_MESH_RESUME")
+                    type(self)._PASS_SUSPENDED_MESH = False
+            except Exception:
+                LOGGER.warning(
+                    "mesh resume after pass failed", exc_info=True
+                )
             type(self)._PASS_BUSY = False
             self._arm_pass_cooler()
 
@@ -1120,6 +1171,7 @@ class ScanFocusPlaneThing(lt.Thing):
                     z_start=self._pass_z_start,
                 )
                 result["installed"] = True
+                self._run_post_pass_af(result)
             except SampleNotFoundError as exc:
                 result["ok"] = False
                 result["reasons"]["install_refused"] = str(exc)
@@ -1179,6 +1231,28 @@ class ScanFocusPlaneThing(lt.Thing):
         done: List[Tuple[float, float]] = []
         cur_x, cur_y = self._xy_tracked()
         try:
+            occ = self._occupancy_map(monitor, done)
+            coasts = self._trace_coastlines(occ)
+            cur_x, cur_y = self._xy_tracked()
+            LOGGER.info(
+                "PLANE: coastline map %d/%d cells present, %d coastlines",
+                sum(1 for v in occ.values() if v), len(occ), len(coasts),
+            )
+            in_sample = {
+                key for key, present in occ.items() if present
+            }
+
+            def coast_aware(r, c, gx, gy):
+                n = COAST_GRID
+                ci = int(round(
+                    (gy - self._py) / COAST_CELL + (n - 1) / 2.0
+                ))
+                cj = int(round(
+                    (gx - self._px) / COAST_CELL + (n - 1) / 2.0
+                ))
+                return (ci, cj) in in_sample or (
+                    (ci, cj) not in occ
+                )
             for row, col, gx, gy, inside in plan:
                 if not inside:
                     fits.append({
@@ -1186,6 +1260,15 @@ class ScanFocusPlaneThing(lt.Thing):
                         "y": gy,
                         "z": None,
                         "reason": "skipped:outside_radius",
+                        "diag": None,
+                    })
+                    continue
+                if not coast_aware(row, col, gx, gy):
+                    fits.append({
+                        "x": gx,
+                        "y": gy,
+                        "z": None,
+                        "reason": "skipped:coastline",
                         "diag": None,
                     })
                     continue
@@ -1198,7 +1281,7 @@ class ScanFocusPlaneThing(lt.Thing):
                 anchor = z_start if z_pred is None else z_pred
                 if z_pred is not None:
                     self._sweep_leg(
-                        monitor, anchor, RETURN_VELOCITY, move_only=True
+                        monitor, anchor, TRANSIT_VELOCITY, move_only=True
                     )
                 if not self._sample_present(
                         monitor, len(monitor.times)
@@ -1242,7 +1325,7 @@ class ScanFocusPlaneThing(lt.Thing):
                 anchor = z_start if z_pred is None else z_pred
                 if z_pred is not None:
                     self._sweep_leg(
-                        monitor, anchor, RETURN_VELOCITY, move_only=True
+                        monitor, anchor, TRANSIT_VELOCITY, move_only=True
                     )
                 if self._sample_present(monitor, len(monitor.times)):
                     peak, reason = self._measure_point(monitor, anchor)
@@ -1260,7 +1343,7 @@ class ScanFocusPlaneThing(lt.Thing):
                 canyon_hit = False
                 for reach in CANYON_REACHES:
                     self._sweep_leg(
-                        monitor, anchor - reach, RETURN_VELOCITY,
+                        monitor, anchor - reach, TRANSIT_VELOCITY,
                         move_only=True,
                     )
                     if not self._sample_present(
@@ -1285,13 +1368,25 @@ class ScanFocusPlaneThing(lt.Thing):
                 if canyon_hit:
                     cur_x, cur_y = self._xy_tracked()
                     continue
+                if math.hypot(gx - self._px, gy - self._py) > MAX_RADIUS:
+                    continue
                 edge = self._find_nearest_sample(
                     monitor, gx, gy, done
                 )
                 if edge is None:
                     continue
                 ex, ey = edge
-                if (round(ex, 3), round(ey, 3)) in type(self)._CTRL_XY:
+                if math.hypot(ex - self._px, ey - self._py) > MAX_RADIUS:
+                    LOGGER.info(
+                        "PLANE: edge find (%.0f,%.0f) landed outside the "
+                        "disk - discarding", ex, ey,
+                    )
+                    continue
+                dup = any(
+                        (cx - ex) ** 2 + (cy - ey) ** 2 < 30.0 ** 2
+                        for cx, cy in type(self)._CTRL_XY
+                )
+                if dup:
                     LOGGER.info(
                         "PLANE: edge find (%.0f,%.0f) duplicates an "
                         "existing control - skipping", ex, ey,
@@ -1300,7 +1395,7 @@ class ScanFocusPlaneThing(lt.Thing):
                 z_pred_e = self._predict_xy(ex, ey)
                 e_anchor = z_start if z_pred_e is None else z_pred_e
                 self._sweep_leg(
-                    monitor, e_anchor, RETURN_VELOCITY, move_only=True
+                    monitor, e_anchor, TRANSIT_VELOCITY, move_only=True
                 )
                 z_hit, r_hit = self._measure_point(monitor, e_anchor)
                 fits.append({
@@ -1313,21 +1408,73 @@ class ScanFocusPlaneThing(lt.Thing):
                 if z_hit is not None:
                     self._note_control(ex, ey, z_hit - z_start)
                 cur_x, cur_y = self._xy_tracked()
+            if type(self)._CTRL_XY:
+                deep = [
+                    (x, y)
+                    for (x, y), z in type(self)._CTRL_XY.items()
+                    if abs(y - self._py) > self._step_u * 0.5
+                    and z < -60.0
+                ]
+                mapped = set()
+                for dx_c, dy_c in deep:
+                    if math.hypot(
+                            dx_c - self._px, dy_c - self._py
+                    ) > MAX_RADIUS:
+                        continue
+                    col = round(dx_c / self._step_u)
+                    if col in mapped:
+                        continue
+                    mapped.add(col)
+                    cx0 = dx_c
+                    cy0 = self._py
+                    ex, ey2 = self._xy_tracked()
+                    ddx, ddy = cx0 - ex, cy0 - ey2
+                    if ddx or ddy:
+                        self._relative_move_xy(ddx, ddy)
+                        done.append((ddx, ddy))
+                    self._map_hole_edge(
+                        monitor, cx0, cy0, dy_c, done
+                    )
+                    if len(mapped) >= self.HOLE_EDGE_SEARCHES:
+                        break
+                cur_x, cur_y = self._xy_tracked()
         finally:
             for dx, dy in reversed(done):
                 if dx or dy:
                     self._relative_move_xy(-dx, -dy)
             try:
                 self._sweep_leg(
-                    monitor, z_start, RETURN_VELOCITY, move_only=True
+                    monitor, z_start, TRANSIT_VELOCITY, move_only=True
                 )
             except Exception:
                 LOGGER.warning(
                     "PLANE: z restore after abort failed", exc_info=True
                 )
+            fits.extend(getattr(self, "_pass_fits_local", []))
+            self._pass_fits_local = []
         self._sweep_leg(
-            monitor, anchor, RETURN_VELOCITY, move_only=True
+            monitor, anchor, TRANSIT_VELOCITY, move_only=True
         )
+
+    def _run_post_pass_af(self, result: dict) -> None:
+        self._cancel_pass_cooler()
+        self._af._forced_restore_base = getattr(self, "_pass_base", None)
+        try:
+            af = self._af.smooth_focus(SmoothAutofocusParams())
+            result["post_af"] = {"peak_z": af.peak_z, "mode": af.mode}
+            LOGGER.info(
+                "PLANE: post-pass AF parked at %.1f (%s)",
+                af.peak_z, af.mode,
+            )
+        except NoFocusFoundError as exc:
+            result["post_af"] = {"refused": str(exc)}
+            LOGGER.info("PLANE: post-pass AF refused: %s", exc)
+        except Exception as exc:
+            result["post_af"] = {"error": repr(exc)}
+            LOGGER.warning("post-pass AF failed", exc_info=True)
+        finally:
+            self._af._forced_restore_base = None
+            self._arm_pass_cooler()
 
     def _offsets(self, key, grid: int, step: float) -> Tuple[float, float]:
         """Absolute stage offsets of a (possibly fractional) grid key."""
@@ -1336,6 +1483,196 @@ class ScanFocusPlaneThing(lt.Thing):
             self._px + (c - (grid - 1) / 2.0) * step,
             self._py + (r - (grid - 1) / 2.0) * step,
         )
+
+    HOLE_EDGE_SEARCHES = 3
+    HOLE_EDGE_STEPS = 5
+
+    def _map_hole_edge(
+            self, monitor, x_start, y_start, y_target, done,
+    ) -> None:
+        """Binary-search the sample->hole transition between a measured
+        plateau point and a measured far point, then drop a control just
+        inside the plateau side so the mesh pins the edge instead of
+        interpolating blindly across the gap. The walk never leaves the
+        mapped disk: mids beyond MAX_RADIUS count as absent without
+        moving (the envelope law outranks the search)."""
+        lo_y, hi_y = y_start, y_target
+        if not self._sample_present(monitor, len(monitor.times)):
+            lo_y, hi_y = y_target, y_start
+        for _ in range(self.HOLE_EDGE_STEPS):
+            mid = (lo_y + hi_y) / 2.0
+            if math.hypot(x_start - self._px, mid - self._py) > MAX_RADIUS:
+                hi_y = mid
+                continue
+            dx, dy = 0.0, mid - self._xy_tracked()[1]
+            if dx or dy:
+                self._relative_move_xy(dx, dy)
+                done.append((dx, dy))
+            if self._sample_present(monitor, len(monitor.times)):
+                lo_y = mid
+            else:
+                hi_y = mid
+        if math.hypot(x_start - self._px, lo_y - self._py) > MAX_RADIUS:
+            LOGGER.info(
+                "PLANE: hole edge at (%.0f,%.0f) outside the mapped "
+                "disk - skipping", x_start, lo_y,
+            )
+            return
+        ex = self._stage_x_now()
+        ey = lo_y
+        z_pred = self._predict_xy(ex, ey)
+        anchor = self._pass_z_start if z_pred is None else z_pred
+        self._sweep_leg(
+            monitor, anchor, TRANSIT_VELOCITY, move_only=True
+        )
+        if not self._sample_present(monitor, len(monitor.times)):
+            LOGGER.info(
+                "PLANE: hole edge at (%.0f,%.0f) reads background at "
+                "plateau side - skipping", ex, ey,
+            )
+            return
+        z_hit, r_hit = self._measure_point(monitor, anchor)
+        self._pass_fits_local = getattr(self, "_pass_fits_local", [])
+        self._pass_fits_local.append({
+            "x": ex,
+            "y": ey,
+            "z": None if z_hit is None else z_hit - self._pass_z_start,
+            "reason": f"holeedge:{r_hit}",
+            "diag": getattr(self, "_last_point_diag", None),
+        })
+        if z_hit is not None:
+            self._note_control(ex, ey, z_hit - self._pass_z_start)
+
+    OCC_SWEEP_VELOCITY = 3000.0
+
+    def _occupancy_map(
+            self, monitor, done,
+    ) -> dict:
+        """Gate-only occupancy over the +/-MAX_RADIUS disk on a
+        COAST_GRID x COAST_GRID lattice, in ONE continuous serpentine
+        sweep: a single move per row, frame stamp mapped to cells along
+        the way. Records moves in done for the finally replay. Returns
+        {(i, j): bool} present map. Gate logic is unchanged (_sample_
+        present thresholds); fail-open per cell when starved."""
+        n = COAST_GRID
+        cell = COAST_CELL
+        occ = {}
+        cur_x, cur_y = self._xy_tracked()
+        col = list(range(n))
+        for i in range(n):
+            gy = self._py + (i - (n - 1) / 2.0) * cell
+            if i % 2:
+                col = col[::-1]
+            in_cells = [
+                j for j in col
+                if math.hypot(
+                    (self._px + (j - (n - 1) / 2.0) * cell) - self._px,
+                    gy - self._py,
+                ) <= MAX_RADIUS
+            ]
+            if not in_cells:
+                for j in col:
+                    occ[(i, j)] = False
+                continue
+            j0, j1 = in_cells[0], in_cells[-1]
+            x0 = self._px + (j0 - (n - 1) / 2.0) * cell
+            x1 = self._px + (j1 - (n - 1) / 2.0) * cell
+            dx = x0 - cur_x
+            dy = gy - cur_y
+            if dx or dy:
+                self._relative_move_xy(dx, dy)
+                done.append((dx, dy))
+                cur_x, cur_y = x0, gy
+            span = abs(x1 - x0)
+            if span < 1.0:
+                occ[(i, j0)] = self._sample_present(
+                    monitor, len(monitor.times)
+                )
+                for j in col:
+                    if j != j0:
+                        occ[(i, j)] = False
+                continue
+            mark = len(monitor.times)
+            monitor.wait_frames(1, mark, timeout=0.5)
+            self._relative_move_xy(x1 - x0, 0.0)
+            done.append((x1 - x0, 0.0))
+            cur_x = x1
+            t0 = time.monotonic()
+            travel = span / self.OCC_SWEEP_VELOCITY
+            for j in in_cells:
+                gx = self._px + (j - (n - 1) / 2.0) * cell
+                frac = abs(gx - x0) / span
+                t_gate = t0 + frac * travel + 0.5 / self.OCC_SWEEP_VELOCITY
+                monitor.wait_until(t_gate, timeout=max(0.05, travel))
+                frames = monitor.frames_since(mark)
+                if frames:
+                    picked = min(
+                        frames,
+                        key=lambda f: abs(f[0] - (t_gate - t0)),
+                    )
+                    sharp = [picked[2]]
+                    pooled = [picked[3]]
+                    bg = (
+                        sharp[0] < self.BG_SHARP_MED
+                        and pooled[0] <= self.BG_POOLED_MED
+                    )
+                    occ[(i, j)] = not bg
+                else:
+                    occ[(i, j)] = True
+        return occ
+
+    def _trace_coastlines(self, occ: dict) -> list:
+        """Moore-neighbour boundary walk over the occupancy map.
+        Returns a list of coastlines; each is an ordered list of cells
+        (i, j) on a present/absent boundary. Recursion-free."""
+        n = COAST_GRID
+
+        def at(i, j):
+            return 0 <= i < n and 0 <= j < n and occ.get((i, j), False)
+
+        visited = set()
+        coasts = []
+        starts = [
+            (i, j) for i in range(n) for j in range(n)
+            if at(i, j) and not at(i, j - 1)
+        ]
+        for s in sorted(starts):
+            if s in visited:
+                continue
+            coast = [s]
+            visited.add(s)
+            prev_dir = 6
+            cur = s
+            for _ in range(n * n * 8):
+                nbrs = [
+                    (cur[0] + di, cur[1] + dj)
+                    for di, dj in (
+                        (-1, -1), (-1, 0), (-1, 1), (0, 1),
+                        (1, 1), (1, 0), (1, -1), (0, -1),
+                    )
+                ]
+                k = nbrs.index(
+                    nbrs[(prev_dir - 2) % 8]
+                ) if False else (prev_dir - 2) % 8
+                found = None
+                for step in range(8):
+                    idx = (k + step) % 8
+                    if at(*nbrs[idx]):
+                        found = idx
+                        break
+                if found is None:
+                    break
+                nxt = nbrs[found]
+                prev_dir = found
+                if nxt == s:
+                    break
+                if nxt in visited:
+                    break
+                visited.add(nxt)
+                coast.append(nxt)
+                cur = nxt
+            coasts.append(coast)
+        return coasts
 
     def _stage_x_now(self) -> float:
         return float(self._stage.position["x"])

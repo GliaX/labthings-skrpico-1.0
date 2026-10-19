@@ -103,6 +103,15 @@ class StreamSharpnessMonitor:
             self.pooled[mark:],
         ))
 
+    def wait_until(self, t_mono: float, timeout: float = 2.0) -> bool:
+        """Block until the monitor's wall clock reaches t_mono
+        (time.monotonic domain) or timeout elapses."""
+        remain = t_mono - time.monotonic()
+        if remain <= 0:
+            return True
+        time.sleep(min(remain, timeout))
+        return True
+
     def wait_frames(self, n: int, mark: int = 0, timeout: float = 2.0) -> bool:
         """Happens-before: returns when n new frames are ingested."""
         deadline = time.monotonic() + timeout
@@ -265,7 +274,18 @@ def _log(line: str) -> None:
 
 def _probe_regime(prev_gain, prev_exp):
     """Probe imaging regime from the pre-AF state: gain doubled, exposure
-    halved (less motion blur), clamped to keep 120fps and sane frames."""
+    halved (less motion blur), clamped to keep 120fps and sane frames.
+
+    Single-trip law: if the camera already sits at probe-class gain the
+    previous flow died before restoring, and probing again would compound
+    (half-of-half into gain 4). Raise instead - the caller's law is to
+    refuse, never to invent."""
+    g_in = float(prev_gain or 0.0)
+    if g_in >= 3.5:
+        raise ValueError(
+            "camera already in probe regime (gain %.1f) - a previous "
+            "flow died before restore; refusing to stack halvings" % g_in
+        )
     g = 2.0 * prev_gain if prev_gain else 2.0
     g = max(1.0, min(16.0, g))
     if not prev_exp:
@@ -396,14 +416,19 @@ class SmoothAutofocusThing(lt.Thing):
                     return s
             return None
 
+        clear = getattr(self._stage, "clear_motion_history", None)
+        if clear is not None:
+            clear()
+
         self._stage.move_relative_z_timed(
             self._hw_steps_param(int(round(delta))), seconds
         )
         self._last_hw = target
+        t_leg_end = time.monotonic() + seconds + 0.2
         marker = _marker_seen()
         prev_n = None
         stall = 0
-        while marker is None and stall < 3:
+        while marker is None and stall < 3 and time.monotonic() < t_leg_end:
             if motion_wait is None:
                 break
             motion_wait(timeout=5.0)
@@ -698,12 +723,12 @@ class SmoothAutofocusThing(lt.Thing):
             LOGGER.error("AF cooler failed: %s", e)
         reg = type(self)._LAST_REGIME
         if not reg:
+            _log("COOL regime skip: no calibrated base known")
             return
         try:
-            self._cam.analogue_gain = reg[0]
-            self._cam.exposure_time = int(reg[1])
-            g2 = float(self._cam.analogue_gain)
-            e2 = int(self._cam.exposure_time)
+            rb = self._cam.restore_calibration_raw()
+            g2 = float(rb["gain"])
+            e2 = int(rb["exposure"])
             ok = abs(g2 - reg[0]) < 0.05 and abs(e2 - int(reg[1])) <= 2
             _log(
                 f"COOL regime g={reg[0]:.2f} e={reg[1]} "
@@ -829,11 +854,21 @@ class SmoothAutofocusThing(lt.Thing):
                 sm = (
                              (st.get("result") or {}).get("status") or {}
                      ).get("sample_mesh") or {}
+                surface = sm.get("surface_here")
                 zref = sm.get("zref")
-                if zref is not None:
+                if surface is not None:
+                    delta = float(pos.get("z")) - float(surface)
+                    sender(script=f"SAMPLE_MESH_SHIFT DELTA={delta:.3f}")
+                    self._mesh_suspended_by_af = False
+                    _log(
+                        f"MESHSHIFT delta={delta:.1f} "
+                        f"surface_here={surface:.1f}"
+                    )
+                elif zref is not None:
                     delta = float(pos.get("z")) - float(zref)
                     sender(script=f"SAMPLE_MESH_SHIFT DELTA={delta:.3f}")
-                    _log(f"MESHSHIFT delta={delta:.1f}")
+                    self._mesh_suspended_by_af = False
+                    _log(f"MESHSHIFT delta={delta:.1f} (legacy zref)")
         except Exception:
             LOGGER.warning("mesh resume/shift after AF failed", exc_info=True)
 
@@ -853,13 +888,31 @@ class SmoothAutofocusThing(lt.Thing):
             )
         z0 = self._last_hw
 
+        self._mesh_suspended_by_af = False
+        try:
+            st = self._stage._get_status(payload={
+                "objects": {"sample_mesh": None}
+            })
+            sm = (
+                (st.get("result") or {}).get("status") or {}
+            ).get("sample_mesh") or {}
+            if sm.get("active"):
+                sender = getattr(self._stage, "_send_gcode_script", None)
+                if sender is not None:
+                    sender(script="SAMPLE_MESH_SUSPEND")
+                    self._mesh_suspended_by_af = True
+                    _log("MESH SUSPEND for AF (transform deflection)")
+        except Exception:
+            LOGGER.warning(
+                "mesh suspend for AF failed", exc_info=True
+            )
+
         try:
             prev_gain_af = self._cam.analogue_gain
             prev_exp_af = self._cam.exposure_time
             if prev_exp_af:
                 _g, _e = _probe_regime(prev_gain_af, prev_exp_af)
-                self._cam.analogue_gain = _g
-                self._cam.exposure_time = _e
+                self._cam.set_probe_controls_raw(_g, _e)
                 _log(f"AFREGIME g={_g} e={_e} (from {prev_gain_af}/{prev_exp_af})")
             else:
                 _log("AFREGIME skipped: no live exposure reading")
@@ -982,8 +1035,7 @@ class SmoothAutofocusThing(lt.Thing):
                 "no live exposure reading - refusing to invent far regime"
             )
         try:
-            self._cam.analogue_gain = far_gain
-            self._cam.exposure_time = far_exp
+            self._cam.set_probe_controls_raw(far_gain, far_exp)
         except Exception as e:
             _log(f"FARREGIME SETFAIL {e!r}")
         _log(f"FARREGIME exp={far_exp} gain={far_gain} "
@@ -1024,10 +1076,8 @@ class SmoothAutofocusThing(lt.Thing):
                     break
 
         try:
-            if far_exp_prev is not None:
-                self._cam.exposure_time = int(far_exp_prev)
-            if far_gain_prev is not None:
-                self._cam.analogue_gain = far_gain_prev
+            self._cam.set_probe_controls_raw(far_gain_prev or 1.0,
+                                             far_exp_prev or 500)
         except Exception:
             LOGGER.warning("Far exposure restore failed", exc_info=True)
 
@@ -1139,11 +1189,21 @@ class SmoothAutofocusThing(lt.Thing):
         t0 = time.monotonic()
         burst = 120.0
         prev_exp = prev_gain = None
+        forced_base = getattr(self, "_forced_restore_base", None)
         try:
-            prev_exp = self._cam.exposure_time
-            prev_gain = self._cam.analogue_gain
-            if prev_gain is not None and prev_exp is not None:
-                type(self)._LAST_REGIME = (float(prev_gain), int(prev_exp))
+            if forced_base is not None:
+                prev_gain, prev_exp = forced_base
+                type(self)._LAST_REGIME = None
+            else:
+                prev_exp = self._cam.exposure_time
+                prev_gain = self._cam.analogue_gain
+                if prev_gain is not None and prev_exp is not None:
+                    if float(prev_gain) < 3.5:
+                        type(self)._LAST_REGIME = (
+                            float(prev_gain), int(prev_exp)
+                        )
+                    else:
+                        type(self)._LAST_REGIME = None
         except Exception:
             prev_exp = prev_gain = None
         type(self)._AF_BUSY = True
@@ -1191,8 +1251,7 @@ class SmoothAutofocusThing(lt.Thing):
                     )
                     try:
                         _g, _e = _probe_regime(prev_gain, prev_exp)
-                        self._cam.analogue_gain = _g
-                        self._cam.exposure_time = _e
+                        self._cam.set_probe_controls_raw(_g, _e)
                         try:
                             result = self._run_flow(monitor)
                         except NoFocusFoundError as exc:
@@ -1229,10 +1288,7 @@ class SmoothAutofocusThing(lt.Thing):
                         raise
         finally:
             try:
-                if prev_exp is not None:
-                    self._cam.exposure_time = int(prev_exp)
-                if prev_gain is not None:
-                    self._cam.analogue_gain = prev_gain
+                self._cam.restore_calibration_raw()
             except Exception:
                 LOGGER.warning("Exposure/gain restore failed", exc_info=True)
             try:
@@ -1240,6 +1296,17 @@ class SmoothAutofocusThing(lt.Thing):
                     self._stage.update_position()
             except Exception:
                 LOGGER.warning("Stage position sync failed", exc_info=True)
+            try:
+                if getattr(self, "_mesh_suspended_by_af", False):
+                    sender = getattr(self._stage, "_send_gcode_script", None)
+                    if sender is not None:
+                        sender(script="SAMPLE_MESH_RESUME")
+                    self._mesh_suspended_by_af = False
+                    _log("MESH RESUME after AF abort")
+            except Exception:
+                LOGGER.warning(
+                    "mesh resume after AF failed", exc_info=True
+                )
             type(self)._AF_BUSY = False
             self._arm_cooler()
 

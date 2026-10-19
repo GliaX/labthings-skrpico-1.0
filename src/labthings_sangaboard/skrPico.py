@@ -88,6 +88,9 @@ class SkrPicoThing(BaseStage):
         default_factory=lambda: {"x": True, "y": False, "z": True}, readonly=True
     )
 
+    def clear_motion_history(self) -> None:
+        self.motion_clear()
+
     def _send_gcode_script(self, client: Optional[httpx.Client] = None, script: str = "",
                            timeout: Optional[httpx.Timeout] = None) -> dict:
         """Send a gcode script to Moonraker, raising if the request fails."""
@@ -130,106 +133,83 @@ class SkrPicoThing(BaseStage):
         self._motion_ws_thread.start()
 
     def _motion_ws_main(self) -> None:
+        """Poll klippy motion_report directly over its own websocket.
+
+        Moonraker stopped pushing motion_report status updates, so this
+        client no longer relies on push semantics: it asks klippy for
+        live_position/live_velocity on a fixed cadence and timestamps each
+        reply with klippy's own eventtime, keeping the sample tuple shape
+        identical to the old push consumer.
+        """
+
+        def _wlog(line: str) -> None:
+            try:
+                with open(self.MOVES_LOG, "a") as f:
+                    f.write("WS %s t=%.3f\n" % (line, time.time()))
+            except Exception:
+                pass
+
         async def _run() -> None:
+            import websockets
             uri = "ws://127.0.0.1:%s/websocket" % self.port
-
-            def _wlog(line: str) -> None:
-                try:
-                    with open(self.MOVES_LOG, "a") as f:
-                        f.write("WS %s t=%.3f\n" % (line, time.time()))
-                except Exception:
-                    pass
-
+            poll_s = 0.02
+            req_id = 10
             while not self._motion_ws_stop.is_set():
                 try:
-                    import websockets
                     async with websockets.connect(uri) as ws:
-                        _wlog("CONNECTED")
-                        sub = json.dumps({
-                            "jsonrpc": "2.0", "method": "printer.objects.subscribe",
-                            "params": {"objects": {"motion_report": None}}, "id": 1,
-                        })
-                        subscribed = False
-                        for _ in range(5):
-                            await ws.send(sub)
-                            resp = json.loads(await asyncio.wait_for(ws.recv(), 5.0))
-                            if resp.get("id") == 1 and "error" in resp:
-                                _wlog("SUBERR %s" % (resp["error"],))
-                                await asyncio.sleep(1.0)
-                                continue
-                            if resp.get("id") == 1:
-                                subscribed = True
-                                break
-                        if not subscribed:
-                            _wlog("SUBGIVEUP")
-                            continue
-                        self._et_handshake = None
-                        try:
-                            with self._motion_ws_lock:
-                                self._et_handshake = (
-                                        float(resp["result"]["eventtime"])
-                                        - time.monotonic()
-                                )
-                            _wlog("HANDSHAKE %.4f" % (self._et_handshake,))
-                        except (KeyError, TypeError, ValueError):
-                            _wlog("HANDSHAKE MISS")
+                        _wlog("CONNECTED poll")
                         first = True
-                        async for raw in ws:
-                            if self._motion_ws_stop.is_set():
-                                break
-                            try:
-                                msg = json.loads(raw)
-                            except Exception:
+                        while not self._motion_ws_stop.is_set():
+                            req_id += 1
+                            query = json.dumps({
+                                "jsonrpc": "2.0",
+                                "method": "printer.objects.query",
+                                "params": {"objects": {"motion_report": None}},
+                                "id": req_id,
+                            })
+                            await ws.send(query)
+                            msg = None
+                            while not self._motion_ws_stop.is_set():
+                                raw = await asyncio.wait_for(
+                                    ws.recv(), 2.0
+                                )
+                                m = json.loads(raw)
+                                if m.get("id") == req_id:
+                                    msg = m
+                                    break
+                            if msg is None:
                                 continue
-                            params = msg.get("params") or []
-                            p0 = params[0] if params else None
-                            if not isinstance(p0, dict):
-                                continue
-                            mr = p0.get("motion_report")
-                            if mr is None:
-                                st = p0.get("status")
-                                if isinstance(st, dict):
-                                    mr = st.get("motion_report")
-                            if not isinstance(mr, dict):
-                                continue
-                            lp = mr.get("live_position")
-                            lz = getattr(self, "_motion_last_z", None)
+                            st = (
+                                msg.get("result", {}).get("status", {})
+                                .get("motion_report", {})
+                            )
+                            lp = st.get("live_position")
                             if lp is None:
-                                if lz is None:
-                                    continue
-                                lp = [0.0, 0.0, lz]
-                                zcar = 2.0
-                            else:
-                                zcar = 0.0
-                            et = None
-                            if len(params) > 1:
-                                try:
-                                    et = float(params[1])
-                                except (TypeError, ValueError):
-                                    et = None
-                            v_raw = mr.get("live_velocity")
-                            if v_raw is not None:
-                                v_now = float(v_raw)
-                                carried = 0.0
-                            else:
-                                v_now = getattr(self, "_motion_last_v", 0.0)
-                                carried = 1.0
-                            with self._motion_ws_lock:
-                                self._motion_last_v = v_now
-                                if zcar == 0.0:
-                                    try:
-                                        self._motion_last_z = float(lp[2])
-                                    except Exception:
-                                        pass
-                                t_mono = time.monotonic()
-                                self._motion_samples.append(
-                                    (self._stamp_for(et), float(lp[2]), v_now, carried or zcar, et))
-                                if et is not None:
-                                    self._clock_offsets.append(et - t_mono)
-                                self._motion_ws_cond.notify_all()
+                                continue
+                            et = float(msg.get("result", {}).get("eventtime", 0.0) or 0.0)
                             if first:
                                 first = False
-                                _wlog("FIRST_SAMPLE")
+                                with self._motion_ws_lock:
+                                    self._et_handshake = et - time.monotonic()
+                                _wlog("HANDSHAKE %.4f" % (self._et_handshake,))
+                            v_raw = st.get("live_velocity")
+                            v_now = float(v_raw) if v_raw is not None else 0.0
+                            with self._motion_ws_lock:
+                                self._motion_last_v = v_now
+                                try:
+                                    self._motion_last_z = float(lp[2])
+                                except Exception:
+                                    pass
+                                t_mono = time.monotonic()
+                                self._motion_samples.append(
+                                    (self._stamp_for(et), float(lp[2]), v_now, 0.0, et))
+                                if et:
+                                    self._clock_offsets.append(et - t_mono)
+                                self._motion_ws_cond.notify_all()
+                            if first is False and getattr(self, "_motion_poll_logged", False) is False:
+                                self._motion_poll_logged = True
+                                _wlog("FIRST_SAMPLE poll")
+                            await asyncio.sleep(poll_s)
                 except Exception as e:
                     _wlog("ERR %r" % (e,))
                 if self._motion_ws_stop.wait(2.0):
@@ -253,6 +233,20 @@ class SkrPicoThing(BaseStage):
             return list(seq)
         with lock:
             return [s for s in seq if s[0] > t0]
+
+    def motion_clear(self) -> None:
+        """Drop all buffered telemetry. Called at the start of a synced
+        move so the deque only ever holds the current leg's samples;
+        stale history from earlier legs can then never leak into
+        drain/marker checks."""
+        lock = getattr(self, "_motion_ws_lock", None)
+        if lock is not None:
+            with lock:
+                self._motion_samples.clear()
+        else:
+            seq = getattr(self, "_motion_samples", None)
+            if seq is not None:
+                seq.clear()
 
     def motion_drained(self, t_after: float) -> bool:
         """True once live_velocity returned to 0 after being non-zero past t_after."""
@@ -528,6 +522,7 @@ class SkrPicoThing(BaseStage):
         stage.
         """
         client = self._client
+        self._send_gcode_script(client, "SAMPLE_MESH_CLEAR")
         self._send_gcode_script(client, "SET_KINEMATIC_POSITION X=0 Y=0 Z=0 SET_HOMED=XYZ")
         self.update_position()
 

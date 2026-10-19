@@ -205,6 +205,8 @@ class StreamingPiCamera2(BaseCamera, ABC):
     mjpeg_bitrate: Optional[int] = lt.property(default=100000000)
     """Bitrate for MJPEG stream (None for default)."""
 
+    """Bitrate for MJPEG stream (None for default)."""
+
     stream_active: bool = lt.property(default=False, readonly=True)
     """Whether the MJPEG stream is active."""
 
@@ -296,6 +298,26 @@ class StreamingPiCamera2(BaseCamera, ABC):
                 # Note: This set a value 1 higher than requested as picamera2 always
                 # sets a lower value than requested, even if the requested is allowed
                 cam.set_controls({"ExposureTime": value + 1})
+
+    def set_probe_controls_raw(self, gain: float, exposure: int) -> None:
+        """Apply sweep imaging controls directly on the sensor. No
+        lt.setting writes: the persisted calibration is untouched, and
+        restore_calibration_raw returns exactly what the settings say."""
+        with self._streaming_picamera() as cam:
+            cam.set_controls({"AnalogueGain": float(gain)})
+
+        with self._streaming_picamera() as cam:
+            cam.set_controls({"ExposureTime": int(exposure) + 1})
+
+    def restore_calibration_raw(self) -> dict:
+        """Re-apply the persisted calibration straight to the sensor and
+        return its readback. Never writes settings."""
+        gain = float(self._analogue_gain)
+        expo = int(self._exposure_time)
+        with self._streaming_picamera() as cam:
+            cam.set_controls({"AnalogueGain": gain})
+            cam.set_controls({"ExposureTime": expo + 1})
+        return {"gain": gain, "exposure": expo}
 
     def _get_persistent_controls(self) -> dict:
         if self.streaming:
