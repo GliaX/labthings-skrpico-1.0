@@ -756,8 +756,8 @@ class ScanFocusPlaneThing(lt.Thing):
                     return [], []
                 now = time.monotonic()
                 if not moved and any(
-                    len(sm_p) > 2 and abs(sm_p[2]) > 0.5
-                    for sm_p in motion_since(0)
+                        len(sm_p) > 2 and abs(sm_p[2]) > 0.5
+                        for sm_p in motion_since(0)
                 ):
                     moved = True
                 if now >= quiet_after and not moved:
@@ -888,7 +888,9 @@ class ScanFocusPlaneThing(lt.Thing):
         violations abort the pass.
         """
         if not hasattr(self, "_px"):
-            return
+            raise SampleNotFoundError(
+                "envelope assert without pass origin - refusing to move"
+            )
         if (
                 abs(x - self._px) > ENVELOPE_XY
                 or abs(y - self._py) > ENVELOPE_XY
@@ -1070,17 +1072,20 @@ class ScanFocusPlaneThing(lt.Thing):
             len(measured), direct, sample_cells, cols, rows,
             MESH_CELL, cols * rows - sample_cells, boundary_z,
         )
-        flat = [
-            z
-            for row, row_m in zip(matrix, mask)
-            for z, m in zip(row, row_m)
-            if m
-        ]
+        for row_m, mrow in zip(matrix, mask):
+            for ci in range(1, cols):
+                if not mrow[ci]:
+                    row_m[ci] = row_m[ci - 1]
+            for ci in range(cols - 2, -1, -1):
+                if not mrow[ci]:
+                    row_m[ci] = row_m[ci + 1]
+        flat = [z for row in matrix for z in row]
         if max(flat) - min(flat) > MAX_PEAK_PTP:
             raise SampleNotFoundError(
                 f"focus range {max(flat) - min(flat):.1f} exceeds "
                 f"{MAX_PEAK_PTP:.0f} - refusing to install"
             )
+
         def _m(r, c):
             return mask[r][c]
 
@@ -1148,21 +1153,41 @@ class ScanFocusPlaneThing(lt.Thing):
             raise SampleNotFoundError("another pass is already running")
         try:
             st = self._stage._get_status(payload={
-                "objects": {"webhooks": None}
+                "objects": {
+                    "webhooks": None,
+                    "toolhead": None,
+                    "motion_report": ["live_velocity"],
+                }
             })
-            state_msg = str(
-                st["result"]["status"]["webhooks"]["state_message"]
-            )
+            ts = st["result"]["status"]
+            state_msg = str(ts["webhooks"]["state_message"])
             if "jog mode" in state_msg.lower():
                 raise SampleNotFoundError(
                     "klippy is in jog mode - exit jog (JOG VALUE=0) "
                     "before running a focus pass"
                 )
+            th = ts.get("toolhead") or {}
+            est_pt = float(th.get("estimated_print_time") or 0.0)
+            pt = float(th.get("print_time") or 0.0)
+            if pt - est_pt > 0.5:
+                raise SampleNotFoundError(
+                    "motion still queued (lead %.1fs) - let the stage "
+                    "settle before running a focus pass" % (pt - est_pt)
+                )
+            vel = float(
+                (ts.get("motion_report") or {}).get("live_velocity") or 0.0
+            )
+            if vel > 1.0:
+                raise SampleNotFoundError(
+                    "stage is moving (%.0f u/s) - let it settle "
+                    "before running a focus pass" % vel
+                )
         except SampleNotFoundError:
             raise
-        except Exception:
-            LOGGER.warning(
-                "could not read klippy state for jog interlock", exc_info=True
+        except Exception as exc:
+            raise SampleNotFoundError(
+                "could not verify klippy is settled for pass start "
+                "(%s) - refusing to run blind" % exc
             )
         type(self)._PASS_BUSY = True
         self._cancel_pass_cooler()
@@ -1171,8 +1196,8 @@ class ScanFocusPlaneThing(lt.Thing):
                 "objects": {"sample_mesh": None}
             })
             sm = (
-                (sm_st.get("result") or {}).get("status") or {}
-            ).get("sample_mesh") or {}
+                         (sm_st.get("result") or {}).get("status") or {}
+                 ).get("sample_mesh") or {}
             if sm.get("active"):
                 self._send_gcode("SAMPLE_MESH_SUSPEND")
                 type(self)._PASS_SUSPENDED_MESH = True
@@ -1263,15 +1288,24 @@ class ScanFocusPlaneThing(lt.Thing):
             "installed": False,
             "install_response": None,
         }
+        try:
+            live_x = float(self._stage.position["x"])
+            live_y = float(self._stage.position["y"])
+        except Exception:
+            live_x = live_y = None
+        trk_x, trk_y = self._xy_tracked()
+        drift = None if live_x is None else max(
+            abs(live_x - trk_x), abs(live_y - trk_y))
+        LOGGER.info(
+            "PLANE: pass end ok=%s origin (%.1f,%.1f) live (%s,%s) "
+            "tracked (%.1f,%.1f) drift %s",
+            ok, self._px, self._py,
+            "NA" if live_x is None else f"{live_x:.1f}",
+            "NA" if live_y is None else f"{live_y:.1f}",
+            trk_x, trk_y,
+            "NA" if drift is None else f"{drift:.1f}",
+        )
         if ok and install:
-            try:
-                live_x = float(self._stage.position["x"])
-                live_y = float(self._stage.position["y"])
-            except Exception:
-                live_x = live_y = None
-            trk_x, trk_y = self._xy_tracked()
-            drift = None if live_x is None else max(
-                abs(live_x - trk_x), abs(live_y - trk_y))
             if drift is not None and drift > 2.0:
                 result["reasons"]["install_refused"] = (
                     f"frame drifted {drift:.0f} units during pass; "
@@ -1309,6 +1343,9 @@ class ScanFocusPlaneThing(lt.Thing):
         """
         self._px = float(self._stage.position["x"])
         self._py = float(self._stage.position["y"])
+        LOGGER.info(
+            "PLANE: pass origin (%.1f, %.1f)", self._px, self._py,
+        )
         z_start = self._stage_z()
         if z_start != z_start:
             self._last_hw = float(self._stage.position["z"])
@@ -1320,6 +1357,7 @@ class ScanFocusPlaneThing(lt.Thing):
         self._static_fast = False
         self._pts_xy = {}
         self._xy_pos = (self._px, self._py)
+        self._freeze_no_replay = False
         self._grid_n = grid
         self._step_u = step
         type(self)._CTRL_XY = {}
@@ -1371,8 +1409,9 @@ class ScanFocusPlaneThing(lt.Thing):
                     (gx - self._px) / COAST_CELL + (n - 1) / 2.0
                 ))
                 return (ci, cj) in in_sample or (
-                    (ci, cj) not in occ
+                        (ci, cj) not in occ
                 )
+
             for row, col, gx, gy, inside in plan:
                 if not inside:
                     fits.append({
@@ -1503,8 +1542,8 @@ class ScanFocusPlaneThing(lt.Thing):
                     )
                     continue
                 dup = any(
-                        (cx - ex) ** 2 + (cy - ey) ** 2 < 30.0 ** 2
-                        for cx, cy in type(self)._CTRL_XY
+                    (cx - ex) ** 2 + (cy - ey) ** 2 < 30.0 ** 2
+                    for cx, cy in type(self)._CTRL_XY
                 )
                 if dup:
                     LOGGER.info(
@@ -1533,7 +1572,7 @@ class ScanFocusPlaneThing(lt.Thing):
                     (x, y)
                     for (x, y), z in type(self)._CTRL_XY.items()
                     if abs(y - self._py) > self._step_u * 0.5
-                    and z < -60.0
+                       and z < -60.0
                 ]
                 mapped = set()
                 for dx_c, dy_c in deep:
@@ -1559,6 +1598,17 @@ class ScanFocusPlaneThing(lt.Thing):
                         break
                 cur_x, cur_y = self._xy_tracked()
         finally:
+            drift = getattr(self._stage, "_xy_live_drift", lambda: None)()
+            if drift is not None and drift > 50.0:
+                type(self)._freeze_no_replay = True
+                LOGGER.error(
+                    "PLANE: FREEZE - live/tracked XY diverged %.0f units "
+                    "(origin %.1f,%.1f tracked %.1f,%.1f) - replay "
+                    "cancelled, stage left in place, operator required",
+                    drift, self._px, self._py,
+                    self._xy_tracked()[0], self._xy_tracked()[1],
+                )
+                return
             for dx, dy in reversed(done):
                 if dx or dy:
                     self._relative_move_xy(-dx, -dy)
@@ -1735,8 +1785,8 @@ class ScanFocusPlaneThing(lt.Thing):
                     sharp = [picked[2]]
                     pooled = [picked[3]]
                     bg = (
-                        sharp[0] < self.BG_SHARP_MED
-                        and pooled[0] <= self.BG_POOLED_MED
+                            sharp[0] < self.BG_SHARP_MED
+                            and pooled[0] <= self.BG_POOLED_MED
                     )
                     occ[(i, j)] = not bg
                 else:
@@ -1822,8 +1872,8 @@ class ScanFocusPlaneThing(lt.Thing):
             sharp = statistics.median([f[2] for f in frames])
             pooled = statistics.median([f[3] for f in frames])
             return not (
-                sharp < self.BG_SHARP_MED
-                and pooled <= self.BG_POOLED_MED
+                    sharp < self.BG_SHARP_MED
+                    and pooled <= self.BG_POOLED_MED
             )
 
         polys: List[List[Tuple[float, float]]] = []
@@ -1863,13 +1913,21 @@ class ScanFocusPlaneThing(lt.Thing):
                 hops = [
                     (wx, wy) for wx, wy in hops
                     if math.hypot(wx - self._px, wy - self._py) <= MAX_RADIUS
-                    and abs(wx - self._px) <= ENVELOPE_XY
-                    and abs(wy - self._py) <= ENVELOPE_XY
+                       and abs(wx - self._px) <= ENVELOPE_XY
+                       and abs(wy - self._py) <= ENVELOPE_XY
                 ]
                 for b0 in range(0, len(hops), pool):
                     batch = hops[b0:b0 + pool]
                     if not batch:
                         continue
+                    drift = getattr(
+                        self._stage, "_xy_live_drift", lambda: None
+                    )()
+                    if drift is not None and drift > 50.0:
+                        raise SampleNotFoundError(
+                            f"live/tracked XY diverged {drift:.0f} units "
+                            "mid-walk - aborting pass"
+                        )
                     self._assert_envelope(batch[-1][0], batch[-1][1])
                     dx = batch[-1][0] - pos[0]
                     dy = batch[-1][1] - pos[1]
@@ -1887,13 +1945,12 @@ class ScanFocusPlaneThing(lt.Thing):
                             )
                             if classify(wx, wy):
                                 poly.append((wx, wy))
-                        pos = batch[-1]
                     else:
                         for wx, wy in batch:
                             if classify(wx, wy):
                                 poly.append((wx, wy))
-                        pos = batch[-1]
-                pos = (cx, cy)
+                    pos = batch[-1]
+                pos = None
             if len(poly) >= 2:
                 polys.append(poly)
         LOGGER.info(

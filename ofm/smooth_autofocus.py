@@ -498,6 +498,13 @@ class SmoothAutofocusThing(lt.Thing):
         ]
         raw.sort(key=lambda s: s[4])
         self._last_leg_samples = raw
+        if not raw:
+            _log(
+                f"LEG EMPTY-TRAJ target={target:.1f} "
+                f"t={time.time():.3f}"
+            )
+            self._telestall_run = True
+            return None, []
         _log(
             f"LEG MARKER n={len(raw)} z={marker[1]:.1f} "
             f"et={m_et:.3f} t={time.time():.3f}"

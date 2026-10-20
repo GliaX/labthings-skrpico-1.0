@@ -1,49 +1,50 @@
 import json
 import logging
+import queue
 import statistics
+import sys
 import threading
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Literal, Optional, Self
 
+import labthings_fastapi as lt
 import numpy as np
 from picamera2.encoders import MJPEGEncoder
-from openflexure_microscope_server.things.camera.picamera import (
-    PicameraStreamOutput,
-    _frame_stash_start,
-    _frame_stash_dump,
-)
 from pydantic import BaseModel, Field
 
-import labthings_fastapi as lt
-
+from openflexure_microscope_server.things.camera.picamera import (
+    PicameraStreamOutput,
+)
 from .autofocus import (
     AutofocusThing,
     NoFocusFoundError as ScanNoFocusFoundError,
     SharpnessDataArrays,
 )
 from .camera import BaseCamera
-from .stage import BaseStage
 from .smooth_af_core import (
     CurvePoint,
     FitOutcome,
     fit_log_gaussian,
     median_filter_curve,
 )
+from .stage import BaseStage
+
+sys.setswitchinterval(0.001)
 
 LOGGER = logging.getLogger(__name__)
 
 _FAR_SPAN = 1024.0
-_FAR_VELOCITY = 6000.0
+_FAR_VELOCITY = 9000.0
 _FAR_MEDIAN_BAR = 1.25
 _NEAR_SPAN = 110.0
-_NEAR_VELOCITY = 250.0
 _TINY_SPAN = 180.0
 _TINY_VELOCITY = 700.0
 _TINY_MIN_V = 100.0
-_PARK_VELOCITY = 6000.0
+_PARK_VELOCITY = 9000.0
+_PARK_CREEP = 300.0
+_CAL_V_ACCEL = 6000.0
 _MEDIAN_BAR = 1.6
 _EDGE_MARGIN = 0.12
 FPS = 120.0
@@ -55,13 +56,6 @@ class NoFocusFoundError(RuntimeError):
 
 class SmoothAutofocusParams(BaseModel):
     search_span_steps: int = Field(default=32, gt=0)
-    min_r2: float = Field(default=0.5, ge=0, le=1)
-    min_snr: float = Field(default=1.4, ge=1)
-
-
-_FOLLOW_LOG_PATH = (
-    Path(__file__).resolve().parents[3] / "smooth_af_follow_log.jsonl"
-)
 
 
 @dataclass
@@ -74,75 +68,31 @@ class SmoothFocusResult:
 
 
 @dataclass
-class MetricProbeResult:
-    sharpness: float
-    brightness: float
-    n_frames: int
-    fps: float
-    streaming_mode: str
-    chroma: float = 0.0
-    pooled: float = 0.0
-
-
-@dataclass
-class GateCalibration:
-    fwhm_u: float
-    contrast: float
-    peak_sharpness: float
-    floor_sharpness: float
-    peak_z: float
-    sweep_error_u: float
-    backlash_u: float
-    near_velocity: float
-    tiny_velocity: float
-    tiny_span: float
-    mode: str
-
-
-class FollowParams(BaseModel):
-    interval_s: float = Field(default=60.0, gt=0)
-    iterations: int = Field(default=0, ge=0)
-    search_span_steps: int = Field(default=16, gt=0)
-
-
-class FollowEntry(BaseModel):
-    index: int
-    ts: float
-    peak_z: Optional[float]
-    elapsed_s: float
-    mode: str
-    error: Optional[str] = None
-
-
-class FollowResult(BaseModel):
-    stops: int
-    peaks: List[float]
-    entries: List[FollowEntry]
-
-
 class StreamSharpnessMonitor:
     """Per-frame metrics from the camera's raw YUV pre_callback hook."""
 
-    def __init__(self, camera: BaseCamera) -> None:
+    def __init__(self, camera: BaseCamera, plane: str = "lores") -> None:
         self.camera = camera
-        self.running = False
+        self.plane = plane
         self.times: List[float] = []
         self.sharpness: List[float] = []
         self.brightness: List[float] = []
         self.chroma: List[float] = []
         self.pooled: List[float] = []
-        self.decoded = 0
+        self.brenner: List[float] = []
         self._hook_lock = threading.Lock()
         self.frame_event = threading.Event()
 
-    def _hook_cb(self, ts, sharp, bright, chroma=0.0, pooled=0.0) -> None:
+    def _hook_cb(
+            self, ts, sharp, bright, chroma=0.0, pooled=0.0, brenner=0.0
+    ) -> None:
         with self._hook_lock:
             self.times.append(ts)
             self.sharpness.append(sharp)
             self.brightness.append(bright)
             self.chroma.append(chroma)
             self.pooled.append(pooled)
-            self.decoded += 1
+            self.brenner.append(brenner)
         self.frame_event.set()
 
     def frames_since(self, mark: int):
@@ -152,6 +102,15 @@ class StreamSharpnessMonitor:
             self.sharpness[mark:],
             self.pooled[mark:],
         ))
+
+    def wait_until(self, t_mono: float, timeout: float = 2.0) -> bool:
+        """Block until the monitor's wall clock reaches t_mono
+        (time.monotonic domain) or timeout elapses."""
+        remain = t_mono - time.monotonic()
+        if remain <= 0:
+            return True
+        time.sleep(min(remain, timeout))
+        return True
 
     def wait_frames(self, n: int, mark: int = 0, timeout: float = 2.0) -> bool:
         """Happens-before: returns when n new frames are ingested."""
@@ -165,15 +124,13 @@ class StreamSharpnessMonitor:
         return True
 
     def __enter__(self) -> Self:
-        self.running = True
         set_hook = getattr(self.camera, "set_af_metric_hook", None)
         if set_hook is None:
             raise RuntimeError("AF requires a YUV metric hook camera")
-        set_hook(self._hook_cb)
+        set_hook(self._hook_cb, plane=self.plane)
         return self
 
     def __exit__(self, *_exc) -> None:
-        self.running = False
         try:
             self.camera.set_af_metric_hook(None)
         except Exception:
@@ -183,20 +140,15 @@ class StreamSharpnessMonitor:
 class _EncoderBurst:
     """Throttle sensor fps for a high-fps metric burst, restore after.
 
-    The camera lives in crop990 with the encoders running at preview
-    fps; the burst raises the sensor to the metric rate and stops the
-    encoders (nobody consumes the UI stream mid-AF). Restore restarts
-    the encoders and drops back to preview fps — both live controls,
-    no reconfigure.
+    The camera lives in crop990; the burst stops the encoders (nobody
+    consumes the UI stream mid-AF) and the sensor stays at the metric
+    rate across runs — restoring a lower FrameRate forces a sensor
+    re-clock (~0.4s) on the next run, so it is deliberately not done.
+    Restore restarts the encoders only.
     """
 
-    def __init__(
-        self, camera, fps: float, restore_fps: float = 20.0
-    ) -> None:
+    def __init__(self, camera) -> None:
         self._cam = camera
-        self.fps = float(fps)
-        self.restore_fps = float(restore_fps)
-        self._stopped = False
 
     def __enter__(self) -> "_EncoderBurst":
         try:
@@ -207,25 +159,19 @@ class _EncoderBurst:
                         _log("BURST stop_encoder t=%.3f" % (time.monotonic(),))
                     except Exception:
                         return self
-                _frame_stash_start()
-                _log("BURST stash_start t=%.3f" % (time.monotonic(),))
-            self._stopped = True
         except Exception:
-            self._stopped = False
+            pass
         return self
 
     def __exit__(self, *exc) -> bool:
-        _frame_stash_dump(
-            "/home/admin/openflexure-microscope-server/smooth_af_frames.npz"
-        )
         try:
             with self._cam._streaming_picamera() as picam:
                 mode_info = getattr(self._cam, "streaming_modes", {}).get(
                     getattr(self._cam, "streaming_mode", "default")
                 )
                 use_lores = (
-                    mode_info is not None
-                    and getattr(mode_info, "use_lores_as_preview", False)
+                        mode_info is not None
+                        and getattr(mode_info, "use_lores_as_preview", False)
                 )
                 stream_name = "lores" if use_lores else "main"
                 if not picam.started:
@@ -256,40 +202,104 @@ class _EncoderBurst:
                     )
                 except Exception as e:
                     LOGGER.error("AF burst: lores encoder restore failed: %s", e)
-                try:
-                    picam.set_controls({"FrameRate": float(self.restore_fps)})
-                except Exception:
-                    pass
         except Exception as e:
             LOGGER.error("AF burst: camera restore failed: %s", e)
         return False
 
 
+_LOGQ: "queue.Queue[str]" = queue.Queue()
+_DUMPQ: "queue.Queue[tuple]" = queue.Queue()
+
+
+def _writer_loop() -> None:
+    """Background flusher for the AF hot-path writes.
+
+    Synchronous SD writes between sweep legs stall the event chain
+    (proven by the capture throttle incident); every hot-path write
+    goes through these queues instead and is flushed off-thread.
+    """
+    while True:
+        try:
+            line = _LOGQ.get(timeout=0.5)
+        except queue.Empty:
+            line = None
+        batch = []
+        if line is not None:
+            batch.append(line)
+        try:
+            while True:
+                batch.append(_LOGQ.get_nowait())
+        except queue.Empty:
+            pass
+        if batch:
+            try:
+                Path(__file__).resolve().parents[3].joinpath(
+                    "smooth_af_moves.log"
+                ).open("a").write("\n".join(batch) + "\n")
+            except Exception:
+                pass
+        dumps = []
+        try:
+            while True:
+                dumps.append(_DUMPQ.get_nowait())
+        except queue.Empty:
+            pass
+        for name, payload in dumps:
+            try:
+                with open(
+                        f"/home/admin/openflexure-microscope-server/{name}", "w"
+                ) as f:
+                    json.dump(payload, f)
+            except Exception:
+                pass
+
+
+WRITER_THREAD = threading.Thread(
+    target=_writer_loop, daemon=True, name="smooth-af-writer"
+)
+
+
+def _writer_kick() -> None:
+    if not WRITER_THREAD.is_alive():
+        WRITER_THREAD.start()
+
+
 def _log(line: str) -> None:
     try:
-        Path(__file__).resolve().parents[3].joinpath(
-            "smooth_af_moves.log"
-        ).open("a").write(line + "\n")
+        _LOGQ.put(line)
+        _writer_kick()
     except Exception:
         pass
 
 
 def _probe_regime(prev_gain, prev_exp):
     """Probe imaging regime from the pre-AF state: gain doubled, exposure
-    halved (less motion blur), clamped to keep 120fps and sane frames."""
+    halved (less motion blur), clamped to keep 120fps and sane frames.
+
+    Single-trip law: if the camera already sits at probe-class gain the
+    previous flow died before restoring, and probing again would compound
+    (half-of-half into gain 4). Raise instead - the caller's law is to
+    refuse, never to invent."""
+    g_in = float(prev_gain or 0.0)
+    if g_in >= 3.5:
+        raise ValueError(
+            "camera already in probe regime (gain %.1f) - a previous "
+            "flow died before restore; refusing to stack halvings" % g_in
+        )
     g = 2.0 * prev_gain if prev_gain else 2.0
     g = max(1.0, min(16.0, g))
-    e = (prev_exp / 2.0) if prev_exp else 1000.0
-    e = max(100.0, min(8000.0, e))
+    if not prev_exp:
+        raise ValueError(
+            "no live exposure reading - refusing to invent an AF regime"
+        )
+    e = max(100.0, min(8000.0, prev_exp // 2))
     return g, int(e)
 
 
 def _dump_json(name: str, payload: dict) -> None:
     try:
-        with open(
-            f"/home/admin/openflexure-microscope-server/{name}", "w"
-        ) as f:
-            json.dump(payload, f)
+        _DUMPQ.put((name, payload))
+        _writer_kick()
     except Exception:
         pass
 
@@ -297,26 +307,25 @@ def _dump_json(name: str, payload: dict) -> None:
 class SmoothAutofocusThing(lt.Thing):
     """Autofocus from a continuous sharpness curve sampled while the stage sweeps.
 
-    Flow (AF_GOALS.md): static reference frames (calibration, never parks) ->
-    near sweep +-110u -> far sweep 2048u -> claw (sharp, pooled16 ballpark) ->
-    tiny sweep +-180u -> park. Every wait is a happens-before: an
-    M400-blocked move return or a frame-count Event predicate. No timed
-    sleeps in the flow.
+    Flow: static reference -> far sweep (both legs, 9000 or 6000 when
+    accel cal is missing; early exit after leg 1 on a strong hit) ->
+    claw -> tiny sweep -> two-stage park. Every wait is a happens-before
+    on telemetry events; no timed waits, no M400.
     """
 
     _class_settings = {"validate_properties_on_set": True}
     _cam: BaseCamera = lt.thing_slot()
     _stage: BaseStage = lt.thing_slot()
-    _SESS_Z: Optional[float] = None
     _SESS_STATIC: float = 0.0
-    _SESS_TS: float = 0.0
-    _cached_accel: Optional[float] = None
-    _leg_certified: bool = False
-    _FAR_DIR: int = 1
     _CAL_FWHM: Optional[float] = None
     _CAL_CONTRAST: Optional[float] = None
-    _CAL_BACKLASH: Optional[float] = None
-    _CAL_PEAK_SHARP: Optional[float] = None
+    _CAL_ACCEL: Optional[float] = None
+    _COOL_TIMER: Optional[threading.Timer] = None
+    _AF_BUSY: bool = False
+    _LAST_REGIME: Optional[tuple] = None
+    _COOL_DELAY: float = 3.0
+    _CAL_LOADED: bool = False
+    _last_leg_samples: list = []
 
     def _hw_steps_param(self, delta_hw):
         inv = getattr(self._stage, "axis_inverted", {}) or {}
@@ -332,12 +341,12 @@ class SmoothAutofocusThing(lt.Thing):
                 return float("nan")
 
     def _sync_move(
-        self,
-        monitor: StreamSharpnessMonitor,
-        target: float,
-        velocity: float,
-        mark: int,
-        labeled: bool = True,
+            self,
+            monitor: StreamSharpnessMonitor,
+            target: float,
+            velocity: float,
+            mark: int,
+            labeled: bool = True,
     ):
         """One leg: queue the move (non-blocking POST), then wait for the
         motion_report websocket telemetry to show the motion start and
@@ -345,279 +354,180 @@ class SmoothAutofocusThing(lt.Thing):
         window. The OFM cache is re-synced after every exit unless the
         falling-edge push certified it or an unlabeled leg completed on
         geometry (commanded target is then the truth)."""
-        self._leg_certified = False
         try:
             return self._sync_move_inner(
                 monitor, target, velocity, mark, labeled
             )
         finally:
-            if not self._leg_certified:
-                if not labeled:
-                    self._last_hw = target
-                else:
-                    try:
-                        if hasattr(self._stage, "update_position"):
-                            self._stage.update_position()
-                    except Exception:
-                        pass
+            if not labeled:
+                self._last_hw = target
 
     def _sync_move_inner(
-        self,
-        monitor: StreamSharpnessMonitor,
-        target: float,
-        velocity: float,
-        mark: int,
-        labeled: bool = True,
+            self,
+            monitor: StreamSharpnessMonitor,
+            target: float,
+            velocity: float,
+            mark: int,
+            labeled: bool = True,
     ):
         cur = self._last_hw
         delta = target - cur
         if abs(delta) < 0.5:
             return None, []
+        dz0 = float(getattr(self, "_frame_offset", 0.0))
         seconds = abs(delta) / velocity
         _log(
             f"move target={target:.2f} cur={cur:.2f} delta={delta:.2f} "
             f"v={velocity:.0f} t={time.time():.3f}"
         )
         motion_since = getattr(self._stage, "motion_since", None)
-        drained = getattr(self._stage, "motion_drained", None)
-        t_post = time.monotonic()
+        motion_wait = getattr(self._stage, "motion_wait", None)
+        if motion_since is None:
+            self._stage.move_relative_z_timed(
+                self._hw_steps_param(int(round(delta))), seconds
+            )
+            self._last_hw = target
+            return None, []
+        hoff = self._stage.handshake_offset()
+        ztol = max(2.0, 0.005 * abs(delta))
+
+        def _marker_seen():
+            for s in motion_since(0):
+                if (
+                        len(s) > 4
+                        and s[4] is not None
+                        and abs(s[2]) < 0.5
+                        and not s[3]
+                        and abs(s[1] - (target + dz0)) <= ztol
+                ):
+                    return s
+            return None
+
+        clear = getattr(self._stage, "clear_motion_history", None)
+        if clear is not None:
+            clear()
+
         self._stage.move_relative_z_timed(
             self._hw_steps_param(int(round(delta))), seconds
         )
         self._last_hw = target
-        if motion_since is None or drained is None:
-            return None, []
-        motion_wait = getattr(self._stage, "motion_wait", None)
-        samples = []
-        moving_seen = False
-        t_open = t_post + 0.5 * seconds
-        # Motion end is known from geometry: commanded time + accel corners.
-        # Labeled legs give the v=0 push one status tick (~0.27s) to land
-        # for end-position certification; unlabeled legs (approach, park,
-        # return) need no push and break right at motion end.
-        accel = type(self)._cached_accel
-        if accel is None:
-            _ag = getattr(self._stage, "printer_max_accel", None)
-            if callable(_ag):
+        # grace for the terminal push: bounded by push arrival, not clock -
+        # wait only until the first sample with v==0 shows up (the move's
+        # own completion push). Cap at 2x nominal move time as a bound.
+        grace_end = time.monotonic() + seconds * 2.0 + 0.2
+        marker = _marker_seen()
+        while marker is None and time.monotonic() < grace_end:
+            if motion_wait is None:
+                break
+            motion_wait(timeout=max(0.02, grace_end - time.monotonic()))
+            marker = _marker_seen()
+        if marker is None:
+            query_state = getattr(
+                self._stage, "query_motion_state", None
+            )
+            if query_state is not None:
                 try:
-                    _a = _ag()
-                    if _a and 0.0 < _a < 1e7:
-                        type(self)._cached_accel = float(_a)
-                        accel = float(_a)
+                    st = query_state()
+                    lp = st.get("live_position")
+                    v_raw = st.get("live_velocity")
+                    if lp is not None:
+                        z_now = float(lp[2])
+                        v_now = (
+                            float(v_raw) if v_raw is not None else None
+                        )
+                        settle_t = time.monotonic() + 2.0
+                        while v_now is not None and abs(v_now) >= 0.5:
+                            if time.monotonic() >= settle_t:
+                                break
+                            time.sleep(0.1)
+                            st = query_state()
+                            lp = st.get("live_position")
+                            v_raw = st.get("live_velocity")
+                            if lp is None:
+                                break
+                            z_now = float(lp[2])
+                            v_now = (
+                                float(v_raw)
+                                if v_raw is not None
+                                else None
+                            )
+                        z_ok = abs(z_now - (target + dz0)) <= ztol
+                        v_ok = v_now is None or abs(v_now) < 0.5
+                        if v_ok and not z_ok:
+                            self._frame_offset = z_now - target
+                            dz0 = self._frame_offset
+                            z_ok = abs(z_now - (target + dz0)) <= ztol
+                            _log(
+                                f"FRAME LEARN offset={dz0:.2f} "
+                                f"(live {z_now:.2f} vs target {target:.1f})"
+                            )
+                        if z_ok and v_ok:
+                            et = (
+                                time.monotonic()
+                                + getattr(
+                                    self._stage, "_et_handshake", 0.0
+                                )
+                            )
+                            marker = (
+                                et, z_now,
+                                v_now if v_now is not None else 0.0,
+                                0.0 if v_now is not None else 1.0,
+                                et,
+                            )
+                            _log(
+                                f"LEG QUIET-CERTIFY target={target:.1f} "
+                                f"z={z_now:.2f} v={v_now} "
+                                f"t={time.time():.3f}"
+                            )
                 except Exception:
-                    accel = None
-        corner = 0.0
-        if accel and seconds > 0.0:
-            t_acc = velocity / accel
-            if velocity * t_acc < abs(delta):
-                corner = 2.0 * t_acc
-        slack = 0.27 if labeled else 0.03
-        expected_end = t_post + seconds + corner
-        deadline = min(
-            t_post + seconds + 2.0,
-            expected_end + (0.9 if labeled else slack + 0.6),
-        )
-        while time.monotonic() < deadline:
-            new = motion_since(t_open)
-            if len(new) == len(samples):
-                if moving_seen and time.monotonic() > expected_end + slack:
-                    break
-                if motion_wait is None:
-                    continue
-                motion_wait(
-                    timeout=min(
-                        0.5,
-                        max(
-                            0.01,
-                            min(
-                                deadline - time.monotonic(),
-                                expected_end + slack - time.monotonic(),
-                            ),
-                        ),
+                    LOGGER.warning(
+                        "quiet-end motion query failed", exc_info=True
                     )
-                )
-                new = motion_since(t_open)
-                if not new:
-                    continue
-            samples = new
-            if abs(samples[-1][2]) > 0.5:
-                moving_seen = True
-            elif moving_seen:
-                break
-            if not labeled and time.monotonic() > expected_end + slack:
-                break
-        _log(
-            f"LEG EXIT labeled={labeled} n_samples={len(samples)} "
-            f"moving_seen={moving_seen} "
-            f"last_v={samples[-1][2] if samples else None} "
-            f"waited={time.monotonic() - t_post:.3f} cmd={seconds:.3f} "
-            f"t={time.time():.3f}"
-        )
-        falling = None
-        mids = []
-        if moving_seen and samples and abs(samples[-1][2]) < 0.5:
-            falling = samples[-1]
-        elif not moving_seen and len(samples) == 1 and abs(
-            samples[-1][1] - cur
-        ) > 0.5 * abs(delta):
-            falling = samples[-1]
-        elif moving_seen and samples and abs(samples[-1][2]) >= 0.5:
+        if marker is None:
             _log(
-                f"LEG GEOMFALL cmd={seconds:.3f} "
-                f"last_v={samples[-1][2]:.1f} t={time.time():.3f}"
-            )
-            falling = (expected_end, cur + delta, 0.0, 0.0, None)
-        if falling is None:
-            return None, []
-        t_fall, z_end = falling[0], falling[1]
-        if abs(z_end - (cur + delta)) > max(2.0, 0.05 * abs(delta)):
-            _log(
-                f"LEG MISMATCH end={z_end:.2f} want={cur + delta:.2f}"
-                f" delta={delta:.2f} t={time.time():.3f}"
-            )
-            return None, []
-        margin = 1.0 / FPS
-        clock_off = getattr(self._stage, "clock_offset", None)
-        clock_spread = getattr(self._stage, "clock_spread", None)
-        off = clock_off() if callable(clock_off) else None
-        spr = clock_spread() if callable(clock_spread) else None
-        if off is not None and (spr is None or spr > 0.05):
-            _log(
-                f"LEG OFFUNSTABLE off={off:.4f} spr={spr if spr is not None else -1:.4f}"
-                f" t={time.time():.3f}"
-            )
-            off = None
-
-        def _s5(s):
-            if len(s) > 4:
-                return s
-            return (s[0], s[1], s[2], s[3], None)
-
-        slope_cmd = delta / seconds
-        _ho = getattr(self._stage, "handshake_offset", None)
-        hoff = _ho() if callable(_ho) else None
-        if hoff is not None:
-            remapped = []
-            for s in samples:
-                if len(s) > 4 and s[4] is not None:
-                    remapped.append((s[4] - hoff,) + tuple(s[1:]))
-                else:
-                    remapped.append(s)
-            samples = remapped
-        mids = [
-            s for s in (_s5(q) for q in samples[:-1])
-            if abs(s[2]) > 0.5
-            and not s[3]
-            and abs(s[1] - cur) > min(2.0, 0.02 * abs(delta))
-            and abs(abs(s[2]) - abs(slope_cmd)) <= 0.05 * abs(slope_cmd)
-        ]
-        if not mids and samples:
-            _sps = [
-                _s5(s) for s in samples
-                if abs(s[2]) > 0.5
-                and not _s5(s)[3]
-                and abs(_s5(s)[1] - cur) > min(2.0, 0.02 * abs(delta))
-            ]
-            if _sps:
-                mids = [_sps[-1]]
-        accel = type(self)._cached_accel
-
-        def _build(ts_, te_, v_abs):
-            total = z_end - cur
-            sgn = 1.0 if total >= 0 else -1.0
-            if accel:
-                t_acc = v_abs / accel
-                d_acc = 0.5 * v_abs * t_acc
-                if 2.0 * d_acc >= abs(total):
-                    t_acc = (abs(total) / accel) ** 0.5
-                    pts = [
-                        (ts_, cur),
-                        (ts_ + t_acc, cur + sgn * 0.5 * accel * t_acc * t_acc),
-                        (te_, z_end),
-                    ]
-                else:
-                    z_mc = z_end - sgn * d_acc
-                    pts = [
-                        (ts_, cur),
-                        (ts_ + t_acc, cur + sgn * d_acc),
-                        (
-                            ts_ + t_acc + (abs(total) - 2.0 * d_acc) / v_abs,
-                            z_mc,
-                        ),
-                        (te_, z_end),
-                    ]
-                ta_ = t_acc
-            else:
-                pts = [(ts_, cur), (te_, z_end)]
-                ta_ = 0.0
-            frames = [
-                f for f in monitor.frames_since(mark)
-                if ts_ + margin <= f[0] <= te_ - margin
-            ]
-            return pts, frames
-
-        if mids:
-            ta, za = mids[-1][0], mids[-1][1]
-            if accel:
-                t_acc = min(velocity / accel, (abs(delta) / accel) ** 0.5)
-                d_acc = 0.5 * accel * t_acc * t_acc
-            else:
-                t_acc, d_acc = 0.0, 0.0
-            sgn = 1.0 if delta >= 0 else -1.0
-            z_rel = min(max((za - cur) * sgn, 0.0), abs(delta))
-            t_acc2 = t_acc * t_acc
-            if z_rel <= d_acc:
-                tau = (2.0 * z_rel / accel) ** 0.5 if accel else 0.0
-            elif z_rel >= abs(delta) - d_acc:
-                z_left = abs(delta) - z_rel
-                tau = (
-                    t_acc + (abs(delta) - 2.0 * d_acc) / velocity
-                    + t_acc - (2.0 * z_left / accel) ** 0.5
-                ) if accel else seconds
-                tau = min(tau, seconds + 2.0 * t_acc)
-            else:
-                tau = t_acc + (z_rel - d_acc) / velocity
-            T_total = seconds + (2.0 * t_acc if accel else 0.0)
-            t_start = min(max(ta - tau, ta - T_total), ta)
-            t_fall = t_start + T_total
-            _log(
-                f"LEG TRAPANCHOR tau={tau:.3f} T={T_total:.3f} "
+                f"LEG TELESTALL target={target:.1f} "
                 f"t={time.time():.3f}"
             )
-            return _build(t_start, t_fall, velocity)
-        elif off is not None:
-            _log(
-                f"LEG off={off:.4f} spr={spr:.4f} mids=0 t={time.time():.3f}"
-            )
-        t_start = None
-        fall_et = falling[4] if len(falling) > 4 else None
-        if fall_et is not None and hoff is not None:
-            t_fall = fall_et - hoff
-            t_acc_extra = 2.0 * (abs(delta) / 2.0) / velocity if False else 0.0
-            if accel:
-                t_acc = velocity / accel
-                d_acc = 0.5 * velocity * t_acc
-                if 2.0 * d_acc < abs(delta):
-                    t_acc_extra = 2.0 * t_acc
-            t_start = t_fall - seconds - t_acc_extra
-            _log(
-                f"LEG ETANCHOR dt={falling[0] - t_fall:.3f} "
-                f"acc={t_acc_extra:.3f} t={time.time():.3f}"
-            )
-        if t_start is None:
-            t_start = t_fall - seconds
-        traj = [(t_start, cur), (t_fall, z_end)]
-        frames = [
-            f for f in monitor.frames_since(mark)
-            if t_start + margin <= f[0] <= t_fall - margin
+            self._telestall_run = True
+            return None, []
+        m_et = marker[4]
+        raw = [
+            s for s in motion_since(0)
+            if len(s) > 4 and s[4] is not None
+               and s[4] <= m_et
         ]
+        raw.sort(key=lambda s: s[4])
+        self._last_leg_samples = raw
+        if not raw:
+            _log(
+                f"LEG EMPTY-TRAJ target={target:.1f} "
+                f"t={time.time():.3f}"
+            )
+            self._telestall_run = True
+            return None, []
+        _log(
+            f"LEG MARKER n={len(raw)} z={marker[1]:.1f} "
+            f"et={m_et:.3f} t={time.time():.3f}"
+        )
+        if not labeled:
+            return None, []
+        if hoff is None:
+            traj = [(s[0], s[1]) for s in raw]
+            frames = list(monitor.frames_since(mark))
+        else:
+            traj = [(s[4] - hoff, s[1]) for s in raw]
+            t_lo = traj[0][0]
+            t_hi = traj[-1][0]
+            frames = [
+                f for f in monitor.frames_since(mark)
+                if t_lo <= f[0] <= t_hi
+            ]
         try:
             _dump_json("smooth_af_legdump.json", {
                 "leg": [cur, target, velocity, seconds],
-                "mids": [[s[0], s[1], s[2], s[3], s[4]] for s in mids],
                 "samples": [
                     [s[0], s[1], s[2], s[3],
-                     s[4] if len(s) > 4 else None] for s in samples
+                     s[4] if len(s) > 4 else None] for s in raw
                 ],
                 "hoff": hoff,
                 "traj": traj,
@@ -629,8 +539,7 @@ class SmoothAutofocusThing(lt.Thing):
             pass
         return traj, frames
 
-    def _label_leg(self, frames, z_a: float, z_b: float, traj,
-                   velocity: float = 0.0):
+    def _label_leg(self, frames, z_a: float, z_b: float, traj, velocity: float):
         """Label frames by interpolating real motion_report positions at
         each frame's timestamp. traj is the telemetry sample list."""
         if len(frames) < 6 or not traj:
@@ -652,10 +561,6 @@ class SmoothAutofocusThing(lt.Thing):
                     break
             pts.append((zq, cbr, s, p))
         pts.sort()
-        b = type(self)._CAL_BACKLASH
-        if b:
-            shift = b if z_b > z_a else -b
-            pts = [(q[0] + shift,) + tuple(q[1:]) for q in pts]
         if velocity <= 1000.0:
             _cp = median_filter_curve(
                 [CurvePoint(z=q[0], sharpness=q[2]) for q in pts], window=3
@@ -676,7 +581,7 @@ class SmoothAutofocusThing(lt.Thing):
         p_max = max(p_vals)
         thr = p_med + 0.35 * max(p_max - p_med, 1e-9)
         pp = [(z, p) for (z, _c, _s, p) in pts if p >= thr]
-        if len(pp) >= 6:
+        if len(pp) >= 3:
             zp = sorted(z for z, _p in pp)
             if zp[-1] - zp[0] <= 260.0:
                 hit = sum(z * p for z, p in pp) / sum(p for z, p in pp)
@@ -706,8 +611,8 @@ class SmoothAutofocusThing(lt.Thing):
                     pts[i][2] for i in cl)
                 return hit, f"|claw_sharp{hit:.0f}{tag}"
         far_bar = (
-            (contrast * 0.45) if contrast else _FAR_MEDIAN_BAR
-        ) * max(s_med, 1e-9)
+                      (contrast * 0.45) if contrast else _FAR_MEDIAN_BAR
+                  ) * max(s_med, 1e-9)
         singles = [
             pts[i] for i in range(len(pts)) if pts[i][2] >= far_bar
         ]
@@ -754,27 +659,22 @@ class SmoothAutofocusThing(lt.Thing):
         bar = ((contrast * 0.85) if contrast else 1.5) * max(s_floor, 1e-9)
         if best < bar:
             return None
-        cal_peak = type(self)._CAL_PEAK_SHARP
-        if cal_peak and static_ref > 0:
-            cal_peak = min(cal_peak, 1.9 * static_ref)
-        if cal_peak and best < 0.85 * cal_peak:
-            return None
         z_lo, z_hi = pts[0][0], pts[-1][0]
         arg = max(pts, key=lambda q: q[2])[0]
         span = z_hi - z_lo
         if span > 0 and not (
-            z_lo + _EDGE_MARGIN * span <= arg <= z_hi - _EDGE_MARGIN * span
+                z_lo + _EDGE_MARGIN * span <= arg <= z_hi - _EDGE_MARGIN * span
         ):
             return None
         if fit.fwhm is not None and fit.fwhm > 60.0 and best >= 1.6 * max(
-            s_floor, 1e-9
+                s_floor, 1e-9
         ):
             top = sorted(pts, key=lambda q: q[2], reverse=True)
             top_n = top[: max(2, len(top) // 5)]
             wsum = sum(q[2] for q in top_n)
             if wsum > 0:
                 z_fit = (
-                    sum(q[0] * q[2] for q in top_n) / wsum
+                        sum(q[0] * q[2] for q in top_n) / wsum
                 )
                 return (
                     FitOutcome(
@@ -784,7 +684,7 @@ class SmoothAutofocusThing(lt.Thing):
                     best,
                 )
         if (fit.r2 is None or fit.r2 < 0.5) or (
-            fit.snr is None or fit.snr < 1.2
+                fit.snr is None or fit.snr < 1.2
         ):
             if best < 1.6 * max(s_floor, 1e-9):
                 return None
@@ -802,13 +702,180 @@ class SmoothAutofocusThing(lt.Thing):
             )
         return fit, best
 
+    def _cancel_cooler(self) -> None:
+        t = type(self)._COOL_TIMER
+        if t is not None:
+            t.cancel()
+            type(self)._COOL_TIMER = None
+
+    def _arm_cooler(self) -> None:
+        self._cancel_cooler()
+        t = threading.Timer(self._COOL_DELAY, self._quiet_camera)
+        t.daemon = True
+        type(self)._COOL_TIMER = t
+        t.start()
+
+    def _quiet_camera(self) -> None:
+        """10s after the last AF: sensor to 20fps, encoders ensured
+        running, gain/exposure re-applied with readback. Deferred
+        housekeeping outside the sweep chain; a new AF run cancels it."""
+        type(self)._COOL_TIMER = None
+        if getattr(self, "_AF_BUSY", False):
+            return
+        try:
+            with self._cam._streaming_picamera() as picam:
+                if not picam.started:
+                    try:
+                        picam.start()
+                    except Exception as e:
+                        LOGGER.error("AF cooler: camera start failed: %s", e)
+                if not getattr(picam, "is_recording", False):
+                    bitrate = getattr(self._cam, "mjpeg_bitrate", 10000000)
+                    mode_info = getattr(self._cam, "streaming_modes", {}).get(
+                        getattr(self._cam, "streaming_mode", "default")
+                    )
+                    use_lores = (
+                            mode_info is not None
+                            and getattr(mode_info, "use_lores_as_preview", False)
+                    )
+                    stream_name = "lores" if use_lores else "main"
+                    enc1 = MJPEGEncoder(bitrate)
+                    try:
+                        picam.start_recording(
+                            enc1,
+                            PicameraStreamOutput(
+                                self._cam.mjpeg_stream, enc1
+                            ),
+                            name=stream_name,
+                        )
+                    except Exception as e:
+                        LOGGER.error(
+                            "AF cooler: main encoder start failed: %s", e)
+                    enc2 = MJPEGEncoder(100000000)
+                    try:
+                        picam.start_encoder(
+                            enc2,
+                            PicameraStreamOutput(
+                                self._cam.lores_mjpeg_stream, enc2
+                            ),
+                            name="lores",
+                        )
+                    except Exception as e:
+                        LOGGER.error(
+                            "AF cooler: lores encoder start failed: %s", e)
+                try:
+                    picam.set_controls({"FrameRate": 20.0})
+                    _log("COOL fps=20 enc=on")
+                except Exception as e:
+                    LOGGER.error("AF cooler: fps restore failed: %s", e)
+        except Exception as e:
+            LOGGER.error("AF cooler failed: %s", e)
+        reg = type(self)._LAST_REGIME
+        if not reg:
+            _log("COOL regime skip: no calibrated base known")
+            return
+        try:
+            rb = self._cam.restore_calibration_raw()
+            g2 = float(rb["gain"])
+            e2 = int(rb["exposure"])
+            ok = abs(g2 - reg[0]) < 0.05 and abs(e2 - int(reg[1])) <= 2
+            _log(
+                f"COOL regime g={reg[0]:.2f} e={reg[1]} "
+                f"readback=({g2:.2f},{e2}) verify={'ok' if ok else 'MISMATCH'}"
+            )
+        except Exception:
+            LOGGER.warning("AF cooler: regime restore failed", exc_info=True)
+
     def _park(self, monitor: StreamSharpnessMonitor, target: float, mark: int):
-        """Blocking park; settled means the move returned (trailing sync)."""
-        self._sync_move(monitor, target, _PARK_VELOCITY, mark, labeled=False)
+        """Two-stage park: fast to 30u short, then creep the last 30u at
+        low speed approaching from one side — no overshoot, no backlash
+        flip, park lands where tiny fit said."""
+        cur = self._stage_z()
+        sgn = 1.0 if target >= cur else -1.0
+        near = target - sgn * 30.0
+        if abs(near - cur) > 1.0:
+            self._sync_move(
+                monitor, near, _PARK_VELOCITY, mark, labeled=False
+            )
+        self._sync_move(
+            monitor, target, _PARK_CREEP, len(monitor.times), labeled=False
+        )
         return self._stage_z()
 
+    def _load_cal(self) -> None:
+        try:
+            p = "/home/admin/openflexure-microscope-server/"
+            p += "smooth_af_cal.json"
+            with open(p) as f:
+                d = json.load(f)
+            a = float(d.get("accel") or 0.0)
+            if 15000.0 < a < 120000.0:
+                type(self)._CAL_ACCEL = a
+                _log(f"CALACCEL loaded {a:.0f}")
+            fw = d.get("fwhm_u")
+            if fw is not None:
+                fw = float(fw)
+                if 2.0 < fw < 400.0:
+                    type(self)._CAL_FWHM = fw
+                    _log(f"CALFWHM loaded {fw:.1f}")
+            ct = d.get("contrast")
+            if ct is not None:
+                type(self)._CAL_CONTRAST = float(ct)
+        except Exception:
+            pass
+        finally:
+            type(self)._CAL_LOADED = True
+
+    def _accel_from_telemetry(self, seg_a, seg_b):
+        """Measure acceleration from the emitted motion report series.
+
+        Per leg: plateau = max |v|, rise ends at the first sample past
+        90% plateau, a = v_p^2 / (2 d_rise). Triangle legs (no plateau)
+        are skipped; plausible estimates are averaged.
+        """
+        ests = []
+        for seg in (seg_a, seg_b):
+            if not seg or len(seg) < 6:
+                continue
+            vs = [abs(s[2]) for s in seg]
+            vp = max(vs)
+            if vp < 500.0:
+                continue
+            i90 = next(
+                (i for i, v in enumerate(vs) if v >= 0.9 * vp), None
+            )
+            if not i90:
+                continue
+            d = abs(seg[i90][1] - seg[0][1])
+            if d < 10.0:
+                continue
+            ests.append(vp * vp / (2.0 * d))
+        if not ests:
+            _log("ACCELTEL no-est")
+            return None
+        a = sum(ests) / len(ests)
+        if not (15000.0 < a < 120000.0):
+            _log(f"ACCELTEL out-of-range a={a:.0f} ests={ests}")
+            return None
+        return a
+
+    def _save_cal(self, key: str, value: float) -> None:
+        try:
+            p = "/home/admin/openflexure-microscope-server/"
+            p += "smooth_af_cal.json"
+            try:
+                with open(p) as f:
+                    d = json.load(f)
+            except Exception:
+                d = {}
+            d[key] = value
+            with open(p, "w") as f:
+                json.dump(d, f)
+        except Exception:
+            pass
+
     def _save_last_focus(
-        self, monitor: "StreamSharpnessMonitor", mark: int, peak: float
+            self, monitor: "StreamSharpnessMonitor", mark: int, peak: float
     ) -> None:
         mark2 = len(monitor.times)
         monitor.wait_frames(4, mark2, timeout=0.5)
@@ -820,45 +887,88 @@ class SmoothAutofocusThing(lt.Thing):
             f"SAVE anchor={peak:.1f} focus_static={focus_static:.0f} "
             f"pre_static={type(self)._SESS_STATIC:.0f}"
         )
-        type(self)._SESS_Z = float(peak)
-        type(self)._SESS_TS = time.time()
         if focus_static > 0 and focus_static > type(self)._SESS_STATIC:
             type(self)._SESS_STATIC = float(focus_static)
-
-    @contextmanager
-    def _fast_stream(self, restore: bool = True, mode_name: str = "fast_preview"):
-        prev_mode = None
         try:
-            prev_mode = self._cam.streaming_mode
-        except Exception:
-            prev_mode = None
-        switched = False
-        try:
+            sender = getattr(self._stage, "_send_gcode_script", None)
+            pos = self._stage.position if sender is not None else None
             if (
-                prev_mode is not None
-                and mode_name in self._cam.streaming_modes
-                and prev_mode != mode_name
+                    sender is not None and pos is not None
+                    and not getattr(self, "_far_regime_active", False)
             ):
-                self._cam._start_streaming(mode_name)
-                switched = True
-        except Exception:
-            LOGGER.warning("Could not switch to fast_preview", exc_info=True)
-            switched = False
-        try:
-            yield not switched
-        finally:
-            if switched and restore:
-                try:
-                    self._cam._start_streaming(mode_name)
-                except Exception:
-                    LOGGER.warning(
-                        "Could not restore streaming mode", exc_info=True
+                sender(script="SAMPLE_MESH_RESUME")
+                st = self._stage._get_status(payload={
+                    "objects": {"sample_mesh": None}
+                })
+                sm = (
+                             (st.get("result") or {}).get("status") or {}
+                     ).get("sample_mesh") or {}
+                surface = sm.get("surface_here")
+                zref = sm.get("zref")
+                if surface is not None:
+                    delta = float(pos.get("z")) - float(surface)
+                    sender(script=f"SAMPLE_MESH_SHIFT DELTA={delta:.3f}")
+                    self._mesh_suspended_by_af = False
+                    _log(
+                        f"MESHSHIFT delta={delta:.1f} "
+                        f"surface_here={surface:.1f}"
                     )
+                elif zref is not None:
+                    delta = float(pos.get("z")) - float(zref)
+                    sender(script=f"SAMPLE_MESH_SHIFT DELTA={delta:.3f}")
+                    self._mesh_suspended_by_af = False
+                    _log(f"MESHSHIFT delta={delta:.1f} (legacy zref)")
+        except Exception:
+            LOGGER.warning("mesh resume/shift after AF failed", exc_info=True)
 
     def _run_flow(self, monitor: StreamSharpnessMonitor) -> SmoothFocusResult:
         t0 = time.monotonic()
         mode = ""
+        try:
+            st = self._stage._get_status(payload={
+                "objects": {"gcode_move": None}
+            })
+            self._last_hw = float(
+                st["result"]["status"]["gcode_move"]["position"][2]
+            )
+        except Exception:
+            LOGGER.warning(
+                "AF logical-z resync failed, using cached", exc_info=True
+            )
+        self._frame_offset = 0.0
         z0 = self._last_hw
+
+        self._mesh_suspended_by_af = False
+        try:
+            st = self._stage._get_status(payload={
+                "objects": {"sample_mesh": None}
+            })
+            sm = (
+                (st.get("result") or {}).get("status") or {}
+            ).get("sample_mesh") or {}
+            if sm.get("active"):
+                sender = getattr(self._stage, "_send_gcode_script", None)
+                if sender is not None:
+                    sender(script="SAMPLE_MESH_SUSPEND")
+                    self._mesh_suspended_by_af = True
+                    _log("MESH SUSPEND for AF (transform deflection)")
+        except Exception:
+            LOGGER.warning(
+                "mesh suspend for AF failed", exc_info=True
+            )
+
+        try:
+            prev_gain_af = self._cam.analogue_gain
+            prev_exp_af = self._cam.exposure_time
+            if prev_exp_af:
+                _g, _e = _probe_regime(prev_gain_af, prev_exp_af)
+                self._cam.set_probe_controls_raw(_g, _e)
+                _log(f"AFREGIME g={_g} e={_e} (from {prev_gain_af}/{prev_exp_af})")
+            else:
+                _log("AFREGIME skipped: no live exposure reading")
+        except Exception:
+            LOGGER.warning("AF regime set failed", exc_info=True)
+            _log("AFREGIME SETFAIL")
 
         pre = monitor.frames_since(0)[-4:]
         static_med = (
@@ -867,12 +977,17 @@ class SmoothAutofocusThing(lt.Thing):
         mode += f"|static{static_med:.0f}"
 
         sess_ref = type(self)._SESS_STATIC
-        if not (
-            static_med > 0 and sess_ref > 0 and static_med >= 0.7 * sess_ref
-        ):
+        near_worthy = (
+                static_med >= 30.0
+                or (
+                        static_med > 0 and sess_ref > 0
+                        and static_med >= 0.7 * sess_ref
+                )
+        )
+        if not near_worthy:
             mode += "|near_skip"
         else:
-            d_near = 1 if type(self)._FAR_DIR == 1 else -1
+            d_near = 1
             near_v = self._cal_near_velocity()
             near_mark = len(monitor.times)
             traj_a, frames_a = self._sync_move(
@@ -923,53 +1038,118 @@ class SmoothAutofocusThing(lt.Thing):
                 )
             mode += "|near_miss"
 
-        anchor = type(self)._SESS_Z
         cur = self._stage_z()
         if not (cur == cur):
             cur = self._last_hw
-        if anchor is not None and abs(anchor - cur) > 8.0:
-            dirn = 1 if anchor > cur else -1
+        leg_a = cur + _FAR_SPAN
+        leg_b = cur - _FAR_SPAN
+        if not type(self)._CAL_LOADED:
+            self._load_cal()
+        if type(self)._CAL_ACCEL is None:
+            far_v = _CAL_V_ACCEL
+            mode += "|accelcal"
         else:
-            dirn = type(self)._FAR_DIR
-        leg_a = cur + dirn * _FAR_SPAN
-        leg_b = cur - dirn * _FAR_SPAN
+            far_v = _FAR_VELOCITY
+        _log(
+            f"FARREGIME_V v={far_v:.0f} cal={type(self)._CAL_ACCEL}"
+        )
 
-        far_mark = len(monitor.times)
-        traj, frames = self._sync_move(monitor, leg_a, _FAR_VELOCITY, far_mark)
-        leg1_pts = self._label_leg(frames, cur, leg_a, traj, _FAR_VELOCITY)
-        _dump_json("smooth_af_seekpts_far1.json", {
-            "z": [q[0] for q in leg1_pts],
-            "s": [q[2] for q in leg1_pts],
-            "c": [q[1] for q in leg1_pts],
-            "p": [q[3] for q in leg1_pts],
-        })
-        claw_z, claw_tag = self._claw(leg1_pts, "far")
-        if claw_z is not None:
-            claw_z = self._refine_hit(leg1_pts, claw_z)
-        mode += claw_tag
-        if claw_z is None:
-            far_mark2 = len(monitor.times)
-            traj2, frames2 = self._sync_move(
-                monitor, leg_b, _FAR_VELOCITY, far_mark2
+        segs = {}
+        self._telestall_run = False
+        best_hit = None
+        best_sharp = 0.0
+        far_exp_prev = None
+        far_gain_prev = None
+        reg = type(self)._LAST_REGIME
+        if reg is not None:
+            far_exp_prev = reg[1]
+            far_gain_prev = reg[0]
+        if far_exp_prev is None:
+            try:
+                far_exp_prev = self._cam.exposure_time
+            except Exception:
+                far_exp_prev = None
+        if far_gain_prev is None:
+            try:
+                far_gain_prev = self._cam.analogue_gain
+            except Exception:
+                far_gain_prev = None
+        if far_exp_prev:
+            far_gain, far_exp = _probe_regime(
+                type(self)._LAST_REGIME[0] if type(self)._LAST_REGIME else 2.0,
+                type(self)._LAST_REGIME[1] if type(self)._LAST_REGIME else far_exp_prev,
             )
-            leg2_pts = self._label_leg(frames2, leg_a, leg_b, traj2,
-                                       _FAR_VELOCITY)
-            _dump_json("smooth_af_seekpts_far2.json", {
-                "z": [q[0] for q in leg2_pts],
-                "s": [q[2] for q in leg2_pts],
-                "c": [q[1] for q in leg2_pts],
-                "p": [q[3] for q in leg2_pts],
+            far_exp = max(100, min(8000, far_exp))
+        else:
+            raise ValueError(
+                "no live exposure reading - refusing to invent far regime"
+            )
+        try:
+            self._cam.set_probe_controls_raw(far_gain, far_exp)
+        except Exception as e:
+            _log(f"FARREGIME SETFAIL {e!r}")
+        _log(f"FARREGIME exp={far_exp} gain={far_gain} "
+             f"prev={far_exp_prev}")
+        for tag, target, prev_end in (("far", leg_a, cur), ("far2", leg_b, leg_a)):
+            if self._telestall_run:
+                mode += f"|{tag}_abort"
+                break
+            far_mark = len(monitor.times)
+            traj, frames = self._sync_move(
+                monitor, target, far_v, far_mark
+            )
+            leg_pts = self._label_leg(frames, prev_end, target, traj,
+                                      far_v)
+            segs[tag] = list(self._last_leg_samples or [])
+            _dump_json(f"smooth_af_seekpts_{tag}.json", {
+                "z": [q[0] for q in leg_pts],
+                "s": [q[2] for q in leg_pts],
+                "c": [q[1] for q in leg_pts],
+                "p": [q[3] for q in leg_pts],
             })
-            claw_z, claw_tag2 = self._claw(leg2_pts, "far2")
-            if claw_z is not None:
-                claw_z = self._refine_hit(leg2_pts, claw_z)
-            mode += claw_tag2
+            hit, claw_tag = self._claw(leg_pts, tag)
+            if hit is not None:
+                hit = self._refine_hit(leg_pts, hit)
+            mode += claw_tag
+            if hit is not None:
+                leg_best = max(q[2] for q in leg_pts)
+                if best_hit is None or leg_best > best_sharp:
+                    best_hit = hit
+                    best_sharp = leg_best
+            else:
+                mode += "|nohit"
+            if (tag == "far" and hit is not None and leg_pts):
+                s_med1 = statistics.median(
+                    [q[2] for q in leg_pts]) or 1e-9
+                if max(q[2] for q in leg_pts) >= 1.35 * s_med1:
+                    mode += "|far1_skip"
+                    break
 
-        if claw_z is not None:
+        try:
+            self._cam.set_probe_controls_raw(far_gain_prev or 1.0,
+                                             far_exp_prev or 500)
+        except Exception:
+            LOGGER.warning("Far exposure restore failed", exc_info=True)
+
+        a_meas = self._accel_from_telemetry(
+            segs.get("far"), segs.get("far2")
+        )
+        if a_meas is not None:
+            _log(
+                f"ACCELTEL a={a_meas:.0f} prev={type(self)._CAL_ACCEL} "
+                f"v={far_v:.0f} SAVED"
+            )
+            type(self)._CAL_ACCEL = a_meas
+            self._save_cal("accel", a_meas)
+
+        if best_hit is not None:
+            claw_z = best_hit
             fwhm = (
                 type(self)._CAL_FWHM if type(self)._CAL_CONTRAST else None
             )
-            span_h = max(15.0, min(_TINY_SPAN, (fwhm * 1.25) if fwhm else 50.0))
+            span_h = max(
+                60.0, min(_TINY_SPAN, (fwhm * 1.25) if fwhm else 60.0)
+            )
             tiny_lo = max(claw_z - span_h, min(leg_a, leg_b))
             tiny_hi = min(claw_z + span_h, max(leg_a, leg_b))
             f_ref = fwhm if fwhm else 20.0
@@ -1000,8 +1180,8 @@ class SmoothAutofocusThing(lt.Thing):
                 ]
                 t_arg = max(tiny_pts, key=lambda q: q[2])
                 if (
-                    t_arg[2] >= 1.25 * max(s_floor_t, 1e-9)
-                    and abs(t_arg[0] - claw_z) <= 45.0
+                        t_arg[2] >= 1.25 * max(s_floor_t, 1e-9)
+                        and abs(t_arg[0] - claw_z) <= 60.0
                 ):
                     top_t = sorted(
                         tiny_pts, key=lambda q: q[2], reverse=True
@@ -1017,10 +1197,13 @@ class SmoothAutofocusThing(lt.Thing):
                         FitOutcome(ok=True, peak=z_fit, fwhm=None),
                         t_arg[2],
                     )
-                    fit, best = gate
             if gate is not None:
                 fit, best = gate
                 mode += f"|tiny_fit{fit.peak:.1f}"
+                if fit.fwhm is not None:
+                    type(self)._CAL_FWHM = fit.fwhm
+                    self._save_cal("fwhm_u", fit.fwhm)
+                    mode += f"|fwhm{fit.fwhm:.1f}"
                 park_z = self._park(monitor, fit.peak, len(monitor.times))
                 mode += f"|park{park_z:.1f}"
                 self._save_last_focus(monitor, len(monitor.times), fit.peak)
@@ -1037,86 +1220,6 @@ class SmoothAutofocusThing(lt.Thing):
                 "s": [q[2] for q in tiny_pts],
                 "b": [q[1] for q in tiny_pts],
             })
-            if "far2" not in mode:
-                mode += "|retryfar2"
-                far_mark2 = len(monitor.times)
-                traj2, frames2 = self._sync_move(
-                    monitor, leg_b, _FAR_VELOCITY, far_mark2
-                )
-                leg2_pts = self._label_leg(frames2, claw_z, leg_b, traj2,
-                                           _FAR_VELOCITY)
-                _dump_json("smooth_af_seekpts_far2.json", {
-                    "z": [q[0] for q in leg2_pts],
-                    "s": [q[2] for q in leg2_pts],
-                    "c": [q[1] for q in leg2_pts],
-                    "p": [q[3] for q in leg2_pts],
-                })
-                claw_z2, claw_tag2 = self._claw(leg2_pts, "far2")
-                if claw_z2 is not None:
-                    claw_z2 = self._refine_hit(leg2_pts, claw_z2)
-                mode += claw_tag2
-                if claw_z2 is not None:
-                    span_h2 = span_h
-                    t_lo2 = max(claw_z2 - span_h2, min(leg_a, leg_b))
-                    t_hi2 = min(claw_z2 + span_h2, max(leg_a, leg_b))
-                    v2 = tiny_v
-                    tm2 = len(monitor.times)
-                    self._sync_move(
-                        monitor, t_lo2, _PARK_VELOCITY, tm2, labeled=False
-                    )
-                    tm2b = len(monitor.times)
-                    traj4, frames4 = self._sync_move(
-                        monitor, t_hi2, v2, tm2b
-                    )
-                    t_pts2 = self._label_leg(frames4, t_lo2, t_hi2, traj4, v2)
-                    _dump_json("smooth_af_seekpts_tiny.json", {
-                        "z": [q[0] for q in t_pts2],
-                        "s": [q[2] for q in t_pts2],
-                        "c": [q[1] for q in t_pts2],
-                        "p": [q[3] for q in t_pts2],
-                    })
-                    gate2 = self._fit_gate(t_pts2)
-                    if gate2 is None and t_pts2:
-                        fl2 = sorted(q[2] for q in t_pts2)[
-                            max(0, len(t_pts2) * 3 // 10 - 1)
-                        ]
-                        a2 = max(t_pts2, key=lambda q: q[2])
-                        if (
-                            a2[2] >= 1.25 * max(fl2, 1e-9)
-                            and abs(a2[0] - claw_z2) <= 45.0
-                        ):
-                            tp2 = sorted(
-                                t_pts2, key=lambda q: q[2], reverse=True
-                            )[: max(2, len(t_pts2) // 5)]
-                            ws2 = sum(q[2] for q in tp2)
-                            zf2 = (
-                                sum(q[0] * q[2] for q in tp2) / ws2
-                                if ws2 > 0 else a2[0]
-                            )
-                            mode += "|tiny_near"
-                            gate2 = (
-                                FitOutcome(ok=True, peak=zf2, fwhm=None),
-                                a2[2],
-                            )
-                    if gate2 is not None:
-                        fit, best = gate2
-                        mode += f"|tiny_fit{fit.peak:.1f}"
-                        park_z = self._park(
-                            monitor, fit.peak, len(monitor.times)
-                        )
-                        mode += f"|park{park_z:.1f}"
-                        self._save_last_focus(
-                            monitor, len(monitor.times), fit.peak
-                        )
-                        return SmoothFocusResult(
-                            peak_z=park_z, mode=mode, fit=fit,
-                            curve=[
-                                CurvePoint(z=q[0], sharpness=q[2])
-                                for q in t_pts2
-                            ],
-                            elapsed_s=time.monotonic() - t0,
-                        )
-                    mode += "|tiny_fail2"
 
         mode += "|no_anchor_refuse"
         ret_mark = len(monitor.times)
@@ -1126,7 +1229,7 @@ class SmoothAutofocusThing(lt.Thing):
 
     @lt.action
     def smooth_focus(
-        self, params: SmoothAutofocusParams
+            self, params: SmoothAutofocusParams
     ) -> SmoothFocusResult:
         """Sweep autofocus: near sweep, far sweep, claw, tiny sweep, park.
 
@@ -1136,11 +1239,25 @@ class SmoothAutofocusThing(lt.Thing):
         t0 = time.monotonic()
         burst = 120.0
         prev_exp = prev_gain = None
+        forced_base = getattr(self, "_forced_restore_base", None)
         try:
-            prev_exp = self._cam.exposure_time
-            prev_gain = self._cam.analogue_gain
+            if forced_base is not None:
+                prev_gain, prev_exp = forced_base
+                type(self)._LAST_REGIME = None
+            else:
+                prev_exp = self._cam.exposure_time
+                prev_gain = self._cam.analogue_gain
+                if prev_gain is not None and prev_exp is not None:
+                    if float(prev_gain) < 3.5:
+                        type(self)._LAST_REGIME = (
+                            float(prev_gain), int(prev_exp)
+                        )
+                    else:
+                        type(self)._LAST_REGIME = None
         except Exception:
             prev_exp = prev_gain = None
+        type(self)._AF_BUSY = True
+        self._cancel_cooler()
         try:
             if hasattr(self._stage, "set_homed"):
                 self._stage.set_homed()
@@ -1155,9 +1272,14 @@ class SmoothAutofocusThing(lt.Thing):
         try:
             monitor = StreamSharpnessMonitor(self._cam)
             _t_switch = time.monotonic()
-            with self._fast_stream(
-                restore=True, mode_name="crop990"
-            ) as _fast, monitor:
+            _fast = True
+            try:
+                if self._cam.streaming_mode != "crop990":
+                    self._cam._start_streaming("crop990")
+                    _fast = False
+            except Exception:
+                LOGGER.warning("Could not switch to crop990", exc_info=True)
+            with monitor:
                 with self._cam._streaming_picamera() as picam:
                     picam.set_controls({"FrameRate": float(burst)})
                 _t_ramp = time.monotonic()
@@ -1173,15 +1295,32 @@ class SmoothAutofocusThing(lt.Thing):
                 else:
                     _log("SETUP mode_ready t=0.000 (already crop990)")
                 _t_burst = time.monotonic()
-                with _EncoderBurst(self._cam, burst):
+                with _EncoderBurst(self._cam):
                     _log(
                         f"SETUP burst_ready t={time.monotonic() - _t_burst:.3f}"
                     )
                     try:
                         _g, _e = _probe_regime(prev_gain, prev_exp)
-                        self._cam.analogue_gain = _g
-                        self._cam.exposure_time = _e
-                        result = self._run_flow(monitor)
+                        self._cam.set_probe_controls_raw(_g, _e)
+                        try:
+                            result = self._run_flow(monitor)
+                        except NoFocusFoundError as exc:
+                            if "tiny_fail" not in str(exc):
+                                _log(
+                                    f"RUN total={time.monotonic() - t0:.2f} "
+                                    f"mode={exc} NORETRY"
+                                )
+                                raise
+                            _log(
+                                f"RUN total={time.monotonic() - t0:.2f} "
+                                f"mode={exc} RETRY1"
+                            )
+                            try:
+                                if hasattr(self._stage, "set_homed"):
+                                    self._stage.set_homed()
+                            except Exception:
+                                pass
+                            result = self._run_flow(monitor)
                         LOGGER.info(
                             "AF total=%.2fs mode=%s",
                             time.monotonic() - t0, result.mode,
@@ -1199,10 +1338,7 @@ class SmoothAutofocusThing(lt.Thing):
                         raise
         finally:
             try:
-                if prev_exp is not None:
-                    self._cam.exposure_time = int(prev_exp)
-                if prev_gain is not None:
-                    self._cam.analogue_gain = prev_gain
+                self._cam.restore_calibration_raw()
             except Exception:
                 LOGGER.warning("Exposure/gain restore failed", exc_info=True)
             try:
@@ -1210,318 +1346,19 @@ class SmoothAutofocusThing(lt.Thing):
                     self._stage.update_position()
             except Exception:
                 LOGGER.warning("Stage position sync failed", exc_info=True)
-
-    @lt.action
-    def metric_probe(
-        self,
-        n_frames: int = 100,
-        burst_fps: float = 0.0,
-    ) -> MetricProbeResult:
-        """Diagnostic: median raw-Y sharpness at the current position.
-
-        Collects exactly ``n_frames`` frames without moving the stage.
-        """
-        burst = float(burst_fps or FPS)
-        monitor = StreamSharpnessMonitor(self._cam)
-        try:
-            prev_gain = self._cam.analogue_gain
-        except Exception:
-            prev_gain = None
-        try:
-            prev_exp = self._cam.exposure_time
-        except Exception:
-            prev_exp = None
-        with self._fast_stream(restore=True, mode_name="crop990"):
-            _log("PROBE mode_switched t=%.3f" % (time.monotonic(),))
-            with _EncoderBurst(self._cam, burst), monitor:
-                try:
-                    _g, _e = _probe_regime(prev_gain, prev_exp)
-                    self._cam.analogue_gain = _g
-                    self._cam.exposure_time = _e
-                    monitor.wait_frames(
-                        max(8, int(n_frames)), 0,
-                        timeout=max(2.0, 4.0 * max(8, int(n_frames)) / FPS),
-                    )
-                finally:
-                    try:
-                        if prev_exp is not None:
-                            self._cam.exposure_time = int(prev_exp)
-                        if prev_gain is not None:
-                            self._cam.analogue_gain = prev_gain
-                    except Exception:
-                        LOGGER.warning(
-                            "Exposure/gain restore failed", exc_info=True
-                        )
-        n = len(monitor.sharpness)
-        med = statistics.median(monitor.sharpness) if monitor.sharpness else 0.0
-        bright = (
-            statistics.median(monitor.brightness) if monitor.brightness else 0.0
-        )
-        chroma = (
-            statistics.median(monitor.chroma) if monitor.chroma else 0.0
-        )
-        pooled = (
-            statistics.median(monitor.pooled) if monitor.pooled else 0.0
-        )
-        eff_fps = 0.0
-        if n >= 3:
-            ts_sorted = sorted(monitor.times)
-            diffs = [b - a for a, b in zip(ts_sorted, ts_sorted[1:])]
-            med_dt = statistics.median(diffs)
-            eff_fps = 1.0 / med_dt if med_dt > 0 else 0.0
-        try:
-            mode = self._cam.streaming_mode
-        except Exception:
-            mode = "?"
-        return MetricProbeResult(
-            sharpness=med,
-            brightness=bright,
-            n_frames=n,
-            fps=round(eff_fps, 1),
-            streaming_mode=str(mode),
-            chroma=chroma,
-            pooled=pooled,
-        )
-
-    @lt.action
-    def calibrate_gates(
-        self, sweep_velocity: float = 80.0, sweep_span: float = 40.0
-    ) -> GateCalibration:
-        """Measure focus-curve width and contrast on the current view.
-
-        Focus the sample by eye, zero the stage there, then run this: it
-        sweeps +-40u through focus at 80 u/s inside a 120fps burst, folds
-        the frames into stage coordinates, and stores FWHM/contrast as
-        gate settings for near/tiny velocity and claw bars.
-        """
-        t0 = time.monotonic()
-        monitor = StreamSharpnessMonitor(self._cam)
-        try:
-            prev_exp = self._cam.exposure_time
-            prev_gain = self._cam.analogue_gain
-        except Exception:
-            prev_exp = prev_gain = None
-        mode = ""
-        pts = []
-        try:
             try:
-                if hasattr(self._stage, "set_homed"):
-                    self._stage.set_homed()
-                z0 = self._stage_z()
+                if getattr(self, "_mesh_suspended_by_af", False):
+                    sender = getattr(self._stage, "_send_gcode_script", None)
+                    if sender is not None:
+                        sender(script="SAMPLE_MESH_RESUME")
+                    self._mesh_suspended_by_af = False
+                    _log("MESH RESUME after AF abort")
             except Exception:
-                z0 = self._last_hw if hasattr(self, "_last_hw") else 0.0
-            self._last_hw = z0
-            d_near = 1 if type(self)._FAR_DIR == 1 else -1
-            with self._fast_stream(
-                restore=True, mode_name="crop990"
-            ) as _fast, monitor:
-                with _EncoderBurst(self._cam, 120.0):
-                    try:
-                        _g, _e = _probe_regime(prev_gain, prev_exp)
-                        self._cam.analogue_gain = _g
-                        self._cam.exposure_time = _e
-                        m1 = len(monitor.times)
-                        self._sync_move(
-                            monitor, z0 + d_near * sweep_span, sweep_velocity, m1
-                        )
-                        m2 = len(monitor.times)
-                        traj_b, frames_b = self._sync_move(
-                            monitor, z0 - d_near * sweep_span, sweep_velocity, m2
-                        )
-                        pts_b = self._label_leg(
-                            frames_b,
-                            z0 + d_near * sweep_span, z0 - d_near * sweep_span,
-                            traj_b, sweep_velocity,
-                        )
-                        m3 = len(monitor.times)
-                        traj_c, frames_c = self._sync_move(
-                            monitor, z0, sweep_velocity, m3
-                        )
-                        pts_c = self._label_leg(
-                            frames_c,
-                            z0 - d_near * sweep_span, z0,
-                            traj_c, sweep_velocity,
-                        )
-                        mode = f"|cal nb={len(pts_b)} nc={len(pts_c)}"
-                    except NoFocusFoundError:
-                        raise
-                    except Exception:
-                        try:
-                            mrec = len(monitor.times)
-                            self._sync_move(monitor, z0, 300.0, mrec)
-                            _log(
-                                f"RECOVER to {z0:.1f} t={time.time():.3f}"
-                            )
-                        except Exception:
-                            _log(
-                                f"RECOVER FAILED t={time.time():.3f}"
-                            )
-                        raise
-        finally:
-            try:
-                if prev_exp is not None:
-                    self._cam.exposure_time = int(prev_exp)
-                if prev_gain is not None:
-                    self._cam.analogue_gain = prev_gain
-            except Exception:
-                LOGGER.warning("Exposure/gain restore failed", exc_info=True)
-            try:
-                if hasattr(self._stage, "update_position"):
-                    self._stage.update_position()
-            except Exception:
-                LOGGER.warning("Stage position sync failed", exc_info=True)
-        if len(pts_b) < 8 or len(pts_c) < 8:
-            raise NoFocusFoundError("cal: too few frames" + mode)
-
-        def _leg_centroid(points):
-            zs = [q[0] for q in points]
-            lo, hi = min(zs), max(zs)
-            span = hi - lo
-            inner = [
-                q for q in points
-                if lo + 0.1 * span <= q[0] <= hi - 0.1 * span
-            ]
-            if len(inner) < 4:
-                return None
-            ss = sorted((q[2] for q in inner), reverse=True)
-            bar = ss[max(0, len(ss) // 4)]
-            top = [q for q in inner if q[2] >= bar]
-            wsum = sum(q[2] for q in top)
-            if wsum <= 0:
-                return None
-            return sum(q[0] * q[2] for q in top) / wsum
-
-        cb = _leg_centroid(pts_b)
-        cc = _leg_centroid(pts_c)
-        if cb is None or cc is None:
-            raise NoFocusFoundError("cal: no inner frames" + mode)
-        sweep_raw = float(cb) - float(cc)
-        b = abs(sweep_raw) / 2.0
-        d_near = 1 if type(self)._FAR_DIR == 1 else -1
-        if b > 0.25:
-            pts_b = (
-                [(q[0] - b,) + tuple(q[1:]) for q in pts_b]
-                if d_near == 1
-                else [(q[0],) + tuple(q[1:]) for q in pts_b]
-            )
-            pts_c = (
-                [(q[0],) + tuple(q[1:]) for q in pts_c]
-                if d_near == 1
-                else [(q[0] + b,) + tuple(q[1:]) for q in pts_c]
-            )
-        cb = _leg_centroid(pts_b)
-        cc = _leg_centroid(pts_c)
-        zb, zc = float(cb), float(cc)
-        sweep_err = zb - zc
-        zpk = (zb + zc) / 2.0
-        merged = (
-            [(q[0] - sweep_err / 2.0, q[2]) for q in pts_b]
-            + [(q[0] + sweep_err / 2.0, q[2]) for q in pts_c]
-        )
-        merged.sort()
-        az = np.array([q[0] for q in merged])
-        as_ = np.array([q[1] for q in merged])
-        pk = float(as_.max())
-        far_mask = np.abs(az - zpk) > 30.0
-        floor = (
-            float(np.median(as_[far_mask]))
-            if int(far_mask.sum()) >= 6
-            else float(np.median(as_))
-        )
-        contrast = pk / max(floor, 1e-9)
-        half = floor + (pk - floor) / 2.0
-        above = az[as_ >= half]
-        fwhm = float(above.max() - above.min()) if len(above) >= 2 else 0.0
-        type(self)._CAL_FWHM = fwhm if fwhm > 0 else None
-        type(self)._CAL_CONTRAST = contrast if contrast > 1.05 else None
-        type(self)._CAL_BACKLASH = b if contrast > 1.05 else None
-        type(self)._CAL_PEAK_SHARP = pk if contrast > 1.05 else None
-        try:
-            save = getattr(self._stage, "_save_cal", None)
-            if callable(save):
-                save({
-                    "fwhm_u": type(self)._CAL_FWHM,
-                    "contrast": type(self)._CAL_CONTRAST,
-                    "backlash_u": type(self)._CAL_BACKLASH,
-                    "peak_sharpness": type(self)._CAL_PEAK_SHARP,
-                })
-        except Exception:
-            pass
-        near_v = self._cal_near_velocity()
-        span_h = max(15.0, min(_TINY_SPAN, (fwhm * 1.25) if fwhm else _TINY_SPAN))
-        tiny_v = max(_TINY_MIN_V, min(_TINY_VELOCITY, FPS * fwhm / 5.0))
-        mode += f"|fwhm{fwhm:.1f}|c{contrast:.2f}|err{sweep_err:+.1f}|b{b:.1f}"
-        _log(
-            f"CAL fwhm={fwhm:.1f} contrast={contrast:.2f} zpk={zpk:.1f} "
-            f"err={sweep_err:+.1f} b={b:.1f} near_v={near_v:.0f} "
-            f"tiny_span={2 * span_h:.0f} tiny_v={tiny_v:.0f}"
-        )
-        return GateCalibration(
-            fwhm_u=round(fwhm, 1),
-            contrast=round(contrast, 3),
-            peak_sharpness=round(pk, 1),
-            floor_sharpness=round(floor, 1),
-            peak_z=round(zpk, 1),
-            sweep_error_u=round(sweep_err, 1),
-            backlash_u=round(b, 1),
-            near_velocity=round(near_v, 0),
-            tiny_velocity=round(tiny_v, 0),
-            tiny_span=round(2 * span_h, 0),
-            mode=mode,
-        )
-
-    @lt.action
-    def follow_focus(self, params: FollowParams) -> FollowResult:
-        """Re-find focus every ``interval_s`` seconds, ``iterations`` times.
-
-        Each cycle runs the normal ``smooth_focus`` search around the previous
-        peak and appends the outcome to a JSONL log next to the server config.
-        ``iterations=0`` runs until the action is cancelled. Peaks land in
-        ``smooth_af_follow_log.jsonl`` — one JSON object per line.
-        """
-        t_start = time.time()
-        stops = 0
-        peaks: List[float] = []
-        entries: List[FollowEntry] = []
-        cycle_params = SmoothAutofocusParams(
-            search_span_steps=params.search_span_steps
-        )
-        while True:
-            idx = len(entries)
-            t_cycle = time.time()
-            error = None
-            peak = None
-            mode = ""
-            elapsed = 0.0
-            try:
-                r = self.smooth_focus(cycle_params)
-                peak = r.peak_z
-                mode = r.mode
-                elapsed = r.elapsed_s
-                peaks.append(peak)
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-                mode = "error"
-            entries.append(FollowEntry(
-                index=idx,
-                ts=round(t_cycle - t_start, 3),
-                peak_z=peak,
-                elapsed_s=round(elapsed, 3),
-                mode=mode,
-                error=error,
-            ))
-            try:
-                with _FOLLOW_LOG_PATH.open("a") as f:
-                    f.write(json.dumps(entries[-1].model_dump()) + "\n")
-            except Exception:
-                LOGGER.warning("Could not append to follow log", exc_info=True)
-            stops += 1
-            if params.iterations and stops >= params.iterations:
-                break
-            wait = params.interval_s - (time.time() - t_cycle)
-            if wait > 0:
-                time.sleep(wait)
-        return FollowResult(stops=stops, peaks=peaks, entries=entries)
+                LOGGER.warning(
+                    "mesh resume after AF failed", exc_info=True
+                )
+            type(self)._AF_BUSY = False
+            self._arm_cooler()
 
 
 class SmoothCompatAutofocus(SmoothAutofocusThing, AutofocusThing):
@@ -1553,11 +1390,11 @@ class SmoothCompatAutofocus(SmoothAutofocusThing, AutofocusThing):
 
     @lt.action
     def fast_autofocus(
-        self,
-        dz: int = 2000,
-        start: Literal["centre", "base"] = "centre",
-        sharpness_metric=None,
-        record=None,
+            self,
+            dz: int = 2000,
+            start: Literal["centre", "base"] = "centre",
+            sharpness_metric=None,
+            record=None,
     ) -> SharpnessDataArrays:
         """Autofocus with the smooth engine; dz = total search span (stage units)."""
         span = max(8, min(int(dz), 192))
@@ -1568,11 +1405,11 @@ class SmoothCompatAutofocus(SmoothAutofocusThing, AutofocusThing):
 
     @lt.action
     def looping_autofocus(
-        self,
-        dz: int = 2000,
-        start: Literal["centre", "base"] = "centre",
-        sharpness_metric=None,
-        record=None,
+            self,
+            dz: int = 2000,
+            start: Literal["centre", "base"] = "centre",
+            sharpness_metric=None,
+            record=None,
     ) -> tuple[list[float], list[float]]:
         """Run the smooth engine once; it already re-verifies and re-anchors."""
         try:

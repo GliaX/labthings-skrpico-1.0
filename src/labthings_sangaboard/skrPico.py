@@ -9,7 +9,7 @@ import threading
 import time
 from enum import Enum
 from types import TracebackType
-from typing import Any, Literal, Mapping, Optional, Self, Sequence
+from typing import Any, Literal, Mapping, Optional, Self, Sequence, Tuple
 
 import httpx
 import labthings_fastapi as lt
@@ -192,6 +192,9 @@ class SkrPicoThing(BaseStage):
                             with self._motion_ws_lock:
                                 try:
                                     self._motion_last_z = float(lp[2])
+                                    self._motion_last_xy = (
+                                        float(lp[0]), float(lp[1]),
+                                    )
                                 except Exception:
                                     pass
                                 self._motion_last_v = (
@@ -205,6 +208,7 @@ class SkrPicoThing(BaseStage):
                                         v_now if v_now is not None else 0.0,
                                         carried,
                                         t_mono + self._et_handshake,
+                                        (float(lp[0]), float(lp[1])),
                                     )
                                 )
                                 self._motion_ws_cond.notify_all()
@@ -234,6 +238,22 @@ class SkrPicoThing(BaseStage):
             return list(seq)
         with lock:
             return [s for s in seq if s[0] > t0]
+
+    def xy_live_position(self) -> Optional[Tuple[float, float]]:
+        """Latest (x, y) from the motion_report stream, or None."""
+        v = getattr(self, "_motion_last_xy", None)
+        return None if v is None else (float(v[0]), float(v[1]))
+
+    def _xy_live_drift(self) -> Optional[float]:
+        """Max |live - tracked| in stage units, or None if unavailable."""
+        v = self.xy_live_position()
+        if v is None:
+            return None
+        try:
+            trk = self._xy_tracked()
+        except AttributeError:
+            return None
+        return max(abs(v[0] - trk[0]), abs(v[1] - trk[1]))
 
     def motion_clear(self) -> None:
         """Drop all buffered telemetry. Called at the start of a synced
