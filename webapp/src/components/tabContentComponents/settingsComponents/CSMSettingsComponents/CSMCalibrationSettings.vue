@@ -1,7 +1,7 @@
 <template>
   <div id="CSMCalibrationSettings" ref="CSMCalibrationSettingsContainer" class="uk-width-large">
     <!--Show auto calibrate if default plugin is enabled-->
-    <div class="uk-margin-small">
+    <div v-if="'calibrate_xy' in actions" class="uk-margin-small">
       <action-button
         :button-primary="true"
         :can-terminate="true"
@@ -16,22 +16,8 @@
         @error="modalError"
       />
     </div>
-    <div class="uk-margin-small">
-      <button
-        class="uk-button uk-button-primary uk-width-1-1"
-        :disabled="detecting"
-        @click="autoDetectView"
-      >
-        {{ detecting ? "Detecting… (stage will jog 4×)" : "Auto-Detect View Alignment" }}
-      </button>
-      <p v-if="detectResult" class="uk-text-meta uk-margin-remove">
-        Measured: +X→({{ detectResult.vx_px[0] }},{{ detectResult.vx_px[1] }})px +Y→({{
-          detectResult.vy_px[0]
-        }},{{ detectResult.vy_px[1] }})px → stage→image rotation {{ stageToImageRotation }}°,
-        mirror: {{ navigationMirror ? "yes" : "no" }}
-      </p>
-    </div>
     <button
+      v-if="'last_calibration' in properties"
       v-show="showExtraSettings"
       type="button"
       class="uk-button uk-button-default uk-width-1-1"
@@ -72,11 +58,7 @@
 <script>
 import ActionButton from "@/components/labThingsComponents/actionButton.vue";
 import matrixDisplay from "@/components/ui/matrixDisplay.vue";
-import axios from "axios";
 import { useIntersectionObserver } from "@vueuse/core";
-import { useSettingsStore } from "@/stores/settings.js";
-import { storeToRefs } from "pinia";
-import labThingsMixin from "@/mixins/labThingsMixins.js";
 
 // Export main app
 export default {
@@ -86,7 +68,6 @@ export default {
     ActionButton,
     matrixDisplay,
   },
-  mixins: [labThingsMixin],
 
   props: {
     showExtraSettings: {
@@ -98,27 +79,22 @@ export default {
 
   emits: ["recalibrateResponse"],
 
-  setup() {
-    const store = useSettingsStore();
-    const { navigationStepSize, navigationRotate, navigationMirror, stageToImageRotation } =
-      storeToRefs(store);
-    return {
-      navigationStepSize,
-      navigationRotate,
-      navigationMirror,
-      stageToImageRotation,
-    };
-  },
-
   data() {
     return {
       csmMatrix: undefined,
       csmResolution: undefined,
       csmRatio: undefined,
       csmFOV: undefined,
-      detecting: false,
-      detectResult: null,
     };
+  },
+
+  computed: {
+    actions() {
+      return this.thingDescription("camera_stage_mapping").actions;
+    },
+    properties() {
+      return this.thingDescription("camera_stage_mapping").properties;
+    },
   },
 
   mounted() {
@@ -135,54 +111,6 @@ export default {
     visibilityChanged(isVisible) {
       if (isVisible) {
         this.updateDisplayedCSM();
-      }
-    },
-    async autoDetectView() {
-      this.detecting = true;
-      this.detectResult = null;
-      try {
-        const step = Math.max(
-          Math.abs(this.navigationStepSize.x),
-          Math.abs(this.navigationStepSize.y),
-        );
-        const response = await this.invokeAction(
-          "camera_stage_mapping",
-          "detect_view",
-          { step: step },
-          false,
-        );
-        const invocation = response.data;
-        const url = invocation.href || invocation["@id"];
-        const final = await this.pollUntilCompleteReturn(url);
-        this.detectResult = final;
-        this.stageToImageRotation = final.stage_to_image_rotation;
-        this.navigationMirror = final.mirror;
-        // Suggest a preview rotation so the view is upright relative to
-        // the stage: preview = stageToImage + 180 keeps +X rightward.
-        this.navigationRotate = (final.stage_to_image_rotation + 180) % 360;
-      } catch (error) {
-        this.modalError(error);
-      } finally {
-        this.detecting = false;
-      }
-    },
-    async pollUntilCompleteReturn(url) {
-      for (;;) {
-        const response = await axios.get(url, { baseURL: this.baseUri });
-        const status = response.data.status;
-        if (status === "completed") {
-          const output = await axios.get(`${url}/output`, {
-            baseURL: this.baseUri,
-          });
-          return output.data;
-        }
-        if (status === "error") {
-          throw new Error(
-            (response.data.log || []).map((entry) => entry.message).join("; ") ||
-              "detection failed",
-          );
-        }
-        await new Promise((resolve) => setTimeout(resolve, 400));
       }
     },
     getCalibrationData: async function () {

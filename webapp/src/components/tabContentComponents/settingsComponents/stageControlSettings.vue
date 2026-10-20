@@ -10,61 +10,65 @@
       <div>
         <label class="uk-form-label" for="form-stacked-text">x</label>
         <div class="uk-form-controls">
-          <input v-model="navigationStepSize.x" class="uk-input uk-form-small" type="number" />
+          <input v-model="stepSize.x" class="uk-input uk-form-small" type="number" />
         </div>
         <label class="uk-margin-small-right">
-          <input v-model="navigationInvert.x" class="uk-checkbox" type="checkbox" />
+          <input v-model="invert.x" class="uk-checkbox" type="checkbox" />
           Invert x
         </label>
       </div>
+
       <div>
         <label class="uk-form-label" for="form-stacked-text">y</label>
         <div class="uk-form-controls">
-          <input v-model="navigationStepSize.y" class="uk-input uk-form-small" type="number" />
+          <input v-model="stepSize.y" class="uk-input uk-form-small" type="number" />
         </div>
         <label class="uk-margin-small-right">
-          <input v-model="navigationInvert.y" class="uk-checkbox" type="checkbox" />
+          <input v-model="invert.y" class="uk-checkbox" type="checkbox" />
           Invert y
         </label>
       </div>
+
       <div>
         <label class="uk-form-label" for="form-stacked-text">z</label>
         <div class="uk-form-controls">
-          <input v-model="navigationStepSize.z" class="uk-input uk-form-small" type="number" />
+          <input v-model="stepSize.z" class="uk-input uk-form-small" type="number" />
         </div>
-      </div>
-    </div>
-    <div class="uk-grid-small" uk-grid>
-      <div class="uk-width-1-3">
-        <label class="uk-form-label" for="form-stacked-select">Preview rotation</label>
-        <div class="uk-form-controls">
-          <select v-model.number="navigationRotate" class="uk-select uk-form-small">
-            <option :value="0">0°</option>
-            <option :value="90">90°</option>
-            <option :value="180">180°</option>
-            <option :value="270">270°</option>
-          </select>
-        </div>
-        <p class="uk-text-meta uk-margin-remove">
-          Rotates the camera preview; navigation follows the rotated view. Use Auto-Detect View
-          Alignment in the Camera-Stage Mapping settings to measure it automatically.
-        </p>
       </div>
     </div>
   </div>
 </template>
 
 <script>
-import { storeToRefs } from "pinia";
-import { useSettingsStore } from "@/stores/settings.js";
-
 export default {
   name: "StageControlSettings",
 
-  setup() {
-    const store = useSettingsStore();
-    const { navigationStepSize, navigationInvert, navigationRotate } = storeToRefs(store);
-    return { navigationStepSize, navigationInvert, navigationRotate };
+  computed: {
+    // Note that as stepSize and invert are mutated (i.e. we change stepSize.x not stepSize)
+    // rather than directly set we cannot use get() and set() computed to interact with the
+    // store as changed won't be detected by set(). Instead use a deep watcher to
+    // update the store (see ``watch:`` below)
+    stepSize() {
+      return this.$store.state.navigationStepSize;
+    },
+    invert() {
+      return this.$store.state.navigationInvert;
+    },
+  },
+
+  watch: {
+    stepSize: {
+      deep: true,
+      handler(newVal) {
+        this.$store.commit("changeNavigationStepSize", newVal);
+      },
+    },
+    invert: {
+      deep: true,
+      handler(newVal) {
+        this.$store.commit("changeNavigationInvert", newVal);
+      },
+    },
   },
 };
 </script>

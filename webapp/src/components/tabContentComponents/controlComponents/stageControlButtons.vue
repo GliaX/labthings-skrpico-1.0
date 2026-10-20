@@ -14,7 +14,7 @@
         class="uk-button uk-button-primary dpad-btn"
         @pointerdown="jog($event, 0, 1, 0)"
         @pointerup="jogStop()"
-        @pointercancel="jogStop()"
+        @mouseLeave="jogStop()"
       >
         <span class="material-symbols-outlined sync-icon"> arrow_upward </span>
       </button>
@@ -79,8 +79,6 @@
 
 <script>
 import { eventBus } from "@/eventBus.js";
-import { mapWritableState } from "pinia";
-import { useSettingsStore } from "@/stores/settings.js";
 
 export default {
   name: "StageControlButtons",
@@ -96,17 +94,9 @@ export default {
   },
   data: () => ({
     jogIntervalId: null,
-    jogTime: 30,
+    jogDistance: 10,
+    jogTime: 3,
   }),
-
-  computed: {
-    ...mapWritableState(useSettingsStore, [
-      "navigationInvert",
-      "navigationStepSize",
-      "navigationRotate",
-    ]),
-  },
-
   methods: {
     /**
      * Jog d-pad and focus buttons.
@@ -126,23 +116,13 @@ export default {
       // pointer is.
       pointerEvent.target.setPointerCapture(pointerEvent.pointerId);
 
-      let invokeJog = () => {
-        let jx = x * this.navigationStepSize.x * (this.navigationInvert.x ? -1 : 1);
-        let jy = y * this.navigationStepSize.y * (this.navigationInvert.y ? -1 : 1);
-        const rot = ((this.navigationRotate % 360) + 360) % 360;
-        if (rot === 90) {
-          [jx, jy] = [jy, -jx];
-        } else if (rot === 180) {
-          [jx, jy] = [-jx, -jy];
-        } else if (rot === 270) {
-          [jx, jy] = [-jy, jx];
-        }
+      const navigationInvert = this.$store.state.navigationInvert;
+      let invokeJog = () =>
         this.invokeAction("stage", "jog", {
-          x: jx,
-          y: jy,
-          z: z * this.navigationStepSize.z,
+          x: x * this.jogDistance * (navigationInvert.x ? -1 : 1),
+          y: y * this.jogDistance * (navigationInvert.y ? -1 : 1),
+          z: z * this.jogDistance,
         });
-      };
       invokeJog();
       this.jogIntervalId = setInterval(invokeJog, this.jogTime);
     },
@@ -191,17 +171,14 @@ export default {
   grid-column: 2;
   grid-row: 1;
 }
-
 .dpad-grid #left-button {
   grid-column: 1;
   grid-row: 2;
 }
-
 .dpad-grid #right-button {
   grid-column: 3;
   grid-row: 2;
 }
-
 .dpad-grid #down-button {
   grid-column: 2;
   grid-row: 3;
@@ -211,7 +188,6 @@ export default {
   grid-column: 1;
   grid-row: 5;
 }
-
 .both-controls #focus-in-button {
   grid-column: 3;
   grid-row: 5;
@@ -221,7 +197,6 @@ export default {
   grid-column: 1;
   grid-row: 1;
 }
-
 .focus-only #focus-in-button {
   grid-column: 3;
   grid-row: 1;

@@ -1,11 +1,9 @@
 <template>
   <div id="app" class="uk-height-1-1 uk-margin-remove uk-padding-remove" :class="handleTheme">
-    <portraitWarning />
-
-    <!-- this stops the app loading until setConnected is committed in the store,
-         this means other components will not load until we have Thing Descriptions. -->
-    <loadingContent v-if="!ready" />
-    <appContent v-else />
+    <!-- this stops the app loading until setConnected is committed in the store, this means
+     other components will not load until we have Thing Descriptions. -->
+    <loadingContent v-if="!$store.getters.ready" />
+    <appContent v-if="$store.getters.ready" />
     <!-- Runtime modals -->
     <div id="modal-center" ref="keyboardManualModal" class="uk-flex-top" uk-modal>
       <div class="uk-modal-dialog uk-modal-body uk-margin-auto-vertical">
@@ -30,10 +28,6 @@ import appContent from "./components/appContent.vue";
 import loadingContent from "./components/loadingContent.vue";
 import Mousetrap from "mousetrap";
 import { eventBus } from "./eventBus.js";
-import { mapWritableState, mapState, mapActions } from "pinia";
-import { useSettingsStore } from "@/stores/settings.js";
-import { useWotStore } from "@/stores/wot.js";
-import portraitWarning from "./components/genericComponents/portraitWarning.vue";
 
 const move_keys = ["up", "down", "left", "right", "pageup", "pagedown"];
 
@@ -64,7 +58,6 @@ export default {
   components: {
     appContent,
     loadingContent,
-    portraitWarning,
   },
 
   data: function () {
@@ -76,23 +69,12 @@ export default {
       themeObserver: undefined,
       keysDown: new Set(),
       lastJogTime: 0,
-      jogTime: 30,
+      jogDistance: 600,
+      jogTime: 300,
     };
   },
 
   computed: {
-    ...mapWritableState(useSettingsStore, [
-      "appTheme",
-      "navigationStepSize",
-      "navigationInvert",
-      "navigationRotate",
-      "stageToImageRotation",
-      "microscopeHostname",
-      "error",
-      "waiting",
-    ]),
-    ...mapState(useSettingsStore, ["ready", "baseUri"]),
-
     isSystemDark: function () {
       if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
         return true;
@@ -102,9 +84,9 @@ export default {
     },
     handleTheme: function () {
       var isDark = false;
-      if (this.appTheme == "dark") {
+      if (this.$store.state.appTheme == "dark") {
         isDark = true;
-      } else if (this.appTheme == "system") {
+      } else if (this.$store.state.appTheme == "system") {
         if (this.systemDark) {
           isDark = true;
         }
@@ -116,123 +98,126 @@ export default {
     },
   },
 
-  // watch origin function refactored
-  watch: {
-    baseUri() {
-      this.checkConnection();
-    },
-  },
-
   mounted() {
     // Query CSS dark theme preference
-    this.mql = window.matchMedia("(prefers-color-scheme: dark)");
-    this.systemDark = this.mql.matches;
+    var mql = window.matchMedia("(prefers-color-scheme: dark)");
     // Check for system dark theme when mounted
-    if (this.mql.matches) {
+    if (mql.matches) {
       this.systemDark = true;
     }
     // Create a theme observer to watch for changes
-    this.themeWatchdog = (e) => {
-      this.systemDark = e.matches;
-    };
-    this.mql.addEventListener("change", this.themeWatchdog);
+    this.themeObserver = mql.addListener((e) => {
+      if (e.matches) {
+        this.systemDark = true;
+      } else {
+        this.systemDark = false;
+      }
+    });
     // Check connection to API
     this.checkConnection();
   },
 
   created: function () {
     window.addEventListener("beforeunload", this.handleExit);
-    this.bindHardwareInputs(); // Turn keys ON when connected
+    // Scrollwheel listener
+    window.addEventListener("wheel", this.wheelMonitor);
+    // Watch for origin changes
+    this.unwatchOriginFunction = this.$store.watch(
+      (state, getters) => {
+        return getters.baseUri;
+      },
+      () => {
+        this.checkConnection();
+      },
+    );
+
+    // Keyboard shortcuts
+    Mousetrap.bind("?", () => {
+      this.toggleModalElement(this.$refs["keyboardManualModal"]); // Calls the mixin
+    });
+
+    Mousetrap.bind(
+      move_keys,
+      (event, key) => {
+        event.preventDefault();
+        this.keysDown.add(key);
+        this.updateJogFromKeys();
+      },
+      "keydown",
+    );
+
+    Mousetrap.bind(
+      move_keys,
+      (event, key) => {
+        event.preventDefault();
+        this.keysDown.delete(key);
+        this.updateJogFromKeys();
+      },
+      "keyup",
+    );
+
+    this.keyboardManual.push({
+      shortcut: "←↑→↓",
+      description: "Move the microscope stage",
+    });
+
+    this.keyboardManual.push({
+      shortcut: "pgup / pgdn",
+      description: "Move the microscope focus",
+    });
+
+    // Capture
+    Mousetrap.bind("c", () => {
+      eventBus.emit("globalCaptureEvent", {});
+    });
+    this.keyboardManual.push({
+      shortcut: "c",
+      description: "Take a capture",
+    });
+
+    // Autofocus
+    Mousetrap.bind("a", () => {
+      eventBus.emit("globalFastAutofocusEvent", {});
+    });
+    this.keyboardManual.push({
+      shortcut: "a",
+      description: "Fast autofocus",
+    });
+
+    // Increment/decrement tab
+    Mousetrap.bind("shift+down", () => {
+      eventBus.emit("globalIncrementTab", {});
+    });
+    Mousetrap.bind("shift+up", () => {
+      eventBus.emit("globalDecrementTab", {});
+    });
+    this.keyboardManual.push({
+      shortcut: "shift+↑ / shift+↓",
+      description: "Switch tab",
+    });
   },
 
   beforeUnmount: function () {
     // Disconnect the theme observer
-    this.mql.removeEventListener("change", this.themeWatchdog);
+    if (this.themeObserver) {
+      this.themeObserver.disconnect();
+    }
     // Remove scrollwheel listener
-    this.unbindHardwareInputs();
+    window.removeEventListener("wheel", this.wheelMonitor);
+    // Remove origin watcher
+    this.unwatchOriginFunction();
+    // Remove key listeners
+    Mousetrap.reset();
   },
 
   methods: {
-    ...mapActions(useSettingsStore, ["setConnected"]),
-
-    bindHardwareInputs() {
-      window.addEventListener("wheel", this.wheelMonitor);
-
-      Mousetrap.bind("?", () => {
-        this.toggleModalElement(this.$refs["keyboardManualModal"]);
-      });
-
-      Mousetrap.bind(
-        move_keys,
-        (event, key) => {
-          event.preventDefault();
-          this.keysDown.add(key);
-          this.updateJogFromKeys();
-        },
-        "keydown",
-      );
-
-      Mousetrap.bind(
-        move_keys,
-        (event, key) => {
-          event.preventDefault();
-          this.keysDown.delete(key);
-          this.updateJogFromKeys();
-        },
-        "keyup",
-      );
-
-      this.keyboardManual.push({
-        shortcut: "←↑→↓",
-        description: "Move the microscope stage",
-      });
-
-      this.keyboardManual.push({
-        shortcut: "pgup / pgdn",
-        description: "Move the microscope focus",
-      });
-      // The following signal is managed (on/off) by actionButton.vue at this.submitOnEvent.
-      Mousetrap.bind("c", () => {
-        eventBus.emit("globalCaptureEvent", {});
-      });
-      this.keyboardManual.push({
-        shortcut: "c",
-        description: "Take a capture",
-      });
-      // The following signal is managed (on/off) by actionButton.vue at this.submitOnEvent.
-      // There's no visual feedback when the event is triggered
-      Mousetrap.bind("a", () => {
-        eventBus.emit("globalFastAutofocusEvent", {});
-      });
-      this.keyboardManual.push({
-        shortcut: "a",
-        description: "Fast autofocus",
-      });
-      // This signal is managed on lifecycle mounted and unmounted optionsAPI at appContent.vue.
-      Mousetrap.bind("shift+down", () => {
-        eventBus.emit("globalIncrementTab", {});
-      });
-      // This signal is managed on lifecycle mounted and unmounted optionsAPI at appContent.vue.
-      Mousetrap.bind("shift+up", () => {
-        eventBus.emit("globalDecrementTab", {});
-      });
-      this.keyboardManual.push({
-        shortcut: "shift+↑ / shift+↓",
-        description: "Switch tab",
-      });
-    },
-
-    unbindHardwareInputs() {
-      window.removeEventListener("wheel", this.wheelMonitor);
-      Mousetrap.reset();
-      this.keyboardManual = [];
-    },
-
     async checkConnection() {
-      this.waiting = true;
-      const wotStore = useWotStore();
+      var baseUri = this.$store.getters.baseUri;
+      this.$store.commit("changeWaiting", true);
+      // TODO: more robust check - e.g. use a microscope Thing
+      // TODO: should we purge existing consumedThings?
       try {
-        await wotStore.fetchThingDescriptions(`${this.baseUri}/thing_descriptions/`);
+        await this.$store.dispatch("wot/fetchThingDescriptions", `${baseUri}/thing_descriptions/`);
         for (let requiredThing of ["camera", "system"]) {
           if (!this.thingAvailable(requiredThing)) {
             throw new Error(`No ${requiredThing} found, the GUI won't work without one.`);
@@ -240,32 +225,37 @@ export default {
         }
         try {
           let hostname = await this.readThingProperty("system", "hostname");
-          this.microscopeHostname = hostname;
+          this.$store.commit("changeMicroscopeHostname", hostname);
           document.title = `OpenFlexure Microscope: ${hostname}`;
         } catch {
-          this.microscopeHostname = null;
+          this.$store.commit("changeMicroscopeHostname", null);
         }
-        this.setConnected();
-        this.error = null;
+        // start rendering components
+        this.$store.commit("setConnected");
+        this.$store.commit("setErrorMessage", null);
       } catch (error) {
-        this.error = error;
+        this.$store.commit("setErrorMessage", error);
       } finally {
-        this.waiting = false;
+        this.$store.commit("changeWaiting", false);
       }
     },
-
-    handleExit() {},
+    handleExit: function () {},
 
     /**
      *  Handle global mouse wheel events to be associated with navigation
      */
-    wheelMonitor(event) {
+    wheelMonitor: function (event) {
+      // Only capture scroll if the event target's parent contains the "scrollTarget" class
       if (
         event.target.parentNode.classList.contains("scrollTarget") ||
         event.target.classList.contains("scrollTarget")
       ) {
         const z_rel = event.deltaY / 100;
-        const z = z_rel * this.navigationStepSize.z;
+        // Emit a signal to move, acted on by panelControl.vue
+        const navigationStepSize = this.$store.state.navigationStepSize;
+        const z = z_rel * navigationStepSize.z;
+        // Don't use `jog() due to variable size of jogs here and the rate limiting in
+        // `jog()`. No need to invert on z, as navigationInvert.z isn't exposed.
         this.invokeAction("stage", "jog", { x: 0, y: 0, z: z });
         eventBus.emit("globalUpdatePositionEvent");
       }
@@ -279,30 +269,19 @@ export default {
      * request to jog that is too recent after the last jog.
      */
     jog(x, y, z) {
+      // Manually debounce extra requests from keyboard repeat rate.
+      // This is used rather than an interval in case of missing a repeat.
       const now = Date.now();
+      const navigationInvert = this.$store.state.navigationInvert;
       if (now - this.lastJogTime < this.jogTime) {
         return;
       }
       this.lastJogTime = now;
-      // Screen intent (x=right, y=down) -> stage axes. The camera shows
-      // the stage frame rotated by stageToImageRotation; the preview is
-      // then rotated by navigationRotate. To make the view move in the
-      // pressed direction, rotate the request by (previewRot - stageRot).
-      let jx = x * this.navigationStepSize.x * (this.navigationInvert.x ? -1 : 1);
-      let jy = y * this.navigationStepSize.y * (this.navigationInvert.y ? -1 : 1);
-      const delta =
-        ((((this.navigationRotate || 0) - (this.stageToImageRotation || 0)) % 360) + 360) % 360;
-      if (delta === 90) {
-        [jx, jy] = [jy, -jx];
-      } else if (delta === 180) {
-        [jx, jy] = [-jx, -jy];
-      } else if (delta === 270) {
-        [jx, jy] = [-jy, jx];
-      }
+
       this.invokeAction("stage", "jog", {
-        x: jx,
-        y: jy,
-        z: z * this.navigationStepSize.z,
+        x: x * this.jogDistance * (navigationInvert.x ? -1 : 1),
+        y: y * this.jogDistance * (navigationInvert.y ? -1 : 1),
+        z: z * this.jogDistance,
       });
       eventBus.emit("globalUpdatePositionEvent");
     },
@@ -347,7 +326,11 @@ export default {
 </script>
 
 <style lang="less">
-@import url("./assets/less/theme.less");
+// Basic UIkit CSS
+@import "../node_modules/uikit/src/less/uikit.less";
+// Custom UIkit CSS modifications
+@import "./assets/less/theme.less";
+
 // We override the custom-electron-titlebar z-index
 // UIKit lightbox must be able to draw over the titlebar
 // as it currently always spawns at the root of the DOM
@@ -375,8 +358,9 @@ html {
 }
 
 .control-component {
-  overflow: hidden auto;
-  scrollbar-gutter: stable both-edges;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
   width: 300px;
   height: 100%;
   padding: 0;
@@ -387,29 +371,14 @@ html {
 }
 
 .view-component {
-  overflow: hidden auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   height: 100%;
   padding: 0;
 }
 
-.view-component.uk-padding-small {
-  padding: 15px;
-}
-
-.image-fit-wrapper {
-  width: 100%;
-  height: 100%;
-  min-height: 0;
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
-  padding: 12px;
-  box-sizing: border-box;
-  overflow: hidden;
-}
-
 .image-fit {
-  height: 100%;
+  height: 80%;
   width: 100%;
   object-fit: contain;
   overflow-y: clip;
@@ -420,15 +389,10 @@ html {
   height: 100%;
 }
 
-.ui-element-error-icon {
-  vertical-align: middle;
-  padding-right: 10px;
-  color: #a00;
-}
-
-.ui-element-broken {
-  border-color: #a00 !important;
-  color: #a00 !important;
-  cursor: not-allowed;
+.thumbnail-fit {
+  max-height: 120px;
+  max-width: 240px;
+  object-fit: contain;
+  overflow-y: hidden;
 }
 </style>
