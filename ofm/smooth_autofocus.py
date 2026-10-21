@@ -36,15 +36,14 @@ sys.setswitchinterval(0.001)
 LOGGER = logging.getLogger(__name__)
 
 _FAR_SPAN = 1024.0
-_FAR_VELOCITY = 9000.0
+_FAR_VELOCITY = 4900.0
 _FAR_MEDIAN_BAR = 1.25
-_NEAR_SPAN = 110.0
 _TINY_SPAN = 180.0
 _TINY_VELOCITY = 700.0
 _TINY_MIN_V = 100.0
 _PARK_VELOCITY = 9000.0
 _PARK_CREEP = 300.0
-_CAL_V_ACCEL = 6000.0
+_CAL_V_ACCEL = 4900.0
 _MEDIAN_BAR = 1.6
 _EDGE_MARGIN = 0.12
 FPS = 120.0
@@ -307,8 +306,8 @@ def _dump_json(name: str, payload: dict) -> None:
 class SmoothAutofocusThing(lt.Thing):
     """Autofocus from a continuous sharpness curve sampled while the stage sweeps.
 
-    Flow: static reference -> far sweep (both legs, 9000 or 6000 when
-    accel cal is missing; early exit after leg 1 on a strong hit) ->
+    Flow: static reference -> far sweep (both legs, 4900; early exit
+    after leg 1 on a strong hit) ->
     claw -> tiny sweep -> two-stage park. Every wait is a happens-before
     on telemetry events; no timed waits, no M400.
     """
@@ -326,6 +325,7 @@ class SmoothAutofocusThing(lt.Thing):
     _COOL_DELAY: float = 3.0
     _CAL_LOADED: bool = False
     _last_leg_samples: list = []
+    _CORR: dict = {}
 
     def _hw_steps_param(self, delta_hw):
         inv = getattr(self._stage, "axis_inverted", {}) or {}
@@ -407,9 +407,17 @@ class SmoothAutofocusThing(lt.Thing):
         if clear is not None:
             clear()
 
-        self._stage.move_relative_z_timed(
-            self._hw_steps_param(int(round(delta))), seconds
-        )
+        poll_start = getattr(self._stage, "_leg_poller_start", None)
+        poll_stop = getattr(self._stage, "_leg_poller_stop_fn", None)
+        if poll_start is not None:
+            poll_start()
+        try:
+            self._stage.move_relative_z_timed(
+                self._hw_steps_param(int(round(delta))), seconds
+            )
+        finally:
+            if poll_stop is not None:
+                poll_stop()
         self._last_hw = target
         # grace for the terminal push: bounded by push arrival, not clock -
         # wait only until the first sample with v==0 shows up (the move's
@@ -463,10 +471,10 @@ class SmoothAutofocusThing(lt.Thing):
                             )
                         if z_ok and v_ok:
                             et = (
-                                time.monotonic()
-                                + getattr(
-                                    self._stage, "_et_handshake", 0.0
-                                )
+                                    time.monotonic()
+                                    + getattr(
+                                self._stage, "_et_handshake", 0.0
+                            )
                             )
                             marker = (
                                 et, z_now,
@@ -631,17 +639,6 @@ class SmoothAutofocusThing(lt.Thing):
             return claw_z
         return max(local, key=lambda q: q[2])[0]
 
-    def _cal_near_velocity(self) -> float:
-        """Near sweep speed at the measured dynamic-hysteresis knee.
-
-        Benchmarked on the 20.7u-FWHM peak: full contrast holds to
-        250 u/s and collapses by 413 u/s -> 12 u/s per u of FWHM.
-        """
-        fwhm = type(self)._CAL_FWHM
-        if not fwhm or not type(self)._CAL_CONTRAST:
-            return 250.0
-        return max(150.0, min(1000.0, 12.0 * fwhm))
-
     def _fit_gate(self, pts, static_ref: float = 0.0) -> Optional[tuple]:
         """Curve-relative acceptance: gaussian fit + median bar + edge margin,
         plus an absolute bar against the static reference."""
@@ -802,12 +799,60 @@ class SmoothAutofocusThing(lt.Thing):
         )
         return self._stage_z()
 
+    def _rest_static(self, monitor: StreamSharpnessMonitor) -> float:
+        m = len(monitor.times)
+        monitor.wait_frames(4, m, timeout=0.5)
+        post = monitor.frames_since(m)[-4:]
+        return (
+            statistics.median([f[2] for f in post])
+            if len(post) >= 3 else 0.0
+        )
+
+    def _revert_if_worse(
+            self, monitor: StreamSharpnessMonitor, z0: float, start_s: float
+    ):
+        land_s = self._rest_static(monitor)
+        if start_s < 30.0 or land_s >= 0.9 * start_s:
+            _log(
+                "LAND start=%.0f land=%.0f verdict=keep"
+                % (start_s, land_s)
+            )
+            return None
+        _log(
+            "REGRESS start=%.0f land=%.0f verdict=revert"
+            % (start_s, land_s)
+        )
+        self._sync_move(
+            monitor, z0, _PARK_VELOCITY, len(monitor.times), labeled=False,
+        )
+        rev_s = self._rest_static(monitor)
+        zr = self._stage_z()
+        _log(
+            "REVERTED z=%.2f static=%.0f (start=%.0f)"
+            % (zr, rev_s, start_s)
+        )
+        return zr
+
     def _load_cal(self) -> None:
         try:
             p = "/home/admin/openflexure-microscope-server/"
             p += "smooth_af_cal.json"
             with open(p) as f:
                 d = json.load(f)
+            corr = d.get("label_corr")
+            if isinstance(corr, dict) and corr.get("v") and corr.get("du"):
+                try:
+                    v = float(corr["v"])
+                    du = float(corr["du"])
+                    if (
+                            200.0 <= v <= 20000.0
+                            and abs(du) <= 2000.0
+                            and abs(du / v) <= 0.5
+                    ):
+                        type(self)._CORR = {"v": v, "du": du}
+                        _log(f"CORR loaded v={v:.0f} du={du:.1f}")
+                except (TypeError, ValueError):
+                    pass
             a = float(d.get("accel") or 0.0)
             if 15000.0 < a < 120000.0:
                 type(self)._CAL_ACCEL = a
@@ -859,7 +904,7 @@ class SmoothAutofocusThing(lt.Thing):
             return None
         return a
 
-    def _save_cal(self, key: str, value: float) -> None:
+    def _save_cal(self, key: str, value) -> None:
         try:
             p = "/home/admin/openflexure-microscope-server/"
             p += "smooth_af_cal.json"
@@ -944,8 +989,8 @@ class SmoothAutofocusThing(lt.Thing):
                 "objects": {"sample_mesh": None}
             })
             sm = (
-                (st.get("result") or {}).get("status") or {}
-            ).get("sample_mesh") or {}
+                         (st.get("result") or {}).get("status") or {}
+                 ).get("sample_mesh") or {}
             if sm.get("active"):
                 sender = getattr(self._stage, "_send_gcode_script", None)
                 if sender is not None:
@@ -976,67 +1021,8 @@ class SmoothAutofocusThing(lt.Thing):
         )
         mode += f"|static{static_med:.0f}"
 
-        sess_ref = type(self)._SESS_STATIC
-        near_worthy = (
-                static_med >= 30.0
-                or (
-                        static_med > 0 and sess_ref > 0
-                        and static_med >= 0.7 * sess_ref
-                )
-        )
-        if not near_worthy:
-            mode += "|near_skip"
-        else:
-            d_near = 1
-            near_v = self._cal_near_velocity()
-            near_mark = len(monitor.times)
-            traj_a, frames_a = self._sync_move(
-                monitor, z0 + d_near * _NEAR_SPAN, near_v, near_mark
-            )
-            pts_a = self._label_leg(
-                frames_a, z0, z0 + d_near * _NEAR_SPAN, traj_a, near_v
-            )
-            near_mark2 = len(monitor.times)
-            traj, frames = self._sync_move(
-                monitor, z0 - d_near * _NEAR_SPAN, near_v, near_mark2
-            )
-            near_pts = self._label_leg(
-                frames, z0 + d_near * _NEAR_SPAN, z0 - d_near * _NEAR_SPAN,
-                traj, near_v
-            )
-            _dump_json("smooth_af_seekpts_near.json", {
-                "z": [q[0] for q in near_pts],
-                "s": [q[2] for q in near_pts],
-                "c": [q[1] for q in near_pts],
-                "p": [q[3] for q in near_pts],
-            })
-            gate = self._fit_gate(pts_a, static_med)
-            if gate is not None:
-                fit, best = gate
-                mode += f"|near_up{fit.peak:.1f}"
-                park_z = self._park(monitor, fit.peak, len(monitor.times))
-                mode += f"|park{park_z:.1f}"
-                self._save_last_focus(monitor, len(monitor.times), fit.peak)
-                return SmoothFocusResult(
-                    peak_z=park_z, mode=mode, fit=fit,
-                    curve=[CurvePoint(z=q[0], sharpness=q[2]) for q in pts_a],
-                    elapsed_s=time.monotonic() - t0,
-                )
-            near_pts = pts_a + near_pts
-            near_pts.sort()
-            gate = self._fit_gate(near_pts, static_med)
-            if gate is not None:
-                fit, best = gate
-                mode += f"|near_fit{fit.peak:.1f}"
-                park_z = self._park(monitor, fit.peak, len(monitor.times))
-                mode += f"|park{park_z:.1f}"
-                self._save_last_focus(monitor, len(monitor.times), fit.peak)
-                return SmoothFocusResult(
-                    peak_z=park_z, mode=mode, fit=fit,
-                    curve=[CurvePoint(z=q[0], sharpness=q[2]) for q in near_pts],
-                    elapsed_s=time.monotonic() - t0,
-                )
-            mode += "|near_miss"
+        if not type(self)._CAL_LOADED:
+            self._load_cal()
 
         cur = self._stage_z()
         if not (cur == cur):
@@ -1098,8 +1084,19 @@ class SmoothAutofocusThing(lt.Thing):
             traj, frames = self._sync_move(
                 monitor, target, far_v, far_mark
             )
-            leg_pts = self._label_leg(frames, prev_end, target, traj,
-                                      far_v)
+            corr = type(self)._CORR or {}
+            tau_c = 0.0
+            if corr.get("v"):
+                tau_c = float(corr["du"]) / float(corr["v"]) * far_v
+            if tau_c:
+                mode += f"|{tag}corr{tau_c:.0f}"
+            leg_pts = self._label_leg(
+                frames,
+                prev_end + tau_c if target > prev_end else prev_end - tau_c,
+                target + tau_c if target > prev_end else target - tau_c,
+                traj,
+                far_v,
+            )
             segs[tag] = list(self._last_leg_samples or [])
             _dump_json(f"smooth_af_seekpts_{tag}.json", {
                 "z": [q[0] for q in leg_pts],
@@ -1159,14 +1156,27 @@ class SmoothAutofocusThing(lt.Thing):
             )
             tiny_mark = len(monitor.times)
             self._sync_move(
-                monitor, tiny_lo, _PARK_VELOCITY, tiny_mark, labeled=False
+                monitor, tiny_hi, _PARK_VELOCITY, tiny_mark, labeled=False
             )
             tiny_mark2 = len(monitor.times)
             traj3, frames3 = self._sync_move(
-                monitor, tiny_hi, tiny_v, tiny_mark2
+                monitor, tiny_lo, tiny_v, tiny_mark2
             )
-            tiny_pts = self._label_leg(frames3, tiny_lo, tiny_hi, traj3,
-                                       tiny_v)
+            corr = type(self)._CORR or {}
+            tau_t = (
+                float(corr["du"]) / float(corr["v"]) * tiny_v
+                if corr.get("v")
+                else 0.0
+            )
+            if tau_t:
+                mode += f"|tinycorr{tau_t:.0f}"
+            tiny_pts = self._label_leg(
+                frames3,
+                tiny_lo + tau_t,
+                tiny_hi + tau_t,
+                traj3,
+                tiny_v,
+            )
             _dump_json("smooth_af_seekpts_tiny.json", {
                 "z": [q[0] for q in tiny_pts],
                 "s": [q[2] for q in tiny_pts],
@@ -1181,7 +1191,7 @@ class SmoothAutofocusThing(lt.Thing):
                 t_arg = max(tiny_pts, key=lambda q: q[2])
                 if (
                         t_arg[2] >= 1.25 * max(s_floor_t, 1e-9)
-                        and abs(t_arg[0] - claw_z) <= 60.0
+                        and abs(t_arg[0] - claw_z) <= _FAR_SPAN
                 ):
                     top_t = sorted(
                         tiny_pts, key=lambda q: q[2], reverse=True
@@ -1206,6 +1216,10 @@ class SmoothAutofocusThing(lt.Thing):
                     mode += f"|fwhm{fit.fwhm:.1f}"
                 park_z = self._park(monitor, fit.peak, len(monitor.times))
                 mode += f"|park{park_z:.1f}"
+                rev = self._revert_if_worse(monitor, z0, static_med)
+                if rev is not None:
+                    park_z = rev
+                    mode += "|reverted"
                 self._save_last_focus(monitor, len(monitor.times), fit.peak)
                 return SmoothFocusResult(
                     peak_z=park_z, mode=mode, fit=fit,
@@ -1231,7 +1245,7 @@ class SmoothAutofocusThing(lt.Thing):
     def smooth_focus(
             self, params: SmoothAutofocusParams
     ) -> SmoothFocusResult:
-        """Sweep autofocus: near sweep, far sweep, claw, tiny sweep, park.
+        """Sweep autofocus: far sweep, claw, tiny sweep, park.
 
         Raises NoFocusFoundError (and returns the stage to its start) rather
         than parking on an unverified peak.
@@ -1279,6 +1293,20 @@ class SmoothAutofocusThing(lt.Thing):
                     _fast = False
             except Exception:
                 LOGGER.warning("Could not switch to crop990", exc_info=True)
+            try:
+                Path(
+                    "/home/admin/openflexure-microscope-server/af_ts_probe.log"
+                ).unlink(missing_ok=True)
+            except OSError:
+                pass
+            _probe_mod = sys.modules.get(
+                "openflexure_microscope_server.things.camera.picamera"
+            )
+            if _probe_mod is not None and hasattr(
+                    _probe_mod, "_AF_TS_PROBE"
+            ):
+                _probe_mod._AF_TS_PROBE["n"] = 0
+                _probe_mod._AF_TS_PROBE["t"] = time.time()
             with monitor:
                 with self._cam._streaming_picamera() as picam:
                     picam.set_controls({"FrameRate": float(burst)})

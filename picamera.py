@@ -37,15 +37,14 @@ from typing import (
     Self,
 )
 
+import labthings_fastapi as lt
 import numpy as np
+from PIL import Image
+from labthings_fastapi.exceptions import ServerNotRunningError
+from labthings_fastapi.types.numpy import NDArray
 from picamera2 import Picamera2
 from picamera2.encoders import MJPEGEncoder
 from picamera2.outputs import Output
-from PIL import Image
-
-import labthings_fastapi as lt
-from labthings_fastapi.exceptions import ServerNotRunningError
-from labthings_fastapi.types.numpy import NDArray
 
 from openflexure_microscope_server.things.background_detect import ChannelBlankError
 from openflexure_microscope_server.ui import (
@@ -54,64 +53,16 @@ from openflexure_microscope_server.ui import (
     action_button_for,
     property_control_for,
 )
-
 from . import BaseCamera, CaptureMode, StreamingMode
 from . import picamera_recalibrate_utils as recalibrate_utils
 from . import picamera_tuning_file_utils as tf_utils
-
-_AF_FRAME_STASH = None
-_AF_TSKEYS_DONE = False
-_AF_PEND = []
-_AF_ANCHOR = None
-_AF_CBTRACE_N = 0
-
-
-def _frame_stash_start() -> None:
-    global _AF_FRAME_STASH, _AF_PEND, _AF_ANCHOR, _AF_CBTRACE_N
-    _AF_FRAME_STASH = []
-    _AF_PEND = []
-    _AF_ANCHOR = None
-    _AF_CBTRACE_N = 0
-
-
-def _frame_stash_dump(path: str) -> int:
-    global _AF_FRAME_STASH
-    st = _AF_FRAME_STASH
-    _AF_FRAME_STASH = None
-    n = len(st) if st else 0
-    try:
-        with open(path + ".count", "w") as f:
-            f.write(str(n))
-        if n > 10:
-            import numpy as _np
-
-            _np.savez(
-                path,
-                ts=_np.array([t for (t, _f) in st]),
-                frames=_np.stack([f for (_t, f) in st]),
-            )
-    except Exception:
-        pass
-    return n
-
-
-def _af_emit(ts, sharp, bright, chroma, pooled, small, cb) -> None:
-    _st = _AF_FRAME_STASH
-    if _st is not None:
-        try:
-            _st.append((ts, small))
-            if len(_st) > 4096:
-                del _st[:1]
-        except Exception:
-            pass
-    cb(ts, sharp, bright, chroma, pooled)
-
-
 
 if TYPE_CHECKING:
     from libcamera import Request
 
 LOGGER = logging.getLogger(__name__)
+
+_AF_TS_PROBE = {"n": 0, "t": None}
 
 
 class PicameraModelError(RuntimeError):
@@ -137,12 +88,12 @@ class PicameraStreamOutput(Output):
         self.encoder = encoder
 
     def outputframe(
-        self,
-        frame: bytes,
-        _keyframe: Optional[bool] = True,
-        timestamp: Optional[int] = None,
-        _packet: Any = None,
-        _audio: bool = False,
+            self,
+            frame: bytes,
+            _keyframe: Optional[bool] = True,
+            timestamp: Optional[int] = None,
+            _packet: Any = None,
+            _audio: bool = False,
     ) -> None:
         """Add a frame to the stream's ringbuffer."""
         if timestamp is None or self.encoder.firsttimestamp is None:
@@ -207,9 +158,9 @@ class StreamingPiCamera2(BaseCamera, ABC):
     _sensor_info: recalibrate_utils.SensorInfo
 
     def __init__(
-        self,
-        thing_server_interface: lt.ThingServerInterface,
-        camera_num: int = 0,
+            self,
+            thing_server_interface: lt.ThingServerInterface,
+            camera_num: int = 0,
     ) -> None:
         """Initialise the camera with the given camera number.
 
@@ -254,6 +205,8 @@ class StreamingPiCamera2(BaseCamera, ABC):
         self._colour_gains = tf_utils.get_colour_gains_from_lst(self.tuning)
 
     mjpeg_bitrate: Optional[int] = lt.property(default=100000000)
+    """Bitrate for MJPEG stream (None for default)."""
+
     """Bitrate for MJPEG stream (None for default)."""
 
     stream_active: bool = lt.property(default=False, readonly=True)
@@ -347,6 +300,26 @@ class StreamingPiCamera2(BaseCamera, ABC):
                 # Note: This set a value 1 higher than requested as picamera2 always
                 # sets a lower value than requested, even if the requested is allowed
                 cam.set_controls({"ExposureTime": value + 1})
+
+    def set_probe_controls_raw(self, gain: float, exposure: int) -> None:
+        """Apply sweep imaging controls directly on the sensor. No
+        lt.setting writes: the persisted calibration is untouched, and
+        restore_calibration_raw returns exactly what the settings say."""
+        with self._streaming_picamera() as cam:
+            cam.set_controls({"AnalogueGain": float(gain)})
+
+        with self._streaming_picamera() as cam:
+            cam.set_controls({"ExposureTime": int(exposure) + 1})
+
+    def restore_calibration_raw(self) -> dict:
+        """Re-apply the persisted calibration straight to the sensor and
+        return its readback. Never writes settings."""
+        gain = float(self._analogue_gain)
+        expo = int(self._exposure_time)
+        with self._streaming_picamera() as cam:
+            cam.set_controls({"AnalogueGain": gain})
+            cam.set_controls({"ExposureTime": expo + 1})
+        return {"gain": gain, "exposure": expo}
 
     def _get_persistent_controls(self) -> dict:
         if self.streaming:
@@ -471,10 +444,10 @@ class StreamingPiCamera2(BaseCamera, ABC):
                     self._start_streaming(streaming_mode)
 
     def __exit__(
-        self,
-        exc_type: type[BaseException],
-        exc_value: Optional[BaseException],
-        traceback: Optional[TracebackType],
+            self,
+            exc_type: type[BaseException],
+            exc_value: Optional[BaseException],
+            traceback: Optional[TracebackType],
     ) -> None:
         """Close the picamera connection when the Thing context manager is closed."""
         self._stop_streaming()
@@ -494,10 +467,10 @@ class StreamingPiCamera2(BaseCamera, ABC):
         """Modes the camera can use for capturing."""
 
     def _create_picam_config_from_mode_info(
-        self,
-        picam: Picamera2,
-        controls: dict[str, Any],
-        mode_info: PiCamera2StreamingMode,
+            self,
+            picam: Picamera2,
+            controls: dict[str, Any],
+            mode_info: PiCamera2StreamingMode,
     ) -> dict[str, Any]:
         """Create the dictionary to pass to ``Picamera2.configure``.
 
@@ -510,8 +483,11 @@ class StreamingPiCamera2(BaseCamera, ABC):
         if mode_info.frame_rate is not None:
             controls["FrameRate"] = mode_info.frame_rate
 
+        main_cfg: dict[str, Any] = {"size": mode_info.main_resolution}
+        if mode_info.sensor_mode_resolution == (1332, 990):
+            main_cfg["format"] = "YUV420"
         stream_config = picam.create_video_configuration(
-            main={"size": mode_info.main_resolution},
+            main=main_cfg,
             lores={"size": mode_info.lores_resolution, "format": "YUV420"},
             sensor=mode_info.sensor_mode_dict,
             controls=controls,
@@ -519,47 +495,55 @@ class StreamingPiCamera2(BaseCamera, ABC):
         stream_config["buffer_count"] = mode_info.buffer_count
         return stream_config
 
-    def set_stream_framerate(self, fps: float) -> None:
-        """Change the live stream frame rate without reconfiguring the sensor mode."""
-        with self._streaming_picamera() as picam:
-            picam.set_controls({"FrameRate": float(fps)})
-
-
-    def set_af_metric_hook(self, callback) -> None:
+    def set_af_metric_hook(self, callback, plane: str = "lores") -> None:
         """Install a per-frame sharpness callback fed from the raw lores Y plane.
 
         The callback receives ``(timestamp_s, sharpness, brightness)`` for every
         captured frame, computed without JPEG decode. Pass ``None`` to remove.
+        ``plane`` selects the metric source: ``lores`` (default, historical
+        behavior) or ``main`` (2x linear resolution in crop990 mode).
         """
         self._af_metric_hook = callback
+        self._af_metric_plane = plane if callback is not None else "lores"
         try:
             with self._streaming_picamera() as picam:
                 picam.pre_callback = self._af_pre_callback
         except Exception:
             pass
 
-
     def _af_pre_callback(self, request) -> None:
         import numpy as _np
-        global _AF_TSKEYS_DONE, _AF_PEND, _AF_ANCHOR, _AF_CBTRACE_N
 
         cb = getattr(self, "_af_metric_hook", None)
         if cb is None:
             return
-        _t0 = time.monotonic()
+        plane = getattr(self, "_af_metric_plane", "lores")
         try:
             arr = request.make_array("lores")
-            _t1 = time.monotonic()
             rows, stride = arr.shape[0], arr.shape[1]
             y_rows = rows * 2 // 3
             y = arr[:y_rows, :stride].astype(_np.uint8, copy=False)
             a = y.astype(_np.int16)
+            if plane == "main":
+                try:
+                    m = request.make_array("main")
+                    m_rows, m_stride = m.shape[0], m.shape[1]
+                    m_y_rows = m_rows * 2 // 3
+                    m_y = m[:m_y_rows, :m_stride]
+                    win = 350
+                    r0 = max(0, (m_y_rows - win) // 2)
+                    c0 = max(0, (m_stride - win) // 2)
+                    a = m_y[r0:r0 + win, c0:c0 + win].astype(
+                        _np.int16)
+                except Exception:
+                    a = y
             dx = a[:, 1:] - a[:, :-1]
             dy = a[1:, :] - a[:-1, :]
             sharp = float((dx * dx).mean() + (dy * dy).mean())
-            small = y.copy()
+            bx = a[:, 2:] - a[:, :-2]
+            by = a[2:, :] - a[:-2, :]
+            brenner = float((bx * bx).mean() + (by * by).mean())
             bright = float(y.mean())
-            _t2 = time.monotonic()
             chroma = 0.0
             pooled = 0.0
             try:
@@ -595,7 +579,6 @@ class StreamingPiCamera2(BaseCamera, ABC):
                     pooled = float(eb.std())
             except Exception:
                 pass
-            _t3 = time.monotonic()
             try:
                 _md = request.get_metadata()
             except Exception:
@@ -605,54 +588,28 @@ class StreamingPiCamera2(BaseCamera, ABC):
                     _md = dict(request.metadata)
                 except Exception:
                     _md = None
-            _t4 = time.monotonic()
-            if _AF_CBTRACE_N < 8:
-                try:
-                    with open(
-                        "/home/admin/openflexure-microscope-server/"
-                        "af_cb_trace.txt", "a"
-                    ) as _f:
-                        _f.write("n=%d arr=%.4f math=%.4f blk=%.4f meta=%.4f tot=%.4f\n" % (
-                            _AF_CBTRACE_N, _t1 - _t0, _t2 - _t1,
-                            _t3 - _t2, _t4 - _t3, _t4 - _t0))
-                except Exception:
-                    pass
-                _AF_CBTRACE_N += 1
-            if _md is not None and not _AF_TSKEYS_DONE:
-                try:
-                    _lines = "".join(
-                        f"{k}: {v}\n" for k, v in sorted(_md.items())
-                    )
-                    open(
-                        "/home/admin/openflexure-microscope-server/"
-                        "smooth_af_tskeys.json", "w").write(_lines)
-                except Exception:
-                    pass
-                finally:
-                    _AF_TSKEYS_DONE = True
             _st_ns = None
+            _md_mono = time.monotonic()
             if isinstance(_md, dict):
                 for _k in ("SensorTimestamp", "sensor_timestamp"):
                     if _md.get(_k):
                         _st_ns = _md[_k]
                         break
             if not _st_ns:
-                _AF_PEND.append(
-                    (sharp, bright, chroma, pooled, small)
-                )
+                ts = time.monotonic()
+                cb(ts, sharp, bright, chroma, pooled, brenner)
                 return
             ts = float(_st_ns) / 1e9
-            n_pend = len(_AF_PEND)
-            if n_pend:
-                if _AF_ANCHOR is None:
-                    step = 0.0
-                else:
-                    step = (ts - _AF_ANCHOR) / (n_pend + 1)
-                for i, (s, b, c, p, small) in enumerate(_AF_PEND):
-                    _af_emit(ts - step * (n_pend - i), s, b, c, p, small, cb)
-                _AF_PEND = []
-            _AF_ANCHOR = ts
-            _af_emit(ts, sharp, bright, chroma, pooled, small, cb)
+            if _AF_TS_PROBE["n"] < 40:
+                _AF_TS_PROBE["n"] += 1
+                with open(
+                    "/home/admin/openflexure-microscope-server/af_ts_probe.log",
+                    "a",
+                ) as _f:
+                    _f.write(
+                        "%.6f %.6f\n" % (ts, _md_mono - ts)
+                    )
+            cb(ts, sharp, bright, chroma, pooled, brenner)
         except Exception:
             pass
 
@@ -734,7 +691,7 @@ class StreamingPiCamera2(BaseCamera, ABC):
 
     @contextmanager
     def _ensure_mode_for_capture(
-        self, capture_mode_info: PiCamera2CaptureMode
+            self, capture_mode_info: PiCamera2CaptureMode
     ) -> Iterator[Picamera2]:
         """Ensure in correct mode for capture.
 
@@ -746,8 +703,8 @@ class StreamingPiCamera2(BaseCamera, ABC):
         """
         required_streaming_mode = capture_mode_info.streaming_mode
         if (
-            required_streaming_mode is None
-            or required_streaming_mode == self.streaming_mode
+                required_streaming_mode is None
+                or required_streaming_mode == self.streaming_mode
         ):
             with self._streaming_picamera() as cam:
                 yield cam
@@ -787,9 +744,9 @@ class StreamingPiCamera2(BaseCamera, ABC):
 
     @lt.action
     def capture_as_array(
-        self,
-        capture_mode: str = "standard",
-        raw: bool = False,
+            self,
+            capture_mode: str = "standard",
+            raw: bool = False,
     ) -> NDArray:
         """Acquire one image from the camera and return as an array.
 
@@ -841,9 +798,9 @@ class StreamingPiCamera2(BaseCamera, ABC):
 
     @lt.action
     def auto_expose_from_minimum(
-        self,
-        target_white_level: Optional[int] = None,
-        percentile: float = 99.9,
+            self,
+            target_white_level: Optional[int] = None,
+            percentile: float = 99.9,
     ) -> None:
         """Adjust exposure until a the target white level is reached.
 
@@ -900,7 +857,7 @@ class StreamingPiCamera2(BaseCamera, ABC):
 
     @lt.property
     def colour_correction_matrix(
-        self,
+            self,
     ) -> tuple[float, float, float, float, float, float, float, float, float]:
         """The ``colour_correction_matrix`` from the tuning file.
 
@@ -914,8 +871,8 @@ class StreamingPiCamera2(BaseCamera, ABC):
 
     @colour_correction_matrix.setter  # type: ignore
     def colour_correction_matrix(
-        self,
-        value: tuple[float, float, float, float, float, float, float, float, float],
+            self,
+            value: tuple[float, float, float, float, float, float, float, float, float],
     ) -> None:
         self.tuning = tf_utils.set_ccm(self.tuning, value)
 
@@ -1268,9 +1225,8 @@ class PiCameraHQ(StreamingPiCamera2):
             ),
             "crop990": PiCamera2StreamingMode(
                 description=(
-                    "Cropped 1332x990 sensor readout for high frame rate autofocus "
-                    "experiments. Narrower field of view than fast_preview; same "
-                    "lores stream size."
+                    "Cropped 1332x990 sensor readout for high frame rate autofocus. "
+                    "Same lores stream size as the default mode."
                 ),
                 main_resolution=(700, 700),
                 lores_resolution=(350, 350),

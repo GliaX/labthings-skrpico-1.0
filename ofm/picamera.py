@@ -62,6 +62,8 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
+_AF_TS_PROBE = {"n": 0, "t": None}
+
 
 class PicameraModelError(RuntimeError):
     """There is a problem Picamera sensor model set by the configuration."""
@@ -587,6 +589,7 @@ class StreamingPiCamera2(BaseCamera, ABC):
                 except Exception:
                     _md = None
             _st_ns = None
+            _md_mono = time.monotonic()
             if isinstance(_md, dict):
                 for _k in ("SensorTimestamp", "sensor_timestamp"):
                     if _md.get(_k):
@@ -597,6 +600,15 @@ class StreamingPiCamera2(BaseCamera, ABC):
                 cb(ts, sharp, bright, chroma, pooled, brenner)
                 return
             ts = float(_st_ns) / 1e9
+            if _AF_TS_PROBE["n"] < 40:
+                _AF_TS_PROBE["n"] += 1
+                with open(
+                    "/home/admin/openflexure-microscope-server/af_ts_probe.log",
+                    "a",
+                ) as _f:
+                    _f.write(
+                        "%.6f %.6f\n" % (ts, _md_mono - ts)
+                    )
             cb(ts, sharp, bright, chroma, pooled, brenner)
         except Exception:
             pass
