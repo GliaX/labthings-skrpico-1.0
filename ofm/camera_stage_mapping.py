@@ -11,6 +11,7 @@ server, and depends on that server and its underlying LabThings library.
 """
 
 import json
+import logging
 import time
 from typing import Any, List, Mapping, NamedTuple, Optional, Tuple, cast
 
@@ -30,6 +31,9 @@ from .stage import BaseStage
 from .view_alignment import ViewAlignmentMixin
 
 
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _patch_relative_motion_ladder(limits=None, cam=None, stage=None) -> None:
@@ -53,6 +57,7 @@ def _patch_relative_motion_ladder(limits=None, cam=None, stage=None) -> None:
                          multipliers=None, detect_cumulative_motion=False):
         displacement = _np.array(displacement, dtype=float)
         unit = displacement / (_norm(displacement) or 1.0)
+        threshold = min(threshold, 25.0)
         step = max(6.0, min(14.0, (threshold * 1.4) / PX_PER_STEP))
         pos = _np.array(tracker.stage_positions[-1, :], dtype=float)
 
@@ -101,6 +106,10 @@ def _patch_relative_motion_ladder(limits=None, cam=None, stage=None) -> None:
             shift = _norm(
                 _np.array(tracker.image_positions[-1, :], dtype=float)
                 - _np.array(tracker.image_positions[-2, :], dtype=float)
+            )
+            _LOGGER.info(
+                "CSM probe %d: inc=%.0f shift=%.1fpx thr=%.1f",
+                _i + 1, inc, shift, threshold,
             )
             if shift >= threshold:
                 return 1, float(inc)
