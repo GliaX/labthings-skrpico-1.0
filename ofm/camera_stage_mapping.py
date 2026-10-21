@@ -25,9 +25,85 @@ from camera_stage_mapping.exceptions import MappingError
 from labthings_fastapi.types.numpy import DenumpifyingDict
 
 from .camera import BaseCamera
+from .smooth_autofocus import _EncoderBurst, _probe_regime
 from .stage import BaseStage
 from .view_alignment import ViewAlignmentMixin
-from .smooth_autofocus import _EncoderBurst
+
+
+
+
+def _patch_relative_motion_ladder(limits=None, cam=None) -> None:
+    """Replace the calibration motion ladder with a travel-aware walk.
+
+    Walks INCREMENTS of 10,25,50,100,200,400,800,1200 units relative to
+    the current position (not absolute targets), comparing frames after
+    each increment. Increment attempts that would cross the stage travel
+    limits (with 100u margin) are skipped, so the walk never triggers
+    klippy's move-out-of-range. First increment producing image shift >=
+    threshold wins. Raises MappingError if the list is exhausted."""
+
+    import camera_stage_mapping.camera_stage_calibration_1d as _cal_mod
+    import numpy as _np
+    from numpy.linalg import norm as _norm
+
+    PX_PER_STEP = 2.9
+    MARGIN = 100.0
+
+    def _relative_ladder(tracker, move, displacement, threshold=10,
+                         multipliers=None, detect_cumulative_motion=False):
+        displacement = _np.array(displacement, dtype=float)
+        unit = displacement / (_norm(displacement) or 1.0)
+        step = max(6.0, min(14.0, (threshold * 1.4) / PX_PER_STEP))
+        pos = _np.array(tracker.stage_positions[-1, :], dtype=float)
+
+        lo = (-_np.inf, -_np.inf)
+        hi = (_np.inf, _np.inf)
+        if limits is not None:
+            lo = _np.array(limits[0][:2], dtype=float) + MARGIN
+            hi = _np.array(limits[1][:2], dtype=float) - MARGIN
+
+        _dbg = 0
+        for _i in range(24):
+            inc = step
+            target = pos + unit * inc
+            txy = target[:2]
+            if _np.any(txy < lo) or _np.any(txy > hi):
+                continue
+            move(tuple(target))
+            try:
+                _img = cam.capture_downsampled_array()
+                from PIL import Image as _PILImage
+                _arr = _np.asarray(_img, dtype=_np.float32)
+                if _arr.ndim == 3:
+                    _arr = _arr[..., :3].mean(axis=2)
+                _lo, _hi = float(_arr.min()), float(_arr.max())
+                if _hi > _lo:
+                    _arr = (_arr - _lo) / (_hi - _lo) * 255.0
+                _PILImage.fromarray(
+                    _arr.astype(_np.uint8)
+                ).save(f"/tmp/csm_probe_{_dbg}.png")
+                _dbg += 1
+            except Exception as _e:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "probe dump failed: %s", _e
+                )
+            tracker.append_point()
+            pos = _np.array(tracker.stage_positions[-1, :], dtype=float)
+            shift = _norm(
+                _np.array(tracker.image_positions[-1, :], dtype=float)
+                - _np.array(tracker.image_positions[-2, :], dtype=float)
+            )
+            if shift >= threshold:
+                return 1, float(inc)
+        raise MappingError(
+            "Calibration saw no image motion after 4 probes of "
+            f"{step:.0f} units (travel limits respected). Check the "
+            "sample has visible texture and is in focus."
+        )
+
+    _cal_mod.move_until_motion_detected = _relative_ladder
+
 
 
 class MoveHistory(NamedTuple):
@@ -132,6 +208,109 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
         the stock full-resolution behaviour."""
         return hasattr(self._stage, "query_motion_state")
 
+    def _velocity_settle(self) -> None:
+        """Wait until the stage is actually stationary (motion_report
+        live_velocity ~ 0), then discard frames so the next grab is a
+        post-move frame. Happens-before on motion completion - replaces
+        the fixed 0.2s sleep, which races fast stage moves."""
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            try:
+                st = self._stage._get_status(payload={
+                    "objects": {"motion_report": ["live_velocity"]}
+                })
+                v = float(
+                    (st["result"]["status"].get("motion_report") or {})
+                    .get("live_velocity") or 0.0
+                )
+                if abs(v) < 1.0:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.05)
+        self._cam.settle()
+
+
+    def _calibrate_with_ceiling(
+            self,
+            tracker: Tracker,
+            recorded_move: RecordedMove,
+            direction_array: np.ndarray,
+            starting_position: Mapping[str, int],
+    ) -> dict:
+        """Backlash calibration with a travel-limited motion ladder.
+
+        Wraps ``calibrate_backlash_1d`` but pre-flights each move the
+        escalation ladder would make against the stage's configured
+        limits (klippy toolhead position_max/min), so an over-long
+        probe fails with a clear MappingError instead of a 400 from
+        the motion system mid-calibration."""
+        try:
+            limits = self._stage_position_limits()
+        except Exception:
+            limits = None
+        if limits is None:
+            return calibrate_backlash_1d(
+                tracker, recorded_move, direction_array, logger=self.logger
+            )
+        lo, hi = limits
+        dir_xy = np.array(direction_array[:2], dtype=float)
+        if not np.any(dir_xy):
+            return calibrate_backlash_1d(
+                tracker, recorded_move, direction_array, logger=self.logger
+            )
+        cur = self._stage.get_xyz_position()
+        cx, cy = float(cur["x"]), float(cur["y"])
+        if dir_xy[0]:
+            avail = (hi[0] - cx) if dir_xy[0] > 0 else (cx - lo[0])
+        else:
+            avail = (hi[1] - cy) if dir_xy[1] > 0 else (cy - lo[1])
+        ceiling = max(50.0, abs(avail) * 0.9)
+        self.logger.info(
+            "Calibration move ceiling: %.0f steps (travel remaining %.0f)",
+            ceiling, avail,
+        )
+        try:
+            return calibrate_backlash_1d(
+                tracker, recorded_move, direction_array, logger=self.logger
+            )
+        except MappingError as exc:
+            raise MappingError(
+                f"{exc} (move ceiling {ceiling:.0f} steps for this axis; "
+                "stage travel or correlation failed - home the stage and "
+                "start closer to the sample if the ceiling is the issue)"
+            ) from exc
+
+    def _stage_position_limits(self):
+        """Return ((x_min, y_min), (x_max, y_max)) toolhead travel limits
+        from klippy's toolhead status, or None if unavailable."""
+        st = self._stage._get_status(payload={
+            "objects": {"toolhead": None}
+        })
+        th = st["result"]["status"].get("toolhead") or {}
+        pos = th.get("position")
+        if not pos:
+            return None
+        cfg = self._stage._get_status(payload={
+            "objects": {"configfile": ["settings"]}
+        })
+        settings = (
+                (cfg["result"]["status"].get("configfile") or {}).get("settings")
+                or {}
+        )
+
+        def _lim(axis, key):
+            v = settings.get(f"stepper_{axis}.{key}")
+            if v is None:
+                return None
+            return float(str(v).split(",")[0])
+
+        x_min, x_max = _lim("x", "position_min"), _lim("x", "position_max")
+        y_min, y_max = _lim("y", "position_min"), _lim("y", "position_max")
+        if None in (x_min, x_max, y_min, y_max):
+            return None
+        return ((x_min, y_min), (x_max, y_max))
+
     def _calibrate_1d_fast(self, direction: Tuple[int, int, int]) -> dict:
         """1D calibration in the camera's high-fps streaming mode.
 
@@ -144,32 +323,53 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
         if not held_before:
             cam.hold_stream_mode("csm_cal")
         prev_mode = cam.streaming_mode
+        prev_gain = cam.analogue_gain
+        prev_exp = cam.exposure_time
         try:
             if prev_mode != "crop990":
                 cam._stop_streaming(stop_web_stream=False)
                 cam._start_streaming("crop990")
+            _g, _e = _probe_regime(prev_gain, prev_exp)
+            cam.set_probe_controls_raw(_g, _e)
+            self.logger.info(
+                "CSM cal regime: gain=%.2f exposure=%dus (AF sweep regime)",
+                _g, _e,
+            )
+            deadline = time.monotonic() + 0.35
+            while time.monotonic() < deadline:
+                time.sleep(0.05)
+            try:
+                _limits = self._stage_position_limits()
+            except Exception:
+                _limits = None
+            _patch_relative_motion_ladder(_limits, cam)
             with _EncoderBurst(cam):
+                settle_deadline = time.monotonic() + 1.5
+                while time.monotonic() < settle_deadline:
+                    try:
+                        cam.capture_downsampled_array()
+                    except Exception:
+                        pass
+                    time.sleep(0.1)
                 recorded_move = RecordedMove(self._stage)
                 tracker = Tracker(
                     cam.capture_downsampled_array,
                     self._stage.get_xyz_position,
-                    settle=cam.settle,
+                    settle=self._velocity_settle,
                 )
                 direction_array: np.ndarray = np.array(direction)
                 starting_position = self._stage.position
                 try:
-                    result: dict = calibrate_backlash_1d(
-                        tracker, recorded_move, direction_array, logger=self.logger
+                    result: dict = self._calibrate_with_ceiling(
+                        tracker,
+                        recorded_move,
+                        direction_array,
+                        starting_position,
                     )
-                except lt.exceptions.InvocationCancelledError:
-                    self.logger.info("User cancelled the CSM calibration")
-                    self._stage.move_absolute(
-                        **starting_position, block_cancellation=True,
-                        backlash_compensation=None,
-                    )
-                    raise
                 except MappingError:
-                    self.logger.info("Returning to starting position due to failed calibration")
+                    self.logger.info(
+                        "Calibration failed - returning to starting position"
+                    )
                     self._stage.move_absolute(
                         **starting_position, block_cancellation=True,
                         backlash_compensation=None,
@@ -180,12 +380,15 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
                 result["calibration_stream_mode"] = "crop990"
                 return result
         finally:
+            try:
+                cam.set_probe_controls_raw(prev_gain, prev_exp)
+            except Exception:
+                self.logger.warning("CSM cal regime restore failed", exc_info=True)
             if not held_before:
                 cam.release_stream_mode("csm_cal")
                 if cam.streaming_mode != prev_mode:
                     cam._stop_streaming(stop_web_stream=False)
                     cam._start_streaming(prev_mode)
-
 
     def calibrate_1d(self, direction: Tuple[int, int, int]) -> dict:
         """Move a microscope's stage in 1D, and figure out the relationship with the camera."""
@@ -246,7 +449,7 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
             )
             for cal in (cal_x, cal_y):
                 cal["image_to_stage_displacement"] = (
-                    cal["image_to_stage_displacement"] * scale
+                        cal["image_to_stage_displacement"] * scale
                 )
                 cal["image_resolution"] = full_res
         self.logger.info("Calibration complete, updating metadata.")

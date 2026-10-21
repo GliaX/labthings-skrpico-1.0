@@ -54,7 +54,7 @@ class NoFocusFoundError(RuntimeError):
 
 
 class SmoothAutofocusParams(BaseModel):
-    search_span_steps: int = Field(default=32, gt=0)
+    search_span_steps: int = Field(default=0, ge=0)
 
 
 @dataclass
@@ -1627,8 +1627,9 @@ class SmoothAutofocusThing(lt.Thing):
         """
         t0 = time.monotonic()
         burst = 120.0
-        self._span_hint = max(
-            200.0, min(float(params.search_span_steps), 1024.0)
+        hint = float(params.search_span_steps)
+        self._span_hint = (
+            max(200.0, min(hint, 1024.0)) if hint > 0 else 0.0
         )
         prev_exp = prev_gain = None
         forced_base = getattr(self, "_forced_restore_base", None)

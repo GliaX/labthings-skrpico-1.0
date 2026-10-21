@@ -744,42 +744,16 @@ class StreamingPiCamera2(BaseCamera, ABC):
                 yield cam
 
     @staticmethod
-    def _pil_from_yuv420_array(arr: np.ndarray) -> Image.Image:
-        """Build a PIL image from a raw YUV420 planar array (picamera2
-        main/lores stream format: y_rows of luma, then y_rows/2 rows of
-        interleaved U,V bytes). Built from three L-mode planes via
-        Image.merge - avoids PIL's raw planar-YCbCr decoder entirely."""
-        rows, stride = arr.shape[0], arr.shape[1]
-        y_rows = rows * 2 // 3
-        w = stride // 2 * 2
-        y = arr[:y_rows, :w]
-        uv = arr[y_rows:]
-        u = uv[:, 0::2][: y_rows // 2, : w // 2]
-        v = uv[:, 1::2][: y_rows // 2, : w // 2]
-        yp = Image.frombuffer(
-            "L", (w, y_rows), np.ascontiguousarray(y).tobytes(), "raw", "L", 0, 1
-        )
-        up = Image.frombuffer(
-            "L",
-            (w // 2, y_rows // 2),
-            np.ascontiguousarray(u).tobytes(),
-            "raw",
-            "L",
-            0,
-            1,
-        )
-        vp = Image.frombuffer(
-            "L",
-            (w // 2, y_rows // 2),
-            np.ascontiguousarray(v).tobytes(),
-            "raw",
-            "L",
-            0,
-            1,
-        )
-        up = up.resize((w, y_rows))
-        vp = vp.resize((w, y_rows))
-        img = Image.merge("YCbCr", (yp, up, vp))
+    def _pil_from_yuv420_array(arr: np.ndarray, size: tuple) -> Image.Image:
+        """Grayscale PIL image from a raw YUV420 planar array. Planes are
+        sliced using the stream's true (w, h) from the camera configuration
+        (never derived from the array shape, whose stride padding differs
+        per mode), copied into PIL-owned memory, and returned as an L-mode
+        image: consumers on this path (CSM tracking) correlate luma only."""
+        w, h = size
+        y = np.ascontiguousarray(arr[:h, :w])
+        img = Image.new("L", (w, h))
+        img.paste(Image.fromarray(y, mode="L"))
         return img
 
     def _capture_image(self, capture_mode: str = "standard") -> Image.Image:
@@ -795,13 +769,16 @@ class StreamingPiCamera2(BaseCamera, ABC):
 
         with self._ensure_mode_for_capture(capture_mode_info) as cam:
             stream = capture_mode_info.stream_name
-            try:
-                return cam.capture_image(stream, wait=capture_mode_info.timeout)
-            except RuntimeError as exc:
-                if "YUV420" not in str(exc):
-                    raise
-            arr = cam.capture_array(stream, wait=capture_mode_info.timeout)
-            return self._pil_from_yuv420_array(arr)
+            fmt = (
+                cam.camera_configuration()[stream]["format"]
+                if stream in cam.camera_configuration()
+                else None
+            ) or ""
+            size = cam.camera_configuration()[stream]["size"]
+            if "YUV420" in str(fmt):
+                arr = cam.capture_array(stream, wait=capture_mode_info.timeout)
+                return self._pil_from_yuv420_array(arr, size)
+            return cam.capture_image(stream, wait=capture_mode_info.timeout)
 
     @lt.action
     def capture_as_array(
