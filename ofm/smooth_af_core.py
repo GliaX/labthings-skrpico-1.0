@@ -89,3 +89,17 @@ def median_filter_curve(points: List[CurvePoint], window: int = 3) -> List[Curve
         out.append(CurvePoint(z=p.z, sharpness=statistics.median(vals),
                               brightness=p.brightness))
     return out
+
+
+def cluster_curve(points: List[CurvePoint]) -> List[CurvePoint]:
+    """Median-collapse samples at the same z (drops first sample of each cluster)."""
+    clusters: dict = {}
+    for p in points:
+        clusters.setdefault(round(p.z, 3), []).append(p.sharpness)
+    out = []
+    for z, vals in sorted(clusters.items()):
+        if len(vals) >= 2:
+            out.append(CurvePoint(z=z, sharpness=statistics.median(vals[1:])))
+        else:
+            out.append(CurvePoint(z=z, sharpness=vals[0]))
+    return out
