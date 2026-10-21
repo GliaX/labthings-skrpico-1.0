@@ -183,6 +183,7 @@ class StreamingPiCamera2(BaseCamera, ABC):
 
         self._picamera_lock = RLock()
         self._picamera = None
+        self._mode_lock_holders: set = set()
 
         # Load the tuning file for the specified sensor mode.
         self.default_tuning = tf_utils.load_default_tuning(
@@ -211,6 +212,22 @@ class StreamingPiCamera2(BaseCamera, ABC):
 
     stream_active: bool = lt.property(default=False, readonly=True)
     """Whether the MJPEG stream is active."""
+
+    def hold_stream_mode(self, holder: str) -> None:
+        """Request the current streaming mode be kept (no cooler restore).
+
+        Nested holders count; the mode is released when all holders call
+        :meth:`release_stream_mode`.
+        """
+        self._mode_lock_holders.add(holder)
+
+    def release_stream_mode(self, holder: str) -> None:
+        """Release a hold_stream_mode request from the named holder."""
+        self._mode_lock_holders.discard(holder)
+
+    @property
+    def stream_mode_held(self) -> bool:
+        return bool(self._mode_lock_holders)
 
     def save_settings(self) -> None:
         """Override save_settings to ensure that camera properties don't recurse.
@@ -603,8 +620,8 @@ class StreamingPiCamera2(BaseCamera, ABC):
             if _AF_TS_PROBE["n"] < 40:
                 _AF_TS_PROBE["n"] += 1
                 with open(
-                    "/home/admin/openflexure-microscope-server/af_ts_probe.log",
-                    "a",
+                        "/home/admin/openflexure-microscope-server/af_ts_probe.log",
+                        "a",
                 ) as _f:
                     _f.write(
                         "%.6f %.6f\n" % (ts, _md_mono - ts)
@@ -726,6 +743,45 @@ class StreamingPiCamera2(BaseCamera, ABC):
                 time.sleep(self._sensor_info.short_pause)
                 yield cam
 
+    @staticmethod
+    def _pil_from_yuv420_array(arr: np.ndarray) -> Image.Image:
+        """Build a PIL image from a raw YUV420 planar array (picamera2
+        main/lores stream format: y_rows of luma, then y_rows/2 rows of
+        interleaved U,V bytes). Built from three L-mode planes via
+        Image.merge - avoids PIL's raw planar-YCbCr decoder entirely."""
+        rows, stride = arr.shape[0], arr.shape[1]
+        y_rows = rows * 2 // 3
+        w = stride // 2 * 2
+        y = arr[:y_rows, :w]
+        uv = arr[y_rows:]
+        u = uv[:, 0::2][: y_rows // 2, : w // 2]
+        v = uv[:, 1::2][: y_rows // 2, : w // 2]
+        yp = Image.frombuffer(
+            "L", (w, y_rows), np.ascontiguousarray(y).tobytes(), "raw", "L", 0, 1
+        )
+        up = Image.frombuffer(
+            "L",
+            (w // 2, y_rows // 2),
+            np.ascontiguousarray(u).tobytes(),
+            "raw",
+            "L",
+            0,
+            1,
+        )
+        vp = Image.frombuffer(
+            "L",
+            (w // 2, y_rows // 2),
+            np.ascontiguousarray(v).tobytes(),
+            "raw",
+            "L",
+            0,
+            1,
+        )
+        up = up.resize((w, y_rows))
+        vp = vp.resize((w, y_rows))
+        img = Image.merge("YCbCr", (yp, up, vp))
+        return img
+
     def _capture_image(self, capture_mode: str = "standard") -> Image.Image:
         """Acquire one image from the camera and return it as a PIL Image.
 
@@ -738,9 +794,14 @@ class StreamingPiCamera2(BaseCamera, ABC):
         capture_mode_info = self.capture_modes[capture_mode]
 
         with self._ensure_mode_for_capture(capture_mode_info) as cam:
-            return cam.capture_image(
-                capture_mode_info.stream_name, wait=capture_mode_info.timeout
-            )
+            stream = capture_mode_info.stream_name
+            try:
+                return cam.capture_image(stream, wait=capture_mode_info.timeout)
+            except RuntimeError as exc:
+                if "YUV420" not in str(exc):
+                    raise
+            arr = cam.capture_array(stream, wait=capture_mode_info.timeout)
+            return self._pil_from_yuv420_array(arr)
 
     @lt.action
     def capture_as_array(

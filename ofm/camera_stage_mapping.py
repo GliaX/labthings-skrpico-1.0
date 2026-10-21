@@ -27,6 +27,7 @@ from labthings_fastapi.types.numpy import DenumpifyingDict
 from .camera import BaseCamera
 from .stage import BaseStage
 from .view_alignment import ViewAlignmentMixin
+from .smooth_autofocus import _EncoderBurst
 
 
 class MoveHistory(NamedTuple):
@@ -124,8 +125,72 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
     _cam: BaseCamera = lt.thing_slot()
     _stage: BaseStage = lt.thing_slot()
 
+    def _use_fast_cal(self) -> bool:
+        """True when the stage is an skrPico-class stage: calibration runs
+        in the camera's high-fps crop990 mode because the stage is fast
+        enough to outrun the full-res frame rate. Any other stage keeps
+        the stock full-resolution behaviour."""
+        return hasattr(self._stage, "query_motion_state")
+
+    def _calibrate_1d_fast(self, direction: Tuple[int, int, int]) -> dict:
+        """1D calibration in the camera's high-fps streaming mode.
+
+        The stage is fast enough to outrun full-resolution frames, so the
+        tracker runs against the live crop990 stream instead. The result is
+        scaled to full-resolution pixel units so downstream consumers see
+        the same matrix as a full-res calibration would produce."""
+        cam = self._cam
+        held_before = cam.stream_mode_held
+        if not held_before:
+            cam.hold_stream_mode("csm_cal")
+        prev_mode = cam.streaming_mode
+        try:
+            if prev_mode != "crop990":
+                cam._stop_streaming(stop_web_stream=False)
+                cam._start_streaming("crop990")
+            with _EncoderBurst(cam):
+                recorded_move = RecordedMove(self._stage)
+                tracker = Tracker(
+                    cam.capture_downsampled_array,
+                    self._stage.get_xyz_position,
+                    settle=cam.settle,
+                )
+                direction_array: np.ndarray = np.array(direction)
+                starting_position = self._stage.position
+                try:
+                    result: dict = calibrate_backlash_1d(
+                        tracker, recorded_move, direction_array, logger=self.logger
+                    )
+                except lt.exceptions.InvocationCancelledError:
+                    self.logger.info("User cancelled the CSM calibration")
+                    self._stage.move_absolute(
+                        **starting_position, block_cancellation=True,
+                        backlash_compensation=None,
+                    )
+                    raise
+                except MappingError:
+                    self.logger.info("Returning to starting position due to failed calibration")
+                    self._stage.move_absolute(
+                        **starting_position, block_cancellation=True,
+                        backlash_compensation=None,
+                    )
+                    raise
+                result["move_history"] = recorded_move.history
+                result["image_resolution"] = cam.capture_downsampled_array().shape[:2]
+                result["calibration_stream_mode"] = "crop990"
+                return result
+        finally:
+            if not held_before:
+                cam.release_stream_mode("csm_cal")
+                if cam.streaming_mode != prev_mode:
+                    cam._stop_streaming(stop_web_stream=False)
+                    cam._start_streaming(prev_mode)
+
+
     def calibrate_1d(self, direction: Tuple[int, int, int]) -> dict:
         """Move a microscope's stage in 1D, and figure out the relationship with the camera."""
+        if self._use_fast_cal():
+            return self._calibrate_1d_fast(direction)
         # Record positions and times for stage calibration
         recorded_move = RecordedMove(self._stage)
         tracker = Tracker(
@@ -170,6 +235,20 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
         cal_y: dict = self.calibrate_1d((0, 1, 0))
         self.logger.info("Calibrating X axis:")
         cal_x: dict = self.calibrate_1d((1, 0, 0))
+        # Fast-mode calibrations ran against the crop990 stream: scale their
+        # matrices to full-resolution pixel units so the combined result
+        # matches what a full-res calibration would have produced.
+        if cal_x.get("calibration_stream_mode") == "crop990":
+            full_res = self._cam.streaming_modes["default"].main_resolution
+            scale = full_res[0] / cal_x["image_resolution"][0]
+            self.logger.info(
+                "Scaling crop990 calibration x%.2f to full-res units", scale
+            )
+            for cal in (cal_x, cal_y):
+                cal["image_to_stage_displacement"] = (
+                    cal["image_to_stage_displacement"] * scale
+                )
+                cal["image_resolution"] = full_res
         self.logger.info("Calibration complete, updating metadata.")
 
         # Combine X and Y calibrations to make a 2D calibration

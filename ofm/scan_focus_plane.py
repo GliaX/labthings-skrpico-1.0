@@ -115,6 +115,18 @@ class ScanFocusPlaneThing(lt.Thing):
         if getattr(type(self), "_PASS_BUSY", False):
             return
         try:
+            if (
+                    getattr(
+                        self._cam, "streaming_mode", "default"
+                    ) != "default"
+                    and not getattr(self._cam, "stream_mode_held", False)
+            ):
+                self._cam._stop_streaming(stop_web_stream=False)
+                self._cam._start_streaming("default")
+                LOGGER.info("PLANE: cooler restored default stream mode")
+        except Exception:
+            LOGGER.warning("pass cooler mode restore failed", exc_info=True)
+        try:
             with self._cam._streaming_picamera() as picam:
                 picam.set_controls({"FrameRate": 20.0})
         except Exception:
@@ -1239,6 +1251,7 @@ class ScanFocusPlaneThing(lt.Thing):
 
         fits: List[dict] = []
         try:
+            self._cam.hold_stream_mode("scan_pass")
             if self._cam.streaming_mode != "crop990":
                 self._cam._start_streaming("crop990")
             with StreamSharpnessMonitor(self._cam, plane="main") as monitor:
@@ -1254,6 +1267,7 @@ class ScanFocusPlaneThing(lt.Thing):
                             monitor, fits, grid, step, self._pass_z_start
                         )
         finally:
+            self._cam.release_stream_mode("scan_pass")
             try:
                 self._cam.restore_calibration_raw()
             except Exception:

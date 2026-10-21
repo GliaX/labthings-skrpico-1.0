@@ -206,8 +206,6 @@ class _EncoderBurst:
         return False
 
 
-
-
 _LOGQ: "queue.Queue[str]" = queue.Queue()
 _DUMPQ: "queue.Queue[tuple]" = queue.Queue()
 
@@ -758,6 +756,15 @@ class SmoothAutofocusThing(lt.Thing):
         try:
             if getattr(self, "_AF_BUSY", False):
                 return
+            held = getattr(self._cam, "stream_mode_held", False)
+            mode = getattr(self._cam, "streaming_mode", "default")
+            try:
+                if mode != "default" and not held:
+                    self._cam._stop_streaming(stop_web_stream=False)
+                    self._cam._start_streaming("default")
+                    _log("COOL mode=default (restored)")
+            except Exception as e:
+                LOGGER.error("AF cooler: mode restore failed: %s", e)
             try:
                 with self._cam._streaming_picamera() as picam:
                     if not picam.started:
@@ -1317,6 +1324,8 @@ class SmoothAutofocusThing(lt.Thing):
     def _run_flow(self, monitor: StreamSharpnessMonitor) -> SmoothFocusResult:
         t0 = time.monotonic()
         mode = ""
+        span = float(getattr(self, "_span_hint", 0.0) or _FAR_SPAN)
+        half_span = min(span / 2.0, _FAR_SPAN)
         try:
             st = self._stage._get_status(payload={
                 "objects": {"gcode_move": None}
@@ -1377,8 +1386,8 @@ class SmoothAutofocusThing(lt.Thing):
         cur = self._stage_z()
         if not (cur == cur):
             cur = self._last_hw
-        leg_a = cur + _FAR_SPAN
-        leg_b = cur - _FAR_SPAN
+        leg_a = cur + half_span
+        leg_b = cur - half_span
         if not type(self)._CAL_LOADED:
             self._load_cal()
         if type(self)._CAL_ACCEL is None:
@@ -1539,7 +1548,7 @@ class SmoothAutofocusThing(lt.Thing):
                 t_arg = max(tiny_pts, key=lambda q: q[2])
                 if (
                         t_arg[2] >= 1.25 * max(s_floor_t, 1e-9)
-                        and abs(t_arg[0] - claw_z) <= _FAR_SPAN
+                        and abs(t_arg[0] - claw_z) <= half_span
                 ):
                     top_t = sorted(
                         tiny_pts, key=lambda q: q[2], reverse=True
@@ -1592,6 +1601,7 @@ class SmoothAutofocusThing(lt.Thing):
             })
 
         mode += "|no_anchor_refuse"
+        self._span_hint = 0.0
         ret_mark = len(monitor.times)
         self._sync_move(monitor, z0, _PARK_VELOCITY, ret_mark, labeled=False)
         mode += f"|return{self._stage_z():.1f}"
@@ -1617,6 +1627,9 @@ class SmoothAutofocusThing(lt.Thing):
         """
         t0 = time.monotonic()
         burst = 120.0
+        self._span_hint = max(
+            200.0, min(float(params.search_span_steps), 1024.0)
+        )
         prev_exp = prev_gain = None
         forced_base = getattr(self, "_forced_restore_base", None)
         try:
@@ -1769,7 +1782,7 @@ class SmoothCompatAutofocus(SmoothAutofocusThing, AutofocusThing):
     _af_params = SmoothAutofocusParams()
 
     def _run_smooth(self, span: int) -> SharpnessDataArrays:
-        params = self._af_params.model_copy(update={"search_span_steps": span})
+        params = self._af_params.model_copy(update={"search_span_steps": 0})
         result = self.smooth_focus(params)
         z = [pt.z for pt in result.curve]
         s = [pt.sharpness for pt in result.curve]
@@ -1792,10 +1805,10 @@ class SmoothCompatAutofocus(SmoothAutofocusThing, AutofocusThing):
             sharpness_metric=None,
             record=None,
     ) -> SharpnessDataArrays:
-        """Autofocus with the smooth engine; dz = total search span (stage units)."""
-        span = max(8, min(int(dz), 192))
+        """Autofocus with the smooth engine; dz is accepted for API
+        compatibility only - the engine always runs its full-span chain."""
         try:
-            return self._run_smooth(span)
+            return self._run_smooth(0)
         except NoFocusFoundError as exc:
             raise ScanNoFocusFoundError(str(exc)) from exc
 
@@ -1809,7 +1822,7 @@ class SmoothCompatAutofocus(SmoothAutofocusThing, AutofocusThing):
     ) -> tuple[list[float], list[float]]:
         """Run the smooth engine once; it already re-verifies and re-anchors."""
         try:
-            self._run_smooth(max(8, min(int(dz), 192)))
+            self._run_smooth(0)
         except NoFocusFoundError as exc:
             raise ScanNoFocusFoundError(str(exc)) from exc
         peaks = [float(self._stage.position["z"])]
