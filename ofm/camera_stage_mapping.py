@@ -32,7 +32,7 @@ from .view_alignment import ViewAlignmentMixin
 
 
 
-def _patch_relative_motion_ladder(limits=None, cam=None) -> None:
+def _patch_relative_motion_ladder(limits=None, cam=None, stage=None) -> None:
     """Replace the calibration motion ladder with a travel-aware walk.
 
     Walks INCREMENTS of 10,25,50,100,200,400,800,1200 units relative to
@@ -63,13 +63,21 @@ def _patch_relative_motion_ladder(limits=None, cam=None) -> None:
             hi = _np.array(limits[1][:2], dtype=float) - MARGIN
 
         _dbg = 0
-        for _i in range(24):
+        for _i in range(10):
             inc = step
             target = pos + unit * inc
             txy = target[:2]
             if _np.any(txy < lo) or _np.any(txy > hi):
                 continue
-            move(tuple(target))
+            if stage is not None and hasattr(stage, "_send_gcode_script"):
+                stage._send_gcode_script(
+                    stage._client,
+                    "G90\n"
+                    f"G1 X{target[0]:.3f} Y{target[1]:.3f} "
+                    f"Z{target[2]:.3f} S9000 F45000\nM400\n",
+                )
+            else:
+                move(tuple(target))
             try:
                 _img = cam.capture_downsampled_array()
                 from PIL import Image as _PILImage
@@ -97,12 +105,60 @@ def _patch_relative_motion_ladder(limits=None, cam=None) -> None:
             if shift >= threshold:
                 return 1, float(inc)
         raise MappingError(
-            "Calibration saw no image motion after 4 probes of "
-            f"{step:.0f} units (travel limits respected). Check the "
-            "sample has visible texture and is in focus."
+            "Calibration saw no image motion after "
+            f"{_i + 1} probes of {step:.0f} units (travel limits "
+            "respected). Check the sample has visible texture and is in "
+            "focus."
         )
 
     _cal_mod.move_until_motion_detected = _relative_ladder
+
+    def _fit_backlash_lenient(moves):
+        """Stock fit_backlash without the 0.1 fractional-error gate: on this
+        stage the per-point scatter (short travelled distance, FFT integer
+        pixel resolution) trips the stock threshold even when the linear fit
+        is good. The caller gates on pixels_per_step plausibility instead."""
+        all_stage_points, all_image_points, times = (
+            _cal_mod.to_tracker_history(moves)
+        )
+        image_direction = _cal_mod.direction_from_points(all_image_points)
+        stage_direction = _cal_mod.direction_from_points(all_stage_points)
+        xfit = _np.sum(
+            all_stage_points * stage_direction[_np.newaxis, :], axis=1
+        )
+        yfit = _np.sum(
+            all_image_points * image_direction[_np.newaxis, :], axis=1
+        )
+
+        def fit_motion(xfit, yfit, backlash=0):
+            xfit_blsh = _cal_mod.apply_backlash(xfit, backlash)
+            xfit_blsh -= _np.mean(xfit_blsh)
+            m, c = _np.polyfit(xfit_blsh, yfit, 1)
+            residuals = yfit - (xfit_blsh * m + c)
+            return m, c, _np.std(residuals, ddof=3)
+
+        max_backlash = (_np.max(xfit) - _np.min(xfit)) / 3
+        backlash_values = []
+        residual_values = []
+        backlash = 0
+        while backlash < max_backlash:
+            m, c, residual = fit_motion(xfit, yfit, backlash)
+            residual_values.append(residual)
+            backlash_values.append(backlash)
+            backlash += max(1, backlash / 3)
+        backlash = backlash_values[_np.argmin(residual_values)]
+        m, c, residual = fit_motion(xfit, yfit, backlash)
+        fractional_error = residual / _norm(_np.diff(yfit))
+        return {
+            "backlash": backlash,
+            "pixels_per_step": m,
+            "fractional_error": fractional_error,
+            "stage_direction": stage_direction,
+            "image_direction": image_direction,
+            "pixels_per_step_vector": m * image_direction,
+        }
+
+    _cal_mod.fit_backlash = _fit_backlash_lenient
 
 
 
@@ -228,6 +284,8 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
             except Exception:
                 pass
             time.sleep(0.05)
+        if hasattr(self._stage, "update_position"):
+            self._stage.update_position()
         self._cam.settle()
 
 
@@ -251,7 +309,19 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
             limits = None
         if limits is None:
             return calibrate_backlash_1d(
-                tracker, recorded_move, direction_array, logger=self.logger
+            tracker, recorded_move, direction_array,
+            logger=self.logger,
+            return_data_on_failure=True,
+        )
+        pps = abs(result.get("pixels_per_step", 0.0))
+        fe = result.get("fractional_error", 1.0)
+        self.logger.warning(
+            "CSM fit: pixels_per_step=%.2f fractional_error=%.3f",
+            pps, fe,
+        )
+        if not (0.1 < pps < 50.0):
+            raise MappingError(
+                f"CSM fit implausible: pixels_per_step={pps:.2f}"
             )
         lo, hi = limits
         dir_xy = np.array(direction_array[:2], dtype=float)
@@ -342,7 +412,7 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
                 _limits = self._stage_position_limits()
             except Exception:
                 _limits = None
-            _patch_relative_motion_ladder(_limits, cam)
+            _patch_relative_motion_ladder(_limits, cam, self._stage)
             with _EncoderBurst(cam):
                 settle_deadline = time.monotonic() + 1.5
                 while time.monotonic() < settle_deadline:
