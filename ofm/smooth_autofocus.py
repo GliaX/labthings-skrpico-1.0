@@ -137,9 +137,13 @@ class StreamSharpnessMonitor:
 
 
 class _EncoderBurst:
-    """Stop both MJPEG encoders (main + lores) for the AF burst so the
-    metric gets the full frame path at 120fps; restore main after.
-    Preview is dark for the ~5s of a run — that is by design.
+    """Throttle sensor fps for a high-fps metric burst, restore after.
+
+    The camera lives in crop990; the burst stops the encoders (nobody
+    consumes the UI stream mid-AF) and the sensor stays at the metric
+    rate across runs — restoring a lower FrameRate forces a sensor
+    re-clock (~0.4s) on the next run, so it is deliberately not done.
+    Restore restarts the encoders only.
     """
 
     def __init__(self, camera) -> None:
@@ -148,56 +152,60 @@ class _EncoderBurst:
     def __enter__(self) -> "_EncoderBurst":
         try:
             with self._cam._streaming_picamera() as picam:
-                enc = getattr(picam, "encoder", None)
-                if enc is not None:
+                if picam.started:
                     try:
                         picam.stop_encoder()
+                        _log("BURST stop_encoder t=%.3f" % (time.monotonic(),))
                     except Exception:
-                        pass
-                try:
-                    picam.stop_encoder("lores")
-                except Exception:
-                    pass
-        except Exception as e:
-            LOGGER.error("AF burst: lores switch failed: %s", e)
+                        return self
+        except Exception:
+            pass
         return self
 
     def __exit__(self, *exc) -> bool:
         try:
             with self._cam._streaming_picamera() as picam:
+                mode_info = getattr(self._cam, "streaming_modes", {}).get(
+                    getattr(self._cam, "streaming_mode", "default")
+                )
+                use_lores = (
+                        mode_info is not None
+                        and getattr(mode_info, "use_lores_as_preview", False)
+                )
+                stream_name = "lores" if use_lores else "main"
                 if not picam.started:
                     try:
                         picam.start()
                     except Exception as e:
                         LOGGER.error("AF burst: camera start failed: %s", e)
-                if getattr(picam, "encoder", None) is None:
-                    bitrate = getattr(self._cam, "mjpeg_bitrate", 10000000)
-                    mode_info = getattr(
-                        self._cam, "streaming_modes", {}
-                    ).get(getattr(self._cam, "streaming_mode", "default"))
-                    use_lores = (
-                            mode_info is not None
-                            and getattr(
-                        mode_info, "use_lores_as_preview", False
+                bitrate = getattr(self._cam, "mjpeg_bitrate", 10000000)
+                enc1 = MJPEGEncoder(bitrate)
+                try:
+                    picam.start_recording(
+                        enc1,
+                        PicameraStreamOutput(
+                            self._cam.mjpeg_stream, enc1
+                        ),
+                        name=stream_name,
                     )
+                except Exception as e:
+                    LOGGER.error("AF burst: main encoder restore failed: %s", e)
+                enc2 = MJPEGEncoder(100000000)
+                try:
+                    picam.start_encoder(
+                        enc2,
+                        PicameraStreamOutput(
+                            self._cam.lores_mjpeg_stream, enc2
+                        ),
+                        name="lores",
                     )
-                    stream_name = "lores" if use_lores else "main"
-                    enc1 = MJPEGEncoder(bitrate)
-                    try:
-                        picam.start_recording(
-                            enc1,
-                            PicameraStreamOutput(
-                                self._cam.mjpeg_stream, enc1
-                            ),
-                            name=stream_name,
-                        )
-                    except Exception as e:
-                        LOGGER.error(
-                            "AF burst: encoder restore failed: %s", e
-                        )
+                except Exception as e:
+                    LOGGER.error("AF burst: lores encoder restore failed: %s", e)
         except Exception as e:
             LOGGER.error("AF burst: camera restore failed: %s", e)
         return False
+
+
 
 
 _LOGQ: "queue.Queue[str]" = queue.Queue()

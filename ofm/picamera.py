@@ -86,8 +86,6 @@ class PicameraStreamOutput(Output):
         Output.__init__(self)
         self.stream = stream
         self.encoder = encoder
-        self.min_interval = 0.05
-        self._last_sent = None
 
     def outputframe(
             self,
@@ -97,11 +95,7 @@ class PicameraStreamOutput(Output):
             _packet: Any = None,
             _audio: bool = False,
     ) -> None:
-        """Add a frame to the stream's ringbuffer, capped at min_interval."""
-        now = time.monotonic()
-        if self._last_sent is not None and now - self._last_sent < self.min_interval:
-            return
-        self._last_sent = now
+        """Add a frame to the stream's ringbuffer."""
         if timestamp is None or self.encoder.firsttimestamp is None:
             frame_timestamp = None
         else:
@@ -609,8 +603,8 @@ class StreamingPiCamera2(BaseCamera, ABC):
             if _AF_TS_PROBE["n"] < 40:
                 _AF_TS_PROBE["n"] += 1
                 with open(
-                        "/home/admin/openflexure-microscope-server/af_ts_probe.log",
-                        "a",
+                    "/home/admin/openflexure-microscope-server/af_ts_probe.log",
+                    "a",
                 ) as _f:
                     _f.write(
                         "%.6f %.6f\n" % (ts, _md_mono - ts)
