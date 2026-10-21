@@ -1501,11 +1501,7 @@ class SmoothAutofocusThing(lt.Thing):
             )
             tiny_lo = max(claw_z - span_h, min(leg_a, leg_b))
             tiny_hi = min(claw_z + span_h, max(leg_a, leg_b))
-            f_ref = fwhm if fwhm else 20.0
-            tiny_v = max(
-                _TINY_MIN_V,
-                min(_TINY_VELOCITY, FPS * f_ref / 5.0),
-            )
+            tiny_v = self.fine_sweep_velocity(fwhm)
             self._sync_move_pair(
                 monitor,
                 tiny_hi + 60.0, _PARK_VELOCITY, tiny_hi, _PARK_CREEP,
@@ -1600,6 +1596,15 @@ class SmoothAutofocusThing(lt.Thing):
         self._sync_move(monitor, z0, _PARK_VELOCITY, ret_mark, labeled=False)
         mode += f"|return{self._stage_z():.1f}"
         raise NoFocusFoundError(mode)
+
+    @classmethod
+    def fine_sweep_velocity(cls, fwhm: float | None) -> float:
+        """Shared fine-sweep speed law: FPS x FWHM / 5, clamped.
+
+        Single source of truth for the engine's tiny sweep and the
+        scanner's per-point fine sweeps."""
+        f_ref = fwhm if fwhm else 20.0
+        return max(_TINY_MIN_V, min(_TINY_VELOCITY, FPS * f_ref / 5.0))
 
     @lt.action
     def smooth_focus(

@@ -19,6 +19,7 @@ from openflexure_microscope_server.things.smooth_autofocus import (
     StreamSharpnessMonitor,
     SmoothAutofocusThing,
     _EncoderBurst,
+    _FAR_VELOCITY,
     _probe_regime,
 )
 from openflexure_microscope_server.things.stage import BaseStage
@@ -27,18 +28,18 @@ LOGGER = logging.getLogger(__name__)
 
 NEAR_SPAN = 30.0
 MAX_DEPTH = 90.0
-SWEEP_VELOCITY = 80.0
 TRANSIT_VELOCITY = 9000.0
 
 
 def _sweep_velocity() -> float:
-    """Engine-calibrated near-sweep speed (12 u/s per u of FWHM)."""
+    """Engine's shared fine-sweep speed law (FPS x FWHM / 5, clamped)."""
     from openflexure_microscope_server.things.smooth_autofocus import (
         SmoothAutofocusThing,
     )
 
-    return SmoothAutofocusThing._cal_near_velocity(
-        object.__new__(SmoothAutofocusThing)
+    fw = SmoothAutofocusThing._CAL_FWHM
+    return SmoothAutofocusThing.fine_sweep_velocity(
+        float(fw) if fw else None
     )
 
 
@@ -525,13 +526,13 @@ class ScanFocusPlaneThing(lt.Thing):
 
         traj, frames = self._sweep_leg(
             monitor, anchor - self._sweep_halfspan(),
-            max(SWEEP_VELOCITY, _sweep_velocity())
+            _sweep_velocity()
         )
         if not traj and getattr(self, "_last_leg_status", "") == "telestall":
             LOGGER.info("PLANE: telestall retry once")
             traj, frames = self._sweep_leg(
                 monitor, anchor - self._sweep_halfspan(),
-                max(SWEEP_VELOCITY, _sweep_velocity())
+                _sweep_velocity()
             )
         if not traj:
             return None, f"sweep:{getattr(self, '_last_leg_status', 'notraj')}"
@@ -544,7 +545,7 @@ class ScanFocusPlaneThing(lt.Thing):
         ):
             traj2, frames2 = self._sweep_leg(
                 monitor, anchor - depth - NEAR_SPAN,
-                max(SWEEP_VELOCITY, _sweep_velocity())
+                _sweep_velocity()
             )
             if not traj2:
                 break
@@ -558,7 +559,7 @@ class ScanFocusPlaneThing(lt.Thing):
             top_z = max(p[0] for p in pts)
             traj2, frames2 = self._sweep_leg(
                 monitor, top_z + NEAR_SPAN,
-                max(SWEEP_VELOCITY, _sweep_velocity())
+                _sweep_velocity()
             )
             if not traj2:
                 break
@@ -1713,7 +1714,7 @@ class ScanFocusPlaneThing(lt.Thing):
         if z_hit is not None:
             self._note_control(ex, ey, z_hit - self._pass_z_start)
 
-    OCC_SWEEP_VELOCITY = 1700.0
+    OCC_SWEEP_VELOCITY = _FAR_VELOCITY
 
     def _occupancy_map(
             self, monitor, done,
