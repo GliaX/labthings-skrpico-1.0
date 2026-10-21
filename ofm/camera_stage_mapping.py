@@ -260,6 +260,36 @@ class RecordedMove:
         self._history = []
 
 
+class _CappedSafeTracker(Tracker):
+    """Tracker whose max_safe_displacement is capped so the backlash walk
+    stays inside the template search window on this stage's scale."""
+
+    @property
+    def max_safe_displacement(self):
+        return min(super().max_safe_displacement, 25.0)
+
+
+class _DwellRecordedMove(RecordedMove):
+    """RecordedMove that dwells after each move so the sample settles."""
+
+    def __call__(self, new_position: np.ndarray) -> None:
+        from numpy.linalg import norm as _norm
+        cur = (
+            self._current_position
+            if self._current_position is not None
+            else new_position
+        )
+        if _norm(
+            np.asarray(new_position, dtype=float) - np.asarray(cur, dtype=float)
+        ) > 120.0:
+            raise MappingError(
+                "Calibration attempted a move of more than 120 units - "
+                "steps_per_pixel estimate exploded; aborting to protect travel."
+            )
+        super().__call__(new_position)
+        time.sleep(2.0)
+
+
 class CSMUncalibratedError(lt.exceptions.InvocationError):
     """An Exception raised if camera stage mapping data is needed but unavailable.
 
@@ -445,26 +475,13 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
                     except Exception:
                         pass
                     time.sleep(0.1)
-                recorded_move = RecordedMove(self._stage)
-                _raw_call = recorded_move.__call__
-                def _capped_call(new_position, _raw=_raw_call, _rec=recorded_move):
-                    from numpy.linalg import norm as _n
-                    import numpy as _np2
-                    cur = _np2.array(_rec._current_position if _rec._current_position is not None else new_position)
-                    if _n(_np2.array(new_position) - cur) > 120.0:
-                        raise MappingError(
-                            "Calibration attempted a move of more than 120 units - "
-                            "steps_per_pixel estimate exploded; aborting to protect travel."
-                        )
-                    _raw(new_position)
-                    time.sleep(2.0)
-                    return None
-                recorded_move.__call__ = _capped_call
+                recorded_move = _DwellRecordedMove(self._stage)
                 tracker = Tracker(
                     cam.capture_downsampled_array,
                     self._stage.get_xyz_position,
                     settle=self._velocity_settle,
                 )
+                tracker.__class__ = _CappedSafeTracker
                 direction_array: np.ndarray = np.array(direction)
                 starting_position = self._stage.position
                 try:
