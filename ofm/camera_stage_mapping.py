@@ -198,7 +198,22 @@ def _array_to_stage_tuple(pos: np.ndarray) -> tuple[int, int, int]:
 
 
 def _serialise_numpy_in_dict(dict_with_numpy: dict) -> dict:
-    serialised = json.loads(DenumpifyingDict(dict_with_numpy).model_dump_json())
+    def _plain(obj, depth=0):
+        if depth > 8:
+            return str(obj)
+        if isinstance(obj, dict):
+            return {str(k): _plain(v, depth + 1) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_plain(v, depth + 1) for v in obj]
+        if isinstance(obj, np.ndarray):
+            return _plain(obj.tolist(), depth + 1)
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        return obj
+
+    serialised = _plain(dict_with_numpy)
     if not isinstance(serialised, dict):
         raise TypeError(f"Expecting a dictionary to serialise not a {type(serialised)}")
     return serialised
@@ -431,6 +446,20 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
                         pass
                     time.sleep(0.1)
                 recorded_move = RecordedMove(self._stage)
+                _raw_call = recorded_move.__call__
+                def _capped_call(new_position, _raw=_raw_call, _rec=recorded_move):
+                    from numpy.linalg import norm as _n
+                    import numpy as _np2
+                    cur = _np2.array(_rec._current_position if _rec._current_position is not None else new_position)
+                    if _n(_np2.array(new_position) - cur) > 120.0:
+                        raise MappingError(
+                            "Calibration attempted a move of more than 120 units - "
+                            "steps_per_pixel estimate exploded; aborting to protect travel."
+                        )
+                    _raw(new_position)
+                    time.sleep(2.0)
+                    return None
+                recorded_move.__call__ = _capped_call
                 tracker = Tracker(
                     cam.capture_downsampled_array,
                     self._stage.get_xyz_position,
@@ -454,7 +483,8 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
                         backlash_compensation=None,
                     )
                     raise
-                result["move_history"] = recorded_move.history
+                for _k in ("move_history",):
+                    result.pop(_k, None)
                 result["image_resolution"] = cam.capture_downsampled_array().shape[:2]
                 result["calibration_stream_mode"] = "crop990"
                 return result
@@ -517,6 +547,12 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
         cal_y: dict = self.calibrate_1d((0, 1, 0))
         self.logger.info("Calibrating X axis:")
         cal_x: dict = self.calibrate_1d((1, 0, 0))
+        # Strip tracker-history debug data: the nested move arrays make the
+        # result dict recurse when labthings serialises it.
+        for cal in (cal_y, cal_x):
+            for _k in ("exponential_moves", "linear_moves",
+                       "backlash_corrected_moves", "move_history"):
+                cal.pop(_k, None)
         # Fast-mode calibrations ran against the crop990 stream: scale their
         # matrices to full-resolution pixel units so the combined result
         # matches what a full-res calibration would have produced.
@@ -527,8 +563,9 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
                 "Scaling crop990 calibration x%.2f to full-res units", scale
             )
             for cal in (cal_x, cal_y):
-                cal["image_to_stage_displacement"] = (
-                        cal["image_to_stage_displacement"] * scale
+                cal["pixels_per_step"] = cal["pixels_per_step"] * scale
+                cal["pixels_per_step_vector"] = (
+                        cal["pixels_per_step_vector"] * scale
                 )
                 cal["image_resolution"] = full_res
         self.logger.info("Calibration complete, updating metadata.")
