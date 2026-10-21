@@ -165,8 +165,33 @@ class SkrPicoThing(BaseStage):
                             "id": req_id,
                         }))
                         first = True
+                        last_sample = time.monotonic()
+                        resub_logged = False
                         while not self._motion_ws_stop.is_set():
-                            raw = await asyncio.wait_for(ws.recv(), 2.0)
+                            try:
+                                raw = await asyncio.wait_for(
+                                    ws.recv(), 1.0
+                                )
+                            except asyncio.TimeoutError:
+                                if (
+                                        not self._motion_ws_stop.is_set()
+                                        and time.monotonic() - last_sample
+                                        >= 5.0
+                                ):
+                                    req_id += 1
+                                    await ws.send(json.dumps({
+                                        "jsonrpc": "2.0",
+                                        "method":
+                                            "printer.objects.subscribe",
+                                        "params": {"objects": {
+                                            "motion_report": None}},
+                                        "id": req_id,
+                                    }))
+                                    if not resub_logged:
+                                        _wlog("RESUB idle")
+                                        resub_logged = True
+                                    last_sample = time.monotonic()
+                                continue
                             m = json.loads(raw)
                             params = m.get("params")
                             if not isinstance(params, list) or not params:
@@ -212,6 +237,8 @@ class SkrPicoThing(BaseStage):
                                     )
                                 )
                                 self._motion_ws_cond.notify_all()
+                            last_sample = time.monotonic()
+                            resub_logged = False
                             if first:
                                 first = False
                                 _wlog("FIRST_SAMPLE push")
@@ -221,6 +248,64 @@ class SkrPicoThing(BaseStage):
                     break
 
         asyncio.run(_run())
+
+    def _ingest_motion(self, st: dict) -> None:
+        lp = st.get("live_position")
+        if lp is None:
+            return
+        v_raw = st.get("live_velocity")
+        v_now = float(v_raw) if v_raw is not None else None
+        carried = 0.0 if v_raw is not None else 1.0
+        with self._motion_ws_lock:
+            try:
+                self._motion_last_z = float(lp[2])
+                self._motion_last_xy = (
+                    float(lp[0]), float(lp[1]),
+                )
+            except Exception:
+                pass
+            self._motion_last_v = (
+                v_now if v_now is not None else 0.0
+            )
+            t_mono = time.monotonic()
+            self._motion_samples.append(
+                (
+                    t_mono + self._et_handshake,
+                    float(lp[2]),
+                    v_now if v_now is not None else 0.0,
+                    carried,
+                    t_mono + self._et_handshake,
+                    (float(lp[0]), float(lp[1])),
+                )
+            )
+            self._motion_ws_cond.notify_all()
+
+    def _leg_poller_start(self) -> None:
+        if getattr(self, "_leg_poller_thread", None) and \
+                self._leg_poller_thread.is_alive():
+            return
+        self._leg_poller_stop = threading.Event()
+
+        def _poll_loop() -> None:
+            t0 = time.monotonic()
+            while not self._leg_poller_stop.is_set():
+                try:
+                    self._ingest_motion(self.query_motion_state())
+                except Exception:
+                    pass
+                if time.monotonic() - t0 > 30.0:
+                    break
+                self._leg_poller_stop.wait(0.05)
+
+        self._leg_poller_thread = threading.Thread(
+            target=_poll_loop, daemon=True, name="motion-leg-poller"
+        )
+        self._leg_poller_thread.start()
+
+    def _leg_poller_stop_fn(self) -> None:
+        ev = getattr(self, "_leg_poller_stop", None)
+        if ev is not None:
+            ev.set()
 
     def _stamp_for(self, et) -> float:
         h = getattr(self, "_et_handshake", None)

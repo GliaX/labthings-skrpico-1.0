@@ -320,10 +320,16 @@ class SmoothAutofocusThing(lt.Thing):
     _CAL_CONTRAST: Optional[float] = None
     _CAL_ACCEL: Optional[float] = None
     _COOL_TIMER: Optional[threading.Timer] = None
+    _COOLING: bool = False
+    _COOL_DONE: Optional[threading.Event] = None
     _AF_BUSY: bool = False
     _LAST_REGIME: Optional[tuple] = None
     _COOL_DELAY: float = 3.0
     _CAL_LOADED: bool = False
+    _TAU_FAR: Optional[float] = None
+    _TAU_TINY: Optional[float] = None
+    _REFINE_DZ: Optional[float] = None
+    _REFINE_HIST: list = []
     _last_leg_samples: list = []
     _CORR: dict = {}
 
@@ -707,6 +713,7 @@ class SmoothAutofocusThing(lt.Thing):
 
     def _arm_cooler(self) -> None:
         self._cancel_cooler()
+        type(self)._COOL_DONE = threading.Event()
         t = threading.Timer(self._COOL_DELAY, self._quiet_camera)
         t.daemon = True
         type(self)._COOL_TIMER = t
@@ -716,72 +723,92 @@ class SmoothAutofocusThing(lt.Thing):
         """10s after the last AF: sensor to 20fps, encoders ensured
         running, gain/exposure re-applied with readback. Deferred
         housekeeping outside the sweep chain; a new AF run cancels it."""
-        type(self)._COOL_TIMER = None
-        if getattr(self, "_AF_BUSY", False):
-            return
+        type(self)._COOLING = True
         try:
-            with self._cam._streaming_picamera() as picam:
-                if not picam.started:
-                    try:
-                        picam.start()
-                    except Exception as e:
-                        LOGGER.error("AF cooler: camera start failed: %s", e)
-                if not getattr(picam, "is_recording", False):
-                    bitrate = getattr(self._cam, "mjpeg_bitrate", 10000000)
-                    mode_info = getattr(self._cam, "streaming_modes", {}).get(
-                        getattr(self._cam, "streaming_mode", "default")
-                    )
-                    use_lores = (
-                            mode_info is not None
-                            and getattr(mode_info, "use_lores_as_preview", False)
-                    )
-                    stream_name = "lores" if use_lores else "main"
-                    enc1 = MJPEGEncoder(bitrate)
-                    try:
-                        picam.start_recording(
-                            enc1,
-                            PicameraStreamOutput(
-                                self._cam.mjpeg_stream, enc1
-                            ),
-                            name=stream_name,
+            if getattr(self, "_AF_BUSY", False):
+                return
+            try:
+                with self._cam._streaming_picamera() as picam:
+                    if not picam.started:
+                        try:
+                            picam.start()
+                        except Exception as e:
+                            LOGGER.error(
+                                "AF cooler: camera start failed: %s", e)
+                    if not getattr(picam, "is_recording", False):
+                        bitrate = getattr(
+                            self._cam, "mjpeg_bitrate", 10000000
                         )
+                        mode_info = getattr(
+                            self._cam, "streaming_modes", {}
+                        ).get(getattr(self._cam, "streaming_mode", "default"))
+                        use_lores = (
+                                mode_info is not None
+                                and getattr(
+                            mode_info, "use_lores_as_preview", False
+                        )
+                        )
+                        stream_name = "lores" if use_lores else "main"
+                        enc1 = MJPEGEncoder(bitrate)
+                        try:
+                            picam.start_recording(
+                                enc1,
+                                PicameraStreamOutput(
+                                    self._cam.mjpeg_stream, enc1
+                                ),
+                                name=stream_name,
+                            )
+                        except Exception as e:
+                            LOGGER.error(
+                                "AF cooler: main encoder start failed: %s", e)
+                        enc2 = MJPEGEncoder(100000000)
+                        try:
+                            picam.start_encoder(
+                                enc2,
+                                PicameraStreamOutput(
+                                    self._cam.lores_mjpeg_stream, enc2
+                                ),
+                                name="lores",
+                            )
+                        except Exception as e:
+                            LOGGER.error(
+                                "AF cooler: lores encoder start failed: %s", e)
+                    try:
+                        picam.set_controls({"FrameRate": 20.0})
+                        _log("COOL fps=20 enc=on")
                     except Exception as e:
                         LOGGER.error(
-                            "AF cooler: main encoder start failed: %s", e)
-                    enc2 = MJPEGEncoder(100000000)
-                    try:
-                        picam.start_encoder(
-                            enc2,
-                            PicameraStreamOutput(
-                                self._cam.lores_mjpeg_stream, enc2
-                            ),
-                            name="lores",
-                        )
-                    except Exception as e:
-                        LOGGER.error(
-                            "AF cooler: lores encoder start failed: %s", e)
-                try:
-                    picam.set_controls({"FrameRate": 20.0})
-                    _log("COOL fps=20 enc=on")
-                except Exception as e:
-                    LOGGER.error("AF cooler: fps restore failed: %s", e)
-        except Exception as e:
-            LOGGER.error("AF cooler failed: %s", e)
-        reg = type(self)._LAST_REGIME
-        if not reg:
-            _log("COOL regime skip: no calibrated base known")
-            return
-        try:
-            rb = self._cam.restore_calibration_raw()
-            g2 = float(rb["gain"])
-            e2 = int(rb["exposure"])
-            ok = abs(g2 - reg[0]) < 0.05 and abs(e2 - int(reg[1])) <= 2
-            _log(
-                f"COOL regime g={reg[0]:.2f} e={reg[1]} "
-                f"readback=({g2:.2f},{e2}) verify={'ok' if ok else 'MISMATCH'}"
-            )
-        except Exception:
-            LOGGER.warning("AF cooler: regime restore failed", exc_info=True)
+                            "AF cooler: fps restore failed: %s", e)
+            except Exception as e:
+                LOGGER.error("AF cooler failed: %s", e)
+            if getattr(self, "_AF_BUSY", False):
+                _log("COOL regime abort: AF started mid-cool")
+                return
+            reg = type(self)._LAST_REGIME
+            if not reg:
+                _log("COOL regime skip: no calibrated base known")
+                return
+            try:
+                rb = self._cam.restore_calibration_raw()
+                g2 = float(rb["gain"])
+                e2 = int(rb["exposure"])
+                ok = abs(g2 - reg[0]) < 0.05 and abs(
+                    e2 - int(reg[1])
+                ) <= 2
+                _log(
+                    f"COOL regime g={reg[0]:.2f} e={reg[1]} "
+                    f"readback=({g2:.2f},{e2}) "
+                    f"verify={'ok' if ok else 'MISMATCH'}"
+                )
+            except Exception:
+                LOGGER.warning(
+                    "AF cooler: regime restore failed", exc_info=True
+                )
+        finally:
+            type(self)._COOLING = False
+            _ev = type(self)._COOL_DONE
+            if _ev is not None:
+                _ev.set()
 
     def _park(self, monitor: StreamSharpnessMonitor, target: float, mark: int):
         """Two-stage park: fast to 30u short, then creep the last 30u at
@@ -799,20 +826,146 @@ class SmoothAutofocusThing(lt.Thing):
         )
         return self._stage_z()
 
-    def _rest_static(self, monitor: StreamSharpnessMonitor) -> float:
+    def _rest_static(
+            self, monitor: StreamSharpnessMonitor, cap_s: float = 2.0
+    ) -> float:
+        """Settled rest sharpness: median of a 12-frame window, repeated
+        until two consecutive windows agree within 4%% (plateau) or the
+        cap expires. Motion-arrival gated, never a fixed sleep."""
         m = len(monitor.times)
-        monitor.wait_frames(4, m, timeout=0.5)
-        post = monitor.frames_since(m)[-4:]
-        return (
-            statistics.median([f[2] for f in post])
-            if len(post) >= 3 else 0.0
-        )
+        prev = None
+        t_end = time.monotonic() + cap_s
+        while True:
+            monitor.wait_frames(12, m, timeout=max(0.15, t_end - time.monotonic()))
+            win = monitor.frames_since(m)[-12:]
+            if len(win) < 8:
+                break
+            med = statistics.median([f[2] for f in win])
+            if (
+                prev is not None and max(med, prev, 1.0) < 1.05 * min(med, prev)
+            ) or time.monotonic() >= t_end:
+                return med
+            prev = med
+            m = len(monitor.times)
+        return prev if prev is not None else 0.0
+
+    def _refine_landing(
+            self, monitor: StreamSharpnessMonitor, park_z: float
+    ) -> tuple:
+        """Rest-truth arbiter after the park: banked direct jump when
+        known, else +-12u probes with one +-24u extension; 16-frame
+        medians, +8% to accept a step. Skips entirely when the landing
+        already reads >=200 (clearly focused in scan regime)."""
+        s0 = self._rest_static(monitor)
+        if s0 >= 200.0:
+            _log("REFINE skip: landing sharp (%.0f)" % s0)
+            return park_z, s0
+        best_z, best_s = park_z, s0
+        probes = 0
+        dz = type(self)._REFINE_DZ
+        if dz is not None and abs(dz) >= 6.0:
+            self._sync_move(
+                monitor, park_z + dz, _PARK_CREEP,
+                len(monitor.times), labeled=False,
+            )
+            zr = self._stage_z()
+            s1 = self._rest_static(monitor)
+            probes = 1
+            _log(
+                "REFINE banked dz=%.1f z=%.1f s=%.0f prev=%.0f"
+                % (dz, zr, s1, best_s)
+            )
+            if s1 > best_s * 1.08:
+                best_z, best_s = zr, s1
+                type(self)._REFINE_HIST.append(dz)
+                del type(self)._REFINE_HIST[:-5]
+            else:
+                self._sync_move(
+                    monitor, best_z, _PARK_CREEP,
+                    len(monitor.times), labeled=False,
+                )
+                best_z = self._stage_z()
+                vdz = -24.0 if dz > 0 else 24.0
+                self._sync_move(
+                    monitor, best_z + vdz, _PARK_CREEP,
+                    len(monitor.times), labeled=False,
+                )
+                zr = self._stage_z()
+                s1 = self._rest_static(monitor)
+                _log(
+                    "REFINE scout %+.0f z=%.1f s=%.0f prev=%.0f"
+                    % (vdz, zr, s1, best_s)
+                )
+                if s1 > best_s * 1.08:
+                    best_z, best_s = zr, s1
+                    type(self)._REFINE_HIST.append(vdz)
+                    del type(self)._REFINE_HIST[:-5]
+                    self._sync_move(
+                        monitor, best_z + (12.0 if vdz > 0 else -12.0),
+                        _PARK_CREEP, len(monitor.times), labeled=False,
+                    )
+                    zr = self._stage_z()
+                    s1 = self._rest_static(monitor)
+                    _log(
+                        "REFINE climb z=%.1f s=%.0f prev=%.0f"
+                        % (zr, s1, best_s)
+                    )
+                    if s1 > best_s * 1.08:
+                        best_z, best_s = zr, s1
+                        type(self)._REFINE_HIST.append(
+                            12.0 if vdz > 0 else -12.0
+                        )
+                        del type(self)._REFINE_HIST[:-5]
+                    else:
+                        self._sync_move(
+                            monitor, best_z, _PARK_CREEP,
+                            len(monitor.times), labeled=False,
+                        )
+                        best_z = self._stage_z()
+        if probes == 0:
+            vdz = 24.0
+            self._sync_move(
+                monitor, best_z + vdz, _PARK_CREEP,
+                len(monitor.times), labeled=False,
+            )
+            zr = self._stage_z()
+            s1 = self._rest_static(monitor)
+            probes = 1
+            _log(
+                "REFINE k=1 z=%.1f s=%.0f prev=%.0f"
+                % (zr, s1, best_s)
+            )
+            if s1 > best_s * 1.08:
+                best_z, best_s = zr, s1
+                type(self)._REFINE_HIST.append(vdz)
+                del type(self)._REFINE_HIST[:-5]
+            else:
+                self._sync_move(
+                    monitor, best_z, _PARK_CREEP,
+                    len(monitor.times), labeled=False,
+                )
+                best_z = self._stage_z()
+        if abs(best_z - park_z) > 0.5:
+            bank = sorted(type(self)._REFINE_HIST)
+            if bank:
+                med = bank[len(bank) // 2]
+                type(self)._REFINE_DZ = med
+                self._save_cal("refine_dz", med)
+                _log("REFINE bank dz=%.1f n=%d" % (med, len(bank)))
+            self._sync_move(
+                monitor, best_z, _PARK_CREEP,
+                len(monitor.times), labeled=False,
+            )
+            best_z = self._stage_z()
+            best_s = self._rest_static(monitor)
+        return best_z, best_s
 
     def _revert_if_worse(
-            self, monitor: StreamSharpnessMonitor, z0: float, start_s: float
+            self, monitor: StreamSharpnessMonitor, z0: float,
+            start_s: float, land_z: float,
     ):
         land_s = self._rest_static(monitor)
-        if start_s < 30.0 or land_s >= 0.9 * start_s:
+        if start_s < 30.0 or land_s >= 0.7 * start_s:
             _log(
                 "LAND start=%.0f land=%.0f verdict=keep"
                 % (start_s, land_s)
@@ -827,11 +980,21 @@ class SmoothAutofocusThing(lt.Thing):
         )
         rev_s = self._rest_static(monitor)
         zr = self._stage_z()
+        if rev_s > land_s:
+            _log(
+                "REVERTED z=%.2f static=%.0f (start=%.0f land=%.0f)"
+                % (zr, rev_s, start_s, land_s)
+            )
+            return zr
         _log(
-            "REVERTED z=%.2f static=%.0f (start=%.0f)"
-            % (zr, rev_s, start_s)
+            "REVERT-REFUSED z0=%.0f <= land=%.0f, returning to landing"
+            % (rev_s, land_s)
         )
-        return zr
+        self._sync_move(
+            monitor, land_z, _PARK_VELOCITY, len(monitor.times),
+            labeled=False,
+        )
+        return self._stage_z()
 
     def _load_cal(self) -> None:
         try:
@@ -854,6 +1017,30 @@ class SmoothAutofocusThing(lt.Thing):
                 except (TypeError, ValueError):
                     pass
             a = float(d.get("accel") or 0.0)
+            tf = d.get("tau_far")
+            if tf is not None:
+                try:
+                    tf = float(tf)
+                    if 0.0 < tf < 0.5:
+                        type(self)._TAU_FAR = tf
+                except (TypeError, ValueError):
+                    pass
+            tt = d.get("tau_tiny")
+            if tt is not None:
+                try:
+                    tt = float(tt)
+                    if 0.0 < tt < 0.5:
+                        type(self)._TAU_TINY = tt
+                except (TypeError, ValueError):
+                    pass
+            rd = d.get("refine_dz")
+            if rd is not None:
+                try:
+                    rd = float(rd)
+                    if 0.0 < abs(rd) <= 100.0:
+                        type(self)._REFINE_DZ = rd
+                except (TypeError, ValueError):
+                    pass
             if 15000.0 < a < 120000.0:
                 type(self)._CAL_ACCEL = a
                 _log(f"CALACCEL loaded {a:.0f}")
@@ -1015,6 +1202,8 @@ class SmoothAutofocusThing(lt.Thing):
             LOGGER.warning("AF regime set failed", exc_info=True)
             _log("AFREGIME SETFAIL")
 
+        m_settle = len(monitor.times)
+        monitor.wait_frames(16, m_settle, timeout=0.25)
         pre = monitor.frames_since(0)[-4:]
         static_med = (
             statistics.median([f[2] for f in pre]) if len(pre) >= 3 else 0.0
@@ -1086,7 +1275,9 @@ class SmoothAutofocusThing(lt.Thing):
             )
             corr = type(self)._CORR or {}
             tau_c = 0.0
-            if corr.get("v"):
+            if type(self)._TAU_FAR is not None:
+                tau_c = type(self)._TAU_FAR * far_v
+            elif corr.get("v"):
                 tau_c = float(corr["du"]) / float(corr["v"]) * far_v
             if tau_c:
                 mode += f"|{tag}corr{tau_c:.0f}"
@@ -1145,7 +1336,7 @@ class SmoothAutofocusThing(lt.Thing):
                 type(self)._CAL_FWHM if type(self)._CAL_CONTRAST else None
             )
             span_h = max(
-                60.0, min(_TINY_SPAN, (fwhm * 1.25) if fwhm else 60.0)
+                95.0, min(_TINY_SPAN, (fwhm * 1.25) if fwhm else 95.0)
             )
             tiny_lo = max(claw_z - span_h, min(leg_a, leg_b))
             tiny_hi = min(claw_z + span_h, max(leg_a, leg_b))
@@ -1156,18 +1347,23 @@ class SmoothAutofocusThing(lt.Thing):
             )
             tiny_mark = len(monitor.times)
             self._sync_move(
-                monitor, tiny_hi, _PARK_VELOCITY, tiny_mark, labeled=False
+                monitor, tiny_hi + 60.0, _PARK_VELOCITY, tiny_mark,
+                labeled=False,
+            )
+            tiny_markA = len(monitor.times)
+            self._sync_move(
+                monitor, tiny_hi, _PARK_CREEP, tiny_markA, labeled=False
             )
             tiny_mark2 = len(monitor.times)
             traj3, frames3 = self._sync_move(
                 monitor, tiny_lo, tiny_v, tiny_mark2
             )
             corr = type(self)._CORR or {}
-            tau_t = (
-                float(corr["du"]) / float(corr["v"]) * tiny_v
-                if corr.get("v")
-                else 0.0
-            )
+            tau_t = 0.0
+            if type(self)._TAU_TINY is not None:
+                tau_t = type(self)._TAU_TINY * tiny_v
+            elif corr.get("v"):
+                tau_t = float(corr["du"]) / float(corr["v"]) * tiny_v
             if tau_t:
                 mode += f"|tinycorr{tau_t:.0f}"
             tiny_pts = self._label_leg(
@@ -1214,9 +1410,17 @@ class SmoothAutofocusThing(lt.Thing):
                     type(self)._CAL_FWHM = fit.fwhm
                     self._save_cal("fwhm_u", fit.fwhm)
                     mode += f"|fwhm{fit.fwhm:.1f}"
-                park_z = self._park(monitor, fit.peak, len(monitor.times))
+                park_z = self._park(
+                    monitor,
+                    fit.peak + (type(self)._REFINE_DZ or 0.0),
+                    len(monitor.times),
+                )
                 mode += f"|park{park_z:.1f}"
-                rev = self._revert_if_worse(monitor, z0, static_med)
+                park_z, _rs = self._refine_landing(monitor, park_z)
+                mode += f"|refine{park_z:.1f}"
+                rev = self._revert_if_worse(
+                    monitor, z0, static_med, park_z
+                )
                 if rev is not None:
                     park_z = rev
                     mode += "|reverted"
@@ -1271,6 +1475,9 @@ class SmoothAutofocusThing(lt.Thing):
         except Exception:
             prev_exp = prev_gain = None
         type(self)._AF_BUSY = True
+        _cool_ev = type(self)._COOL_DONE
+        if _cool_ev is not None and type(self)._COOLING:
+            _cool_ev.wait(timeout=5.0)
         self._cancel_cooler()
         try:
             if hasattr(self._stage, "set_homed"):
