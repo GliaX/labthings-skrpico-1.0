@@ -137,13 +137,9 @@ class StreamSharpnessMonitor:
 
 
 class _EncoderBurst:
-    """Throttle sensor fps for a high-fps metric burst, restore after.
-
-    The camera lives in crop990; the burst stops the encoders (nobody
-    consumes the UI stream mid-AF) and the sensor stays at the metric
-    rate across runs — restoring a lower FrameRate forces a sensor
-    re-clock (~0.4s) on the next run, so it is deliberately not done.
-    Restore restarts the encoders only.
+    """Stop both MJPEG encoders (main + lores) for the AF burst so the
+    metric gets the full frame path at 120fps; restore main after.
+    Preview is dark for the ~5s of a run — that is by design.
     """
 
     def __init__(self, camera) -> None:
@@ -152,55 +148,53 @@ class _EncoderBurst:
     def __enter__(self) -> "_EncoderBurst":
         try:
             with self._cam._streaming_picamera() as picam:
-                if picam.started:
+                enc = getattr(picam, "encoder", None)
+                if enc is not None:
                     try:
                         picam.stop_encoder()
-                        _log("BURST stop_encoder t=%.3f" % (time.monotonic(),))
                     except Exception:
-                        return self
-        except Exception:
-            pass
+                        pass
+                try:
+                    picam.stop_encoder("lores")
+                except Exception:
+                    pass
+        except Exception as e:
+            LOGGER.error("AF burst: lores switch failed: %s", e)
         return self
 
     def __exit__(self, *exc) -> bool:
         try:
             with self._cam._streaming_picamera() as picam:
-                mode_info = getattr(self._cam, "streaming_modes", {}).get(
-                    getattr(self._cam, "streaming_mode", "default")
-                )
-                use_lores = (
-                        mode_info is not None
-                        and getattr(mode_info, "use_lores_as_preview", False)
-                )
-                stream_name = "lores" if use_lores else "main"
                 if not picam.started:
                     try:
                         picam.start()
                     except Exception as e:
                         LOGGER.error("AF burst: camera start failed: %s", e)
-                bitrate = getattr(self._cam, "mjpeg_bitrate", 10000000)
-                enc1 = MJPEGEncoder(bitrate)
-                try:
-                    picam.start_recording(
-                        enc1,
-                        PicameraStreamOutput(
-                            self._cam.mjpeg_stream, enc1
-                        ),
-                        name=stream_name,
+                if getattr(picam, "encoder", None) is None:
+                    bitrate = getattr(self._cam, "mjpeg_bitrate", 10000000)
+                    mode_info = getattr(
+                        self._cam, "streaming_modes", {}
+                    ).get(getattr(self._cam, "streaming_mode", "default"))
+                    use_lores = (
+                            mode_info is not None
+                            and getattr(
+                        mode_info, "use_lores_as_preview", False
                     )
-                except Exception as e:
-                    LOGGER.error("AF burst: main encoder restore failed: %s", e)
-                enc2 = MJPEGEncoder(100000000)
-                try:
-                    picam.start_encoder(
-                        enc2,
-                        PicameraStreamOutput(
-                            self._cam.lores_mjpeg_stream, enc2
-                        ),
-                        name="lores",
                     )
-                except Exception as e:
-                    LOGGER.error("AF burst: lores encoder restore failed: %s", e)
+                    stream_name = "lores" if use_lores else "main"
+                    enc1 = MJPEGEncoder(bitrate)
+                    try:
+                        picam.start_recording(
+                            enc1,
+                            PicameraStreamOutput(
+                                self._cam.mjpeg_stream, enc1
+                            ),
+                            name=stream_name,
+                        )
+                    except Exception as e:
+                        LOGGER.error(
+                            "AF burst: encoder restore failed: %s", e
+                        )
         except Exception as e:
             LOGGER.error("AF burst: camera restore failed: %s", e)
         return False
@@ -425,21 +419,18 @@ class SmoothAutofocusThing(lt.Thing):
             if poll_stop is not None:
                 poll_stop()
         self._last_hw = target
-        # grace for the terminal push: bounded by push arrival, not clock -
-        # wait only until the first sample with v==0 shows up (the move's
-        # own completion push). Cap at 2x nominal move time as a bound.
+        # Certify at data arrival: klippy pushes motion updates every ~8ms;
+        # if the terminal push's z missed ztol (one tick of travel) or got
+        # skipped, certify from a one-shot query the moment we see v==0
+        # data instead of burning the grace cap.
         grace_end = time.monotonic() + seconds * 2.0 + 0.2
         marker = _marker_seen()
+        query_state = getattr(self._stage, "query_motion_state", None)
         while marker is None and time.monotonic() < grace_end:
-            if motion_wait is None:
-                break
-            motion_wait(timeout=max(0.02, grace_end - time.monotonic()))
+            if motion_wait is not None:
+                motion_wait(timeout=max(0.02, grace_end - time.monotonic()))
             marker = _marker_seen()
-        if marker is None:
-            query_state = getattr(
-                self._stage, "query_motion_state", None
-            )
-            if query_state is not None:
+            if marker is None and query_state is not None:
                 try:
                     st = query_state()
                     lp = st.get("live_position")
@@ -449,38 +440,12 @@ class SmoothAutofocusThing(lt.Thing):
                         v_now = (
                             float(v_raw) if v_raw is not None else None
                         )
-                        settle_t = time.monotonic() + 2.0
-                        while v_now is not None and abs(v_now) >= 0.5:
-                            if time.monotonic() >= settle_t:
-                                break
-                            time.sleep(0.1)
-                            st = query_state()
-                            lp = st.get("live_position")
-                            v_raw = st.get("live_velocity")
-                            if lp is None:
-                                break
-                            z_now = float(lp[2])
-                            v_now = (
-                                float(v_raw)
-                                if v_raw is not None
-                                else None
-                            )
-                        z_ok = abs(z_now - (target + dz0)) <= ztol
-                        v_ok = v_now is None or abs(v_now) < 0.5
-                        if v_ok and not z_ok:
-                            self._frame_offset = z_now - target
-                            dz0 = self._frame_offset
-                            z_ok = abs(z_now - (target + dz0)) <= ztol
-                            _log(
-                                f"FRAME LEARN offset={dz0:.2f} "
-                                f"(live {z_now:.2f} vs target {target:.1f})"
-                            )
-                        if z_ok and v_ok:
-                            et = (
-                                    time.monotonic()
-                                    + getattr(
+                        if (
+                                (v_now is None or abs(v_now) < 0.5)
+                                and abs(z_now - (target + dz0)) <= ztol
+                        ):
+                            et = time.monotonic() + getattr(
                                 self._stage, "_et_handshake", 0.0
-                            )
                             )
                             marker = (
                                 et, z_now,
@@ -489,14 +454,72 @@ class SmoothAutofocusThing(lt.Thing):
                                 et,
                             )
                             _log(
-                                f"LEG QUIET-CERTIFY target={target:.1f} "
-                                f"z={z_now:.2f} v={v_now} "
-                                f"t={time.time():.3f}"
+                                f"LEG FAST-CERTIFY target={target:.1f} "
+                                f"z={z_now:.2f} t={time.time():.3f}"
                             )
                 except Exception:
                     LOGGER.warning(
-                        "quiet-end motion query failed", exc_info=True
+                        "fast-certify motion query failed", exc_info=True
                     )
+        if marker is None:
+            try:
+                st = query_state() if query_state is not None else {}
+                lp = st.get("live_position")
+                v_raw = st.get("live_velocity")
+                if lp is not None:
+                    z_now = float(lp[2])
+                    v_now = (
+                        float(v_raw) if v_raw is not None else None
+                    )
+                    settle_end = time.monotonic() + 2.0
+                    while v_now is not None and abs(v_now) >= 0.5:
+                        if time.monotonic() >= settle_end:
+                            break
+                        if motion_wait is not None:
+                            motion_wait(timeout=0.1)
+                        st = query_state()
+                        lp = st.get("live_position")
+                        v_raw = st.get("live_velocity")
+                        if lp is None:
+                            break
+                        z_now = float(lp[2])
+                        v_now = (
+                            float(v_raw)
+                            if v_raw is not None
+                            else None
+                        )
+                    z_ok = abs(z_now - (target + dz0)) <= ztol
+                    v_ok = v_now is None or abs(v_now) < 0.5
+                    if v_ok and not z_ok:
+                        self._frame_offset = z_now - target
+                        dz0 = self._frame_offset
+                        z_ok = abs(z_now - (target + dz0)) <= ztol
+                        _log(
+                            f"FRAME LEARN offset={dz0:.2f} "
+                            f"(live {z_now:.2f} vs target {target:.1f})"
+                        )
+                    if z_ok and v_ok:
+                        et = (
+                                time.monotonic()
+                                + getattr(
+                            self._stage, "_et_handshake", 0.0
+                        )
+                        )
+                        marker = (
+                            et, z_now,
+                            v_now if v_now is not None else 0.0,
+                            0.0 if v_now is not None else 1.0,
+                            et,
+                        )
+                        _log(
+                            f"LEG QUIET-CERTIFY target={target:.1f} "
+                            f"z={z_now:.2f} v={v_now} "
+                            f"t={time.time():.3f}"
+                        )
+            except Exception:
+                LOGGER.warning(
+                    "quiet-end motion query failed", exc_info=True
+                )
         if marker is None:
             _log(
                 f"LEG TELESTALL target={target:.1f} "
@@ -813,18 +836,148 @@ class SmoothAutofocusThing(lt.Thing):
     def _park(self, monitor: StreamSharpnessMonitor, target: float, mark: int):
         """Two-stage park: fast to 30u short, then creep the last 30u at
         low speed approaching from one side — no overshoot, no backlash
-        flip, park lands where tiny fit said."""
+        flip, park lands where tiny fit said. One submission, one
+        certification for the pair."""
         cur = self._stage_z()
         sgn = 1.0 if target >= cur else -1.0
         near = target - sgn * 30.0
         if abs(near - cur) > 1.0:
-            self._sync_move(
-                monitor, near, _PARK_VELOCITY, mark, labeled=False
+            self._sync_move_pair(
+                monitor, near, _PARK_VELOCITY, target, _PARK_CREEP
             )
-        self._sync_move(
-            monitor, target, _PARK_CREEP, len(monitor.times), labeled=False
-        )
+        else:
+            self._sync_move(
+                monitor, target, _PARK_CREEP, len(monitor.times),
+                labeled=False,
+            )
         return self._stage_z()
+
+    def _sync_move_pair(
+            self, monitor: StreamSharpnessMonitor,
+            z_mid: float, v_mid: float, z_end: float, v_end: float,
+    ):
+        """Two moves, one gcode submission, one certification at the pair
+        end: the terminal sample of the SECOND move certifies the chain.
+        Leg windows are still sliced per move by telemetry timestamps, so
+        labels stay per-leg."""
+        st = self._stage
+        if getattr(st, "motion_since", None) is None:
+            self._sync_move(monitor, z_mid, v_mid, len(monitor.times),
+                            labeled=False)
+            return self._sync_move(
+                monitor, z_end, v_end, len(monitor.times)
+            )
+        cur = self._last_hw
+        d1 = z_mid - cur
+        d2 = z_end - z_mid
+        if abs(d1) < 0.5 and abs(d2) < 0.5:
+            return None, []
+        mark = len(monitor.times)
+        clear = getattr(st, "clear_motion_history", None)
+        if clear is not None:
+            clear()
+        poll_start = getattr(st, "_leg_poller_start", None)
+        poll_stop = getattr(st, "_leg_poller_stop_fn", None)
+        if poll_start is not None:
+            poll_start()
+        try:
+            s1 = abs(d1) / v_mid
+            s2 = abs(d2) / v_end
+            if getattr(st, "axis_inverted", {}).get("z", False):
+                d1, d2 = -d1, -d2
+            sp1 = abs(d1) / s1 if s1 > 0 else 0.0
+            sp2 = abs(d2) / s2 if s2 > 0 else 0.0
+            script = "G91\n"
+            if abs(d1) >= 0.5:
+                script += (
+                    f"G1 Z{d1:.3f} S{sp1:.6f} F{sp1 * 60.0:.3f}\n"
+                )
+            if abs(d2) >= 0.5:
+                script += (
+                    f"G1 Z{d2:.3f} S{sp2:.6f} F{sp2 * 60.0:.3f}\n"
+                )
+            t0 = time.monotonic()
+            st._send_gcode_script(st._client, script)
+            total = s1 + s2
+            grace_end = time.monotonic() + total * 2.0 + 0.2
+            motion_wait = getattr(st, "motion_wait", None)
+            motion_since = st.motion_since
+            ztol = max(2.0, 0.005 * abs(d2))
+            dz0 = float(getattr(self, "_frame_offset", 0.0))
+            tgt2 = z_end + dz0
+            marker = None
+            query_state = getattr(st, "query_motion_state", None)
+            while marker is None and time.monotonic() < grace_end:
+                if motion_wait is not None:
+                    motion_wait(timeout=max(
+                        0.02, grace_end - time.monotonic()
+                    ))
+                for s in motion_since(0):
+                    if (
+                            len(s) > 4
+                            and s[4] is not None
+                            and abs(s[2]) < 0.5
+                            and not s[3]
+                            and abs(s[1] - tgt2) <= ztol
+                    ):
+                        marker = s
+                        break
+                if marker is None and query_state is not None:
+                    try:
+                        q = query_state()
+                        lp = q.get("live_position")
+                        v_raw = q.get("live_velocity")
+                        if lp is not None:
+                            z_now = float(lp[2])
+                            v_now = (
+                                float(v_raw)
+                                if v_raw is not None else None
+                            )
+                            if (
+                                    v_now is None or abs(v_now) < 0.5
+                            ) and abs(z_now - tgt2) <= ztol:
+                                et = time.monotonic() + getattr(
+                                    st, "_et_handshake", 0.0
+                                )
+                                marker = (
+                                    et, z_now,
+                                    v_now if v_now is not None else 0.0,
+                                    0.0 if v_now is not None else 1.0,
+                                    et,
+                                )
+                    except Exception:
+                        pass
+            self._last_hw = z_end
+            if marker is None:
+                _log(f"PAIR TELESTALL z_end={z_end:.1f} "
+                     f"t={time.time():.3f}")
+                self._telestall_run = True
+                return None, []
+            m_et = marker[4]
+            raw = [
+                s for s in motion_since(0)
+                if len(s) > 4 and s[4] is not None and s[4] <= m_et
+            ]
+            raw.sort(key=lambda s: s[4])
+            # split the trajectory at the velocity boundary between the
+            # two segments: last |v| <= v_mid*1.3 before the final ramp
+            split_i = 0
+            for i, s in enumerate(raw):
+                if abs(s[2]) <= v_mid * 1.3 and s[4] < m_et - s2 * 0.5:
+                    split_i = i
+            hoff_fn = getattr(st, "handshake_offset", None)
+            hoff = hoff_fn() if hoff_fn is not None else None
+            if hoff is not None:
+                traj1 = [(s[4] - hoff, s[1]) for s in raw[:split_i + 1]]
+                traj2 = [(s[4] - hoff, s[1]) for s in raw[split_i:]]
+            else:
+                traj1 = [(s[0], s[1]) for s in raw[:split_i + 1]]
+                traj2 = [(s[0], s[1]) for s in raw[split_i:]]
+            frames = list(monitor.frames_since(mark))
+            return (traj1, traj2), frames
+        finally:
+            if poll_stop is not None:
+                poll_stop()
 
     def _rest_static(
             self, monitor: StreamSharpnessMonitor, cap_s: float = 2.0
@@ -842,7 +995,7 @@ class SmoothAutofocusThing(lt.Thing):
                 break
             med = statistics.median([f[2] for f in win])
             if (
-                prev is not None and max(med, prev, 1.0) < 1.05 * min(med, prev)
+                    prev is not None and max(med, prev, 1.0) < 1.05 * min(med, prev)
             ) or time.monotonic() >= t_end:
                 return med
             prev = med
@@ -1345,14 +1498,9 @@ class SmoothAutofocusThing(lt.Thing):
                 _TINY_MIN_V,
                 min(_TINY_VELOCITY, FPS * f_ref / 5.0),
             )
-            tiny_mark = len(monitor.times)
-            self._sync_move(
-                monitor, tiny_hi + 60.0, _PARK_VELOCITY, tiny_mark,
-                labeled=False,
-            )
-            tiny_markA = len(monitor.times)
-            self._sync_move(
-                monitor, tiny_hi, _PARK_CREEP, tiny_markA, labeled=False
+            self._sync_move_pair(
+                monitor,
+                tiny_hi + 60.0, _PARK_VELOCITY, tiny_hi, _PARK_CREEP,
             )
             tiny_mark2 = len(monitor.times)
             traj3, frames3 = self._sync_move(
