@@ -253,11 +253,18 @@ class StreamingPiCamera2(BaseCamera, ABC):
     ## Persistent controls! These are settings
 
     _analogue_gain: float = 1.0
+    _raw_controls_held: bool = False
+    _scan_hold: bool = False
 
     @lt.setting
     def analogue_gain(self) -> float:
         """The Analogue gain applied by the camera sensor."""
-        if not self._setting_save_in_progress and self.streaming:
+        if (
+                not self._setting_save_in_progress
+                and self.streaming
+                and not self._raw_controls_held
+                and not self._scan_hold
+        ):
             with self._streaming_picamera() as cam:
                 cam_value = cam.capture_metadata()["AnalogueGain"]
             if cam_value != self._analogue_gain:
@@ -301,7 +308,12 @@ class StreamingPiCamera2(BaseCamera, ABC):
         When setting this property the camera will adjust the set value
         to the nearest allowed value that is lower than the current setting.
         """
-        if not self._setting_save_in_progress and self.streaming:
+        if (
+                not self._setting_save_in_progress
+                and self.streaming
+                and not self._raw_controls_held
+                and not self._scan_hold
+        ):
             with self._streaming_picamera() as cam:
                 cam_value = cam.capture_metadata()["ExposureTime"]
             if cam_value != self._exposure_time:

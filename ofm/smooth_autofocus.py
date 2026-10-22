@@ -768,7 +768,7 @@ class SmoothAutofocusThing(lt.Thing):
             if getattr(self, "_AF_BUSY", False):
                 return
             if _SCAN_MODE() or (
-                time.monotonic() - type(self)._LAST_SCAN_TS < 60.0
+                    time.monotonic() - type(self)._LAST_SCAN_TS < 60.0
             ):
                 _log("COOL skip: scan session active/recent")
                 return
@@ -1810,6 +1810,7 @@ class SmoothAutofocusThing(lt.Thing):
         type(self)._AF_BUSY = True
         if _SCAN_MODE():
             type(self)._LAST_SCAN_TS = time.monotonic()
+        self._cam._raw_controls_held = True
         _cool_ev = type(self)._COOL_DONE
         if _cool_ev is not None and type(self)._COOLING:
             _cool_ev.wait(timeout=5.0)
@@ -1917,6 +1918,8 @@ class SmoothAutofocusThing(lt.Thing):
                 self._cam.restore_calibration_raw()
             except Exception:
                 LOGGER.warning("Exposure/gain restore failed", exc_info=True)
+            finally:
+                self._cam._raw_controls_held = False
             try:
                 if hasattr(self._stage, "update_position"):
                     self._stage.update_position()
