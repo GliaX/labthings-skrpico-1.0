@@ -287,7 +287,7 @@ class _DwellRecordedMove(RecordedMove):
                 "steps_per_pixel estimate exploded; aborting to protect travel."
             )
         super().__call__(new_position)
-        time.sleep(2.0)
+        time.sleep(1.0)
 
 
 class CSMUncalibratedError(lt.exceptions.InvocationError):

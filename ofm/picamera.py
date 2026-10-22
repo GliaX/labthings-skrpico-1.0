@@ -697,9 +697,6 @@ class StreamingPiCamera2(BaseCamera, ABC):
                     self.lores_mjpeg_stream.stop()
                 LOGGER.info("Stopped MJPEG stream.")
 
-            # Adding a sleep to prevent camera getting confused by rapid commands
-            time.sleep(self._sensor_info.short_pause)
-
     @lt.action
     def discard_frames(self) -> None:
         """Discard frames so that the next frame captured is fresh."""
@@ -740,7 +737,7 @@ class StreamingPiCamera2(BaseCamera, ABC):
                 )
                 cam.configure(stream_config)
                 cam.start()
-                time.sleep(self._sensor_info.short_pause)
+                self.discard_frames()
                 yield cam
 
     @staticmethod
@@ -770,10 +767,10 @@ class StreamingPiCamera2(BaseCamera, ABC):
         with self._ensure_mode_for_capture(capture_mode_info) as cam:
             stream = capture_mode_info.stream_name
             fmt = (
-                cam.camera_configuration()[stream]["format"]
-                if stream in cam.camera_configuration()
-                else None
-            ) or ""
+                      cam.camera_configuration()[stream]["format"]
+                      if stream in cam.camera_configuration()
+                      else None
+                  ) or ""
             size = cam.camera_configuration()[stream]["size"]
             if "YUV420" in str(fmt):
                 arr = cam.capture_array(stream, wait=capture_mode_info.timeout)

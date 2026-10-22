@@ -485,9 +485,15 @@ class SmartStackMixin:
         af_params = settings.smart_stack_params
         images_to_save = max(1, af_params.images_to_save)
         step = af_params.stack_dz
-        self.as_workflow._autofocus.fast_autofocus(
-            dz=settings.autofocus_params.dz
+        scan_af = getattr(
+            self.as_workflow._autofocus, "scan_autofocus", None
         )
+        if scan_af is not None:
+            scan_af(span=0.0)
+        else:
+            self.as_workflow._autofocus.fast_autofocus(
+                dz=settings.autofocus_params.dz
+            )
         focus_height = self.as_workflow._stage.get_xyz_position()[2]
         if self.stack_sharp_set:
             half = step

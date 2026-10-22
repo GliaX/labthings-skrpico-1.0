@@ -41,9 +41,17 @@ _FAR_MEDIAN_BAR = 1.25
 _TINY_SPAN = 180.0
 _TINY_VELOCITY = 700.0
 _TINY_MIN_V = 100.0
+_SCAN_SPAN = 30.0
+_SCAN_LOCAL = threading.local()
 _PARK_VELOCITY = 9000.0
 _PARK_CREEP = 300.0
 _CAL_V_ACCEL = 4900.0
+
+
+def _SCAN_MODE() -> bool:
+    return bool(getattr(_SCAN_LOCAL, "mode", False))
+
+
 _MEDIAN_BAR = 1.6
 _EDGE_MARGIN = 0.12
 FPS = 120.0
@@ -332,6 +340,9 @@ class SmoothAutofocusThing(lt.Thing):
     _REFINE_HIST: list = []
     _last_leg_samples: list = []
     _CORR: dict = {}
+    _SCAN_LAST_Z: Optional[float] = None
+    _SCAN_FAILS: int = 0
+    _LAST_SCAN_TS: float = 0.0
 
     def _hw_steps_param(self, delta_hw):
         inv = getattr(self._stage, "axis_inverted", {}) or {}
@@ -756,6 +767,11 @@ class SmoothAutofocusThing(lt.Thing):
         try:
             if getattr(self, "_AF_BUSY", False):
                 return
+            if _SCAN_MODE() or (
+                time.monotonic() - type(self)._LAST_SCAN_TS < 60.0
+            ):
+                _log("COOL skip: scan session active/recent")
+                return
             held = getattr(self._cam, "stream_mode_held", False)
             mode = getattr(self._cam, "streaming_mode", "default")
             try:
@@ -995,11 +1011,14 @@ class SmoothAutofocusThing(lt.Thing):
                 poll_stop()
 
     def _rest_static(
-            self, monitor: StreamSharpnessMonitor, cap_s: float = 2.0
+            self, monitor: StreamSharpnessMonitor, cap_s: float | None = None
     ) -> float:
         """Settled rest sharpness: median of a 12-frame window, repeated
         until two consecutive windows agree within 4%% (plateau) or the
-        cap expires. Motion-arrival gated, never a fixed sleep."""
+        cap expires. Motion-arrival gated, never a fixed sleep. Cap
+        defaults to 2.0 s (button flow) or 0.2 s in scan flow."""
+        if cap_s is None:
+            cap_s = 0.2 if _SCAN_MODE() else 2.0
         m = len(monitor.times)
         prev = None
         t_end = time.monotonic() + cap_s
@@ -1360,14 +1379,17 @@ class SmoothAutofocusThing(lt.Thing):
             )
 
         try:
-            prev_gain_af = self._cam.analogue_gain
-            prev_exp_af = self._cam.exposure_time
-            if prev_exp_af:
-                _g, _e = _probe_regime(prev_gain_af, prev_exp_af)
-                self._cam.set_probe_controls_raw(_g, _e)
-                _log(f"AFREGIME g={_g} e={_e} (from {prev_gain_af}/{prev_exp_af})")
+            if _SCAN_MODE():
+                _log("AFREGIME scan: held by wrapper from saved base")
             else:
-                _log("AFREGIME skipped: no live exposure reading")
+                prev_gain_af = self._cam.analogue_gain
+                prev_exp_af = self._cam.exposure_time
+                if prev_exp_af:
+                    _g, _e = _probe_regime(prev_gain_af, prev_exp_af)
+                    self._cam.set_probe_controls_raw(_g, _e)
+                    _log(f"AFREGIME g={_g} e={_e} (from {prev_gain_af}/{prev_exp_af})")
+                else:
+                    _log("AFREGIME skipped: no live exposure reading")
         except Exception:
             LOGGER.warning("AF regime set failed", exc_info=True)
             _log("AFREGIME SETFAIL")
@@ -1390,6 +1412,9 @@ class SmoothAutofocusThing(lt.Thing):
         leg_b = cur - half_span
         if not type(self)._CAL_LOADED:
             self._load_cal()
+        if _SCAN_MODE():
+            return self._run_flow_scan(monitor, z0, static_med)
+
         if type(self)._CAL_ACCEL is None:
             far_v = _CAL_V_ACCEL
             mode += "|accelcal"
@@ -1502,103 +1527,11 @@ class SmoothAutofocusThing(lt.Thing):
 
         if best_hit is not None:
             claw_z = best_hit
-            fwhm = (
-                type(self)._CAL_FWHM if type(self)._CAL_CONTRAST else None
+            result = self._tiny_and_park(
+                monitor, claw_z, mode, z0, static_med, t0
             )
-            span_h = max(
-                95.0, min(_TINY_SPAN, (fwhm * 1.25) if fwhm else 95.0)
-            )
-            tiny_lo = max(claw_z - span_h, min(leg_a, leg_b))
-            tiny_hi = min(claw_z + span_h, max(leg_a, leg_b))
-            tiny_v = self.fine_sweep_velocity(fwhm)
-            self._sync_move_pair(
-                monitor,
-                tiny_hi + 60.0, _PARK_VELOCITY, tiny_hi, _PARK_CREEP,
-            )
-            tiny_mark2 = len(monitor.times)
-            traj3, frames3 = self._sync_move(
-                monitor, tiny_lo, tiny_v, tiny_mark2
-            )
-            corr = type(self)._CORR or {}
-            tau_t = 0.0
-            if type(self)._TAU_TINY is not None:
-                tau_t = type(self)._TAU_TINY * tiny_v
-            elif corr.get("v"):
-                tau_t = float(corr["du"]) / float(corr["v"]) * tiny_v
-            if tau_t:
-                mode += f"|tinycorr{tau_t:.0f}"
-            tiny_pts = self._label_leg(
-                frames3,
-                tiny_lo + tau_t,
-                tiny_hi + tau_t,
-                traj3,
-                tiny_v,
-            )
-            _dump_json("smooth_af_seekpts_tiny.json", {
-                "z": [q[0] for q in tiny_pts],
-                "s": [q[2] for q in tiny_pts],
-                "c": [q[1] for q in tiny_pts],
-                "p": [q[3] for q in tiny_pts],
-            })
-            gate = self._fit_gate(tiny_pts)
-            if gate is None and tiny_pts:
-                s_floor_t = sorted(q[2] for q in tiny_pts)[
-                    max(0, len(tiny_pts) * 3 // 10 - 1)
-                ]
-                t_arg = max(tiny_pts, key=lambda q: q[2])
-                if (
-                        t_arg[2] >= 1.25 * max(s_floor_t, 1e-9)
-                        and abs(t_arg[0] - claw_z) <= half_span
-                ):
-                    top_t = sorted(
-                        tiny_pts, key=lambda q: q[2], reverse=True
-                    )[: max(2, len(tiny_pts) // 5)]
-                    wsum_t = sum(q[2] for q in top_t)
-                    z_fit = (
-                        sum(q[0] * q[2] for q in top_t) / wsum_t
-                        if wsum_t > 0
-                        else t_arg[0]
-                    )
-                    mode += "|tiny_near"
-                    gate = (
-                        FitOutcome(ok=True, peak=z_fit, fwhm=None),
-                        t_arg[2],
-                    )
-            if gate is not None:
-                fit, best = gate
-                mode += f"|tiny_fit{fit.peak:.1f}"
-                if fit.fwhm is not None:
-                    type(self)._CAL_FWHM = fit.fwhm
-                    self._save_cal("fwhm_u", fit.fwhm)
-                    mode += f"|fwhm{fit.fwhm:.1f}"
-                park_z = self._park(
-                    monitor,
-                    fit.peak + (type(self)._REFINE_DZ or 0.0),
-                    len(monitor.times),
-                )
-                mode += f"|park{park_z:.1f}"
-                park_z, _rs = self._refine_landing(monitor, park_z)
-                mode += f"|refine{park_z:.1f}"
-                rev = self._revert_if_worse(
-                    monitor, z0, static_med, park_z
-                )
-                if rev is not None:
-                    park_z = rev
-                    mode += "|reverted"
-                self._save_last_focus(monitor, len(monitor.times), fit.peak)
-                return SmoothFocusResult(
-                    peak_z=park_z, mode=mode, fit=fit,
-                    curve=[
-                        CurvePoint(z=q[0], sharpness=q[2]) for q in tiny_pts
-                    ],
-                    elapsed_s=time.monotonic() - t0,
-                )
-            mode += "|tiny_fail"
-            _dump_json("smooth_af_finefail.json", {
-                "z": [q[0] for q in tiny_pts],
-                "s": [q[2] for q in tiny_pts],
-                "b": [q[1] for q in tiny_pts],
-            })
+            if result is not None:
+                return result
 
         mode += "|no_anchor_refuse"
         self._span_hint = 0.0
@@ -1606,6 +1539,225 @@ class SmoothAutofocusThing(lt.Thing):
         self._sync_move(monitor, z0, _PARK_VELOCITY, ret_mark, labeled=False)
         mode += f"|return{self._stage_z():.1f}"
         raise NoFocusFoundError(mode)
+
+    def _tiny_and_park(
+            self,
+            monitor: StreamSharpnessMonitor,
+            anchor: float,
+            mode: str,
+            z0: float,
+            static_med: float,
+            t0: float,
+            span: float | None = None,
+    ) -> Optional[SmoothFocusResult]:
+        """Generic tiny sweep around `anchor`: span ± around it at
+        fine_sweep_velocity, gaussian-gated fit, two-stage park, settled
+        verify, soft revert, mesh shift. Shared by the button flow (anchor
+        = claw hit, span = fwhm-derived) and the scan-only flow (anchor =
+        last focused z, span = caller-set)."""
+        fwhm = (
+            type(self)._CAL_FWHM if type(self)._CAL_CONTRAST else None
+        )
+        if span:
+            span_h = float(span)
+        else:
+            span_h = max(
+                95.0, min(_TINY_SPAN, (fwhm * 1.25) if fwhm else 95.0)
+            )
+        tiny_lo = anchor - span_h
+        tiny_hi = anchor + span_h
+        tiny_v = self.fine_sweep_velocity(fwhm)
+        self._sync_move_pair(
+            monitor,
+            tiny_hi + 60.0, _PARK_VELOCITY, tiny_hi, _PARK_CREEP,
+        )
+        tiny_mark2 = len(monitor.times)
+        traj3, frames3 = self._sync_move(
+            monitor, tiny_lo, tiny_v, tiny_mark2
+        )
+        corr = type(self)._CORR or {}
+        tau_t = 0.0
+        if type(self)._TAU_TINY is not None:
+            tau_t = type(self)._TAU_TINY * tiny_v
+        elif corr.get("v"):
+            tau_t = float(corr["du"]) / float(corr["v"]) * tiny_v
+        if tau_t:
+            mode += f"|tinycorr{tau_t:.0f}"
+        tiny_pts = self._label_leg(
+            frames3,
+            tiny_lo + tau_t,
+            tiny_hi + tau_t,
+            traj3,
+            tiny_v,
+        )
+        _dump_json("smooth_af_seekpts_tiny.json", {
+            "z": [q[0] for q in tiny_pts],
+            "s": [q[2] for q in tiny_pts],
+            "c": [q[1] for q in tiny_pts],
+            "p": [q[3] for q in tiny_pts],
+        })
+        gate = self._fit_gate(tiny_pts)
+        if gate is None and tiny_pts:
+            s_floor_t = sorted(q[2] for q in tiny_pts)[
+                max(0, len(tiny_pts) * 3 // 10 - 1)
+            ]
+            t_arg = max(tiny_pts, key=lambda q: q[2])
+            if (
+                    t_arg[2] >= 1.25 * max(s_floor_t, 1e-9)
+                    and abs(t_arg[0] - anchor) <= span_h
+            ):
+                top_t = sorted(
+                    tiny_pts, key=lambda q: q[2], reverse=True
+                )[: max(2, len(tiny_pts) // 5)]
+                wsum_t = sum(q[2] for q in top_t)
+                z_fit = (
+                    sum(q[0] * q[2] for q in top_t) / wsum_t
+                    if wsum_t > 0
+                    else t_arg[0]
+                )
+                mode += "|tiny_near"
+                gate = (
+                    FitOutcome(ok=True, peak=z_fit, fwhm=None),
+                    t_arg[2],
+                )
+        if gate is not None:
+            fit, best = gate
+            mode += f"|tiny_fit{fit.peak:.1f}"
+            if fit.fwhm is not None:
+                type(self)._CAL_FWHM = fit.fwhm
+                self._save_cal("fwhm_u", fit.fwhm)
+                mode += f"|fwhm{fit.fwhm:.1f}"
+            park_z = self._park(
+                monitor,
+                fit.peak + (type(self)._REFINE_DZ or 0.0),
+                len(monitor.times),
+            )
+            mode += f"|park{park_z:.1f}"
+            park_z, _rs = self._refine_landing(monitor, park_z)
+            mode += f"|refine{park_z:.1f}"
+            rev = self._revert_if_worse(
+                monitor, z0, static_med, park_z
+            )
+            if rev is not None:
+                park_z = rev
+                mode += "|reverted"
+            self._save_last_focus(monitor, len(monitor.times), fit.peak)
+            return SmoothFocusResult(
+                peak_z=park_z, mode=mode, fit=fit,
+                curve=[
+                    CurvePoint(z=q[0], sharpness=q[2]) for q in tiny_pts
+                ],
+                elapsed_s=time.monotonic() - t0,
+            )
+        mode += "|tiny_fail"
+        _dump_json("smooth_af_finefail.json", {
+            "z": [q[0] for q in tiny_pts],
+            "s": [q[2] for q in tiny_pts],
+            "b": [q[1] for q in tiny_pts],
+        })
+        return None
+
+    def _run_flow_scan(
+            self,
+            monitor: StreamSharpnessMonitor,
+            z0: float,
+            static_med: float,
+    ) -> SmoothFocusResult:
+        """Scan-only flow: anchor-stanced tiny sweep -> park -> settled
+        verify. Anchor = last focused z; on 2 consecutive gated misses it
+        falls back to one full-chain run to re-seed the anchor."""
+        mode = "scan"
+        t0 = time.monotonic()
+        span = float(
+            getattr(_SCAN_LOCAL, "span", 0.0) or _SCAN_SPAN
+        )
+        if type(self)._SCAN_LAST_Z is None:
+            type(self)._SCAN_LAST_Z = self._stage_z()
+        anchor = float(type(self)._SCAN_LAST_Z)
+        result = self._tiny_and_park(
+            monitor, anchor, mode, z0, static_med,
+            time.monotonic(), span,
+        )
+        if result is not None:
+            type(self)._SCAN_LAST_Z = float(result.peak_z)
+            type(self)._SCAN_FAILS = 0
+            return result
+        type(self)._SCAN_FAILS += 1
+        mode += f"|miss{type(self)._SCAN_FAILS}"
+        if type(self)._SCAN_FAILS < 2:
+            mode += "|held"
+            self._sync_move(
+                monitor, anchor, _PARK_VELOCITY,
+                len(monitor.times), labeled=False,
+            )
+            _log(f"SCANFLOW {mode}")
+            return SmoothFocusResult(
+                peak_z=self._stage_z(),
+                mode=mode,
+                fit=FitOutcome(ok=False, peak=anchor, fwhm=None),
+                curve=[],
+                elapsed_s=time.monotonic() - t0,
+            )
+        mode += "|reseed_full"
+        type(self)._SCAN_FAILS = 0
+        type(self)._SCAN_LAST_Z = None
+        self._span_hint = 0.0
+        ret_mark = len(monitor.times)
+        self._sync_move(monitor, z0, _PARK_VELOCITY, ret_mark, labeled=False)
+        try:
+            self._cam.restore_calibration_raw()
+            _log("SCANFLOW reseed: base regime restored for full chain")
+        except Exception:
+            LOGGER.warning("reseed base restore failed", exc_info=True)
+        _log(f"SCANFLOW {mode}")
+        try:
+            return self._run_flow_full_once(monitor)
+        except NoFocusFoundError as exc:
+            mode += f"|reseed_fail({exc})"
+            _log(f"SCANFLOW {mode}")
+            raise NoFocusFoundError(mode) from exc
+
+    def _run_flow_full_once(
+            self, monitor: StreamSharpnessMonitor
+    ) -> SmoothFocusResult:
+        """One full-chain run with scan mode suppressed."""
+        scan = getattr(_SCAN_LOCAL, "mode", False)
+        _SCAN_LOCAL.mode = False
+        try:
+            return self._run_flow(monitor)
+        finally:
+            _SCAN_LOCAL.mode = scan
+
+    @lt.action
+    def scan_autofocus(self, span: float = 0.0) -> SmoothFocusResult:
+        """Scan-only focus: anchor tiny sweep -> park -> settled verify.
+        span sets the sweep half-span in stage units (0 = default)."""
+        _SCAN_LOCAL.span = float(span)
+        _SCAN_LOCAL.mode = True
+        try:
+            return self.smooth_focus(self._scan_params())
+        except NoFocusFoundError as exc:
+            if "reseed_fail" in str(exc):
+                raise
+            raise NoFocusFoundError(
+                str(exc).replace("scan|", "", 1)
+            ) from exc
+        finally:
+            _SCAN_LOCAL.mode = False
+            _SCAN_LOCAL.span = 0.0
+
+    @lt.action
+    def scan_autofocus_full(self) -> SmoothFocusResult:
+        """Scan-only focus, forced full chain (no anchor tiny sweep)."""
+        _SCAN_LOCAL.span = 0.0
+        _SCAN_LOCAL.mode = True
+        try:
+            return self.smooth_focus(self._scan_params())
+        finally:
+            _SCAN_LOCAL.mode = False
+
+    def _scan_params(self) -> SmoothAutofocusParams:
+        return SmoothAutofocusParams(search_span_steps=0)
 
     @classmethod
     def fine_sweep_velocity(cls, fwhm: float | None) -> float:
@@ -1637,6 +1789,12 @@ class SmoothAutofocusThing(lt.Thing):
             if forced_base is not None:
                 prev_gain, prev_exp = forced_base
                 type(self)._LAST_REGIME = None
+            elif _SCAN_MODE():
+                if not type(self)._CAL_LOADED:
+                    self._load_cal()
+                prev_gain = float(self._cam._analogue_gain)
+                prev_exp = int(self._cam._exposure_time)
+                type(self)._LAST_REGIME = (prev_gain, prev_exp)
             else:
                 prev_exp = self._cam.exposure_time
                 prev_gain = self._cam.analogue_gain
@@ -1650,6 +1808,8 @@ class SmoothAutofocusThing(lt.Thing):
         except Exception:
             prev_exp = prev_gain = None
         type(self)._AF_BUSY = True
+        if _SCAN_MODE():
+            type(self)._LAST_SCAN_TS = time.monotonic()
         _cool_ev = type(self)._COOL_DONE
         if _cool_ev is not None and type(self)._COOLING:
             _cool_ev.wait(timeout=5.0)
@@ -1715,6 +1875,12 @@ class SmoothAutofocusThing(lt.Thing):
                         try:
                             result = self._run_flow(monitor)
                         except NoFocusFoundError as exc:
+                            if "scan|" in str(exc) and "reseed_full" in str(exc):
+                                _log(
+                                    f"RUN total={time.monotonic() - t0:.2f} "
+                                    f"mode={exc} NORETRY"
+                                )
+                                raise
                             if "tiny_fail" not in str(exc):
                                 _log(
                                     f"RUN total={time.monotonic() - t0:.2f} "
@@ -1797,6 +1963,23 @@ class SmoothCompatAutofocus(SmoothAutofocusThing, AutofocusThing):
                 {"x": 0, "y": 0, "z": int(round(zi))} for zi in z
             ],
         )
+
+    @lt.action
+    def scan_autofocus(self, span: float = 0.0) -> SmoothFocusResult:
+        """Scan-only focus: anchor tiny sweep -> park -> settled verify.
+        Falls back to the full chain after 2 consecutive gated misses."""
+        try:
+            return super().scan_autofocus(span=span)
+        except NoFocusFoundError as exc:
+            raise ScanNoFocusFoundError(str(exc)) from exc
+
+    @lt.action
+    def scan_autofocus_full(self) -> SmoothFocusResult:
+        """Scan-only focus, forced full chain (no anchor tiny sweep)."""
+        try:
+            return super().scan_autofocus_full()
+        except NoFocusFoundError as exc:
+            raise ScanNoFocusFoundError(str(exc)) from exc
 
     @lt.action
     def fast_autofocus(
