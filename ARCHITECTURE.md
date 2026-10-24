@@ -111,6 +111,36 @@ Driver and device tree are a matched pair, both kept in `kernel/`:
   PREDIV=3 driver accepts only a 640M DT; a stock driver with a 640M DT
   fails probe (−22) and the camera is absent at boot.
 
+## Freeze-motion strobe (`freeze_motion` thing)
+
+Global-shutter imitation for histo scans: the integration window spans the
+whole frame period (E 45100 µs, the driver's frm_length − 22 cap) and the LED
+delivers a short pulse, so every row integrates the same instant. Frame
+timing is the native mode's 45.475 ms period (21.96 fps).
+
+- LED: Bridgelux Thrive BXEN-50S on `!gpio24` via `[pwm_tool TOOL]`
+  (`printer.cfg`: cycle_time 0.045475, shutdown_value 0; M3/M4/M5 macros map
+  S 0–255 onto SET_PIN). VALUE is darkness: 0 = lit, 1 = dark; the stock
+  `[neopixel board_rgb]` block stays commented out.
+- Band-freeze law: dark rows are exactly those whose window misses the
+  pulse. The gap is `cycle − E_applied` ≈ 775 µs (applied exposure runs
+  ~0.8 % under commanded and clamps at frm_length − 22). Any pulse width
+  τ ≥ the gap covers every row at every phase: the recipe is τ = 900 µs
+  (`VALUE = 1 − τ/cycle`), E 45100 — drift irrelevant, no reprogramming.
+- `things/freeze_motion.py` (`FreezeMotionThing`, registered in
+  `ofm_config_full.json`): `strobe_on(tau, cycle_time)` / `strobe_off`,
+  observe-only band instrumentation (`start_observing`, `band_samples` →
+  (sensor-timestamp, row) pairs), parked/refreshing properties. A steering
+  loop exists but is observe-only by design; at τ ≥ the gap freeze needs no
+  feedback.
+- Camera-side actuation: `camera.set_camera_control` passes arbitrary
+  libcamera controls through; `FrameDurationLimits` is glitch-free and a
+  temporary ±offset walks the pulse phase (~312 sensor rows per 400 µs·s of
+  hold). `capture_to_memory` stills re-roll camera phase — only the lores
+  band hook (`set_band_hook`) is a phase-stable sensor.
+- Static artifact bands (dark rows ~0–96 and 138–224, bright ~1818–2020)
+  are lens-shading tables from the stock mode; LST recalibration pending.
+
 ## Calibration (`smooth_af_cal.json`)
 
 | key | meaning | derived |

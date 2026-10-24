@@ -19,7 +19,8 @@
         "stage_measure": "openflexure_microscope_server.things.stage_measure:StageMeasurementThing",
         "bg_color_channels_luv": "openflexure_microscope_server.things.background_detect:ColourChannelDetectLUV",
         "bg_channel_deviations_luv": "openflexure_microscope_server.things.background_detect:ChannelDeviationLUV",
-        "scan_focus_plane": "openflexure_microscope_server.things.scan_focus_plane:ScanFocusPlaneThing"
+        "scan_focus_plane": "openflexure_microscope_server.things.scan_focus_plane:ScanFocusPlaneThing",
+        "freeze_motion": "openflexure_microscope_server.things.freeze_motion:FreezeMotionThing"
     },
     "settings_folder": "/home/admin/ofm/openflexure/settings",
     "api_prefix": "/api/v3",
