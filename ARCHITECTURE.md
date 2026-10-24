@@ -79,6 +79,38 @@ bundled under load).
   frame + sensor timestamp — the way to see the AF's point of view, since
   the encoder is paused during AF.
 
+## Camera hardware: IMX477 clock overclock
+
+The sensor driver runs Open360Camera-style overclocked clocks, doubling the
+full-res readout: **2800×2800 @ 12-bit window mode measures 21.99 fps vs
+10 fps stock** (kernel 6.18.29+rpt-rpi-v8). This lifts the `default`
+full-resolution mode used for stills and calibration; the crop990 120 fps
+AF mode is unchanged.
+
+Driver and device tree are a matched pair, both kept in `kernel/`:
+
+| parameter | stock | this build |
+|---|---|---|
+| MIPI link freq (`IMX477_DEFAULT_LINK_FREQ`) | 450 MHz | 640 MHz |
+| `IMX477_IOP_PREDIV` (sensor reg 0x030d) | 0x02 | 0x03 |
+| pixel rate (`IMX477_PIXEL_RATE`) | 840 MHz | 984 MHz |
+| mode table | stock modes | + `mode_2800x2800_regs` (window 628,120, frm_length 2848) |
+
+- `kernel/imx477-ofm2800.c` / `imx477-ofm2800.ko` — driver source and built
+  module (installed as
+  `/lib/modules/…/kernel/drivers/media/i2c/imx477.ko`, md5-verified against
+  the scope).
+- `kernel/imx477-640M.dtbo` — the installed DT overlay
+  (`/boot/firmware/overlays/imx477.dtbo`; stock kept on the scope as
+  `imx477.dtbo.stock`). `kernel/dtso/` holds the stock rpi-6.18.y overlay
+  sources; the 640M dtbo is those sources with 450M→640M in
+  `imx477_378.dtsi`.
+- Rebuild + install commands are in `kernel/README.md`. Constraints: the
+  dtbo is rebuilt from source only (binary decompile/recompile does not
+  round-trip phandle fixups), and driver/DT must move together — the
+  PREDIV=3 driver accepts only a 640M DT; a stock driver with a 640M DT
+  fails probe (−22) and the camera is absent at boot.
+
 ## Calibration (`smooth_af_cal.json`)
 
 | key | meaning | derived |
@@ -120,6 +152,8 @@ tiny fit.
   - `stage/skrPico.py` — stage thing (scope-live; also mirrored at
     `src/labthings_sangaboard/skrPico.py`): Moonraker client, telemetry
     websocket reader (push Condition), cal persistence, `_stamp_for`.
+- `kernel/` — IMX477 overclocked driver artifacts (source, built module, dtbo,
+  rebuild recipes; see Camera hardware above).
 - `ofm/` (this repo) — deployed copies of the above + unit tests.
 - `funData/` — motion-data playground: `scripts/` (story chart, history
   charts, HUD slowmo burner + its test), `data/` (pulled artifacts),

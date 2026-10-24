@@ -536,7 +536,90 @@ class StreamingPiCamera2(BaseCamera, ABC):
         self._af_metric_plane = plane if callback is not None else "lores"
         try:
             with self._streaming_picamera() as picam:
-                picam.pre_callback = self._af_pre_callback
+                picam.pre_callback = self._pre_callback_dispatch
+        except Exception:
+            pass
+
+    def set_band_hook(self, callback) -> None:
+        """Install a per-frame row-band hook fed from the raw lores Y plane.
+
+        The callback receives ``(timestamp_s, band_row_or_None)`` for every
+        captured frame. ``band_row`` is the intensity-weighted centroid of
+        rows darker than 0.93x the frame median, excluding the top artifact
+        zone. Pass ``None`` to remove.
+        """
+        self._band_hook = callback
+        try:
+            with self._streaming_picamera() as picam:
+                picam.pre_callback = self._pre_callback_dispatch
+        except Exception:
+            pass
+
+    def _pre_callback_dispatch(self, request) -> None:
+        self._band_pre_callback(request)
+        self._af_pre_callback(request)
+
+    def _band_pre_callback(self, request) -> None:
+        import numpy as _np
+
+        cb = getattr(self, "_band_hook", None)
+        if cb is None:
+            return
+        try:
+            arr = request.make_array("lores")
+            rows, stride = arr.shape[0], arr.shape[1]
+            y_rows = rows * 2 // 3
+            y = arr[:y_rows, :stride].astype(_np.int16, copy=False)
+            row_mean = y.mean(axis=1)
+            med = float(_np.median(row_mean))
+            skip = 17
+            mask = row_mean < 0.78 * med
+            mask[:skip] = False
+            if not mask.any():
+                try:
+                    _md = request.get_metadata()
+                except Exception:
+                    _md = None
+                ts = None
+                if isinstance(_md, dict):
+                    for k in ("SensorTimestamp", "sensor_timestamp"):
+                        if _md.get(k):
+                            ts = float(_md[k]) / 1e9
+                            break
+                cb(ts if ts is not None else time.monotonic(), None)
+                return
+            idx = _np.where(mask)[0]
+            centroid = None
+            runs = []
+            s = p = int(idx[0])
+            for v in idx[1:].tolist():
+                if v <= p + 1:
+                    p = v
+                else:
+                    runs.append((s, p))
+                    s = p = v
+            runs.append((s, p))
+            best = None
+            bestd = 1.0
+            for s0, e0 in runs:
+                if e0 - s0 > 70:
+                    continue
+                d = float(row_mean[s0:e0 + 1].mean()) / med
+                if d < bestd:
+                    bestd = d
+                    best = (s0 + e0) / 2.0
+            centroid = best
+            try:
+                _md = request.get_metadata()
+            except Exception:
+                _md = None
+            ts = None
+            if isinstance(_md, dict):
+                for k in ("SensorTimestamp", "sensor_timestamp"):
+                    if _md.get(k):
+                        ts = float(_md[k]) / 1e9
+                        break
+            cb(ts if ts is not None else time.monotonic(), centroid, med)
         except Exception:
             pass
 
@@ -708,6 +791,13 @@ class StreamingPiCamera2(BaseCamera, ABC):
                     self.mjpeg_stream.stop()
                     self.lores_mjpeg_stream.stop()
                 LOGGER.info("Stopped MJPEG stream.")
+
+    @lt.action
+    def set_camera_control(self, name: str, value: Any) -> Any:
+        """Pass an arbitrary libcamera control through to picamera2."""
+        with self._streaming_picamera() as picam:
+            picam.set_controls({name: value})
+        return value
 
     @lt.action
     def discard_frames(self) -> None:
@@ -1237,10 +1327,10 @@ class PiCameraHQ(StreamingPiCamera2):
                 ),
                 main_resolution=(700, 700),
                 lores_resolution=(350, 350),
-                sensor_mode_resolution=(4056, 3040),
+                sensor_mode_resolution=(2800, 2800),
                 bit_depth=12,
                 use_lores_as_preview=False,
-                scaler_crop=(628, 120, 2800, 2800),
+                scaler_crop=None,
             ),
             "full_resolution": PiCamera2StreamingMode(
                 description=(
@@ -1251,10 +1341,10 @@ class PiCameraHQ(StreamingPiCamera2):
                 ),
                 main_resolution=(2800, 2800),
                 lores_resolution=(350, 350),
-                sensor_mode_resolution=(4056, 3040),
+                sensor_mode_resolution=(2800, 2800),
                 bit_depth=12,
                 use_lores_as_preview=True,
-                scaler_crop=(628, 120, 2800, 2800),
+                scaler_crop=None,
             ),
             "fast_preview": PiCamera2StreamingMode(
                 description=(

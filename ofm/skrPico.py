@@ -749,3 +749,11 @@ class SkrPicoThing(BaseStage):
 
         raise IOError("The Pico does not support LED control. Unless you have an ARGB strip connected.")
         # todo maybe I do? beep steppers instead?
+
+    def strobe_set(self, value: float, cycle_time: Optional[float] = None,
+                   pin: str = "TOOL") -> None:
+        script = f"SET_PIN PIN={pin} VALUE={value:.6f}"
+        if cycle_time is not None:
+            script += f" CYCLE_TIME={cycle_time:.7f}"
+        with self._hardware_lock:
+            self._send_gcode_script(self._client, script)
