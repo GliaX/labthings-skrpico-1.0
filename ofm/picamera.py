@@ -511,6 +511,7 @@ class StreamingPiCamera2(BaseCamera, ABC):
             controls["ScalerCrop"] = mode_info.scaler_crop
         if mode_info.frame_rate is not None:
             controls["FrameRate"] = mode_info.frame_rate
+        controls["FrameDurationLimits"] = [45000, 45000]
 
         main_cfg: dict[str, Any] = {"size": mode_info.main_resolution}
         if mode_info.sensor_mode_resolution == (1332, 990):

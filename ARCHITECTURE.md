@@ -122,11 +122,22 @@ timing is the native mode's 45.475 ms period (21.96 fps).
   (`printer.cfg`: cycle_time 0.045475, shutdown_value 0; M3/M4/M5 macros map
   S 0–255 onto SET_PIN). VALUE is darkness: 0 = lit, 1 = dark; the stock
   `[neopixel board_rgb]` block stays commented out.
-- Band-freeze law: dark rows are exactly those whose window misses the
-  pulse. The gap is `cycle − E_applied` ≈ 775 µs (applied exposure runs
-  ~0.8 % under commanded and clamps at frm_length − 22). Any pulse width
-  τ ≥ the gap covers every row at every phase: the recipe is τ = 900 µs
-  (`VALUE = 1 − τ/cycle`), E 45100 — drift irrelevant, no reprogramming.
+- Band-freeze law: dark rows are those whose window misses the pulse, and
+  half-lit rows are those being read out during the pulse (straddle). The
+  gap is `period − E_applied`. picamera2 ships a default
+  `FrameDurationLimits` ceiling of 38.827 ms that silently clamps every
+  exposure to 38527 µs — `strobe_on` raises it to [100, 46000] first, and
+  the FDL max must then stay ≥ the commanded exposure but ≤ 45475 µs, or
+  libcamera sags the frame period and re-widens the gap. At FDL 45475 the
+  applied exposure is ~45166 and the gap floor is ~300 µs (22-line
+  exposure offset); τ = 450 µs covers it.
+- Residual straddle band (rows read out mid-pulse, ~0.54 depth at τ=450)
+  drifts with the LED↔camera beat. Hiding it requires parking the pulse
+  phase in the end-of-frame blanking (rows 0–17, inside the dark-top LST
+  artifact). Coarse phase walks work via `SET_PIN CYCLE_TIME` offsets
+  (±1 ms ≈ 1370–1570 rows/s of band motion); sub-300 µs offsets do not
+  commit (klippy actuation threshold), so fine parking needs longer legs
+  or a driver frame-length bump to widen vblank.
 - `things/freeze_motion.py` (`FreezeMotionThing`, registered in
   `ofm_config_full.json`): `strobe_on(tau, cycle_time)` / `strobe_off`,
   observe-only band instrumentation (`start_observing`, `band_samples` →

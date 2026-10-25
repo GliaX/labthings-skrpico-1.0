@@ -1245,9 +1245,17 @@ static int imx477_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 static void imx477_adjust_exposure_range(struct imx477 *imx477)
 {
 	int exposure_max, exposure_def;
+	unsigned int vblank_eff = imx477->vblank->val;
+
+	/* Match the frame-length clamp: exposure must fit the clamped
+	 * frame, not the bookkeeping vblank. */
+	if (imx477->mode->frm_length_default == 2848 &&
+	    imx477->mode->height + vblank_eff > imx477->mode->frm_length_default)
+		vblank_eff = imx477->mode->frm_length_default -
+			     imx477->mode->height;
 
 	/* Honour the VBLANK limits when setting exposure. */
-	exposure_max = imx477->mode->height + imx477->vblank->val -
+	exposure_max = imx477->mode->height + vblank_eff -
 		       IMX477_EXPOSURE_OFFSET;
 	exposure_def = min(exposure_max, imx477->exposure->val);
 	__v4l2_ctrl_modify_range(imx477->exposure, imx477->exposure->minimum,
@@ -1258,6 +1266,10 @@ static void imx477_adjust_exposure_range(struct imx477 *imx477)
 static int imx477_set_frame_length(struct imx477 *imx477, unsigned int val)
 {
 	int ret = 0;
+
+	if (imx477->mode->frm_length_default == 2848 &&
+	    val > imx477->mode->frm_length_default)
+		val = imx477->mode->frm_length_default;
 
 	imx477->long_exp_shift = 0;
 
