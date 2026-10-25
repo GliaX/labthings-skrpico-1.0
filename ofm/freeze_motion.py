@@ -54,8 +54,12 @@ class FreezeMotionThing(lt.Thing):
 
     @lt.action
     def pin_period(self, us: Optional[float] = None) -> None:
-        """Pin the PWM period (us) and suspend PLL corrections; None unpins."""
+        """Pin the PWM period (us); None releases the pin."""
         self._pin_us = us
+        if us is not None and self._firing:
+            pi = self._pi
+            if pi is not None:
+                self._apply(pi, float(us))
 
     @lt.action
     def strobe_on(self, tau: Optional[float] = 0.0003) -> None:
@@ -67,17 +71,15 @@ class FreezeMotionThing(lt.Thing):
             pass
         self._tau = float(tau)
         self._gpio_wave_start()
+        self._firing = True
         with self._lock:
             self._cam.set_band_hook(self._on_band)
         t = self._pulse_thread
         if t is None or not t.is_alive():
-            self._firing = True
             self._pulse_thread = threading.Thread(
                 target=self._pll_loop, daemon=True
             )
             self._pulse_thread.start()
-        else:
-            self._firing = True
 
     @lt.action
     def strobe_off(self) -> None:
@@ -295,6 +297,7 @@ class FreezeMotionThing(lt.Thing):
     def _pll_loop(self):
         time.sleep(2.0)
         warm = 0
+        hidden_since = None
         while self._firing:
             pi = self._pi
             if pi is None:
@@ -304,18 +307,27 @@ class FreezeMotionThing(lt.Thing):
             if warm < 8:
                 time.sleep(1.5)
                 continue
+            if self._pin_us is not None:
+                self._apply(pi, float(self._pin_us))
+                self._locked = True
+                time.sleep(1.0)
+                continue
             row = self._band_row
-            if row is not None and row > 100.0:
-                self._apply(pi, _HOLD_US, self._phase_us - 8.0)
-                self._locked = False
-                time.sleep(0.9)
+            if row is None:
+                self._apply(pi, _HOLD_US)
+                if hidden_since is None:
+                    hidden_since = time.monotonic()
+                    self._locked = True
+                elif time.monotonic() - hidden_since > 40.0:
+                    self._apply(pi, 45415.0)
+                    time.sleep(1.5)
+                    self._apply(pi, _HOLD_US)
+                    hidden_since = time.monotonic()
+                time.sleep(1.0)
                 continue
-            if row is not None:
-                self._apply(pi, _HOLD_US, self._phase_us + 5.0)
-                self._locked = False
-                time.sleep(0.9)
-                continue
-            self._locked = True
+            hidden_since = None
+            self._locked = False
+            self._apply(pi, 45535.0)
             time.sleep(1.0)
 
     def _apply(self, pi, period_us, phase_us=None):
