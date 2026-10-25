@@ -51,6 +51,11 @@ class FreezeMotionThing(lt.Thing):
     _saved_ae = None
     _pin_us = None
     _phase_us = 0.0
+    _dither_hi = False
+    _dither_t = 0.0
+    _parking_until = None
+    _rev_burst_until = None
+    _prev_none = False
 
     @lt.action
     def pin_period(self, us: Optional[float] = None) -> None:
@@ -313,22 +318,44 @@ class FreezeMotionThing(lt.Thing):
                 time.sleep(1.0)
                 continue
             row = self._band_row
+            now = time.monotonic()
+            if now - self._dither_t >= 2.0:
+                self._dither_hi = not self._dither_hi
+                self._dither_t = now
+            target = 45475.0 if self._dither_hi else 45474.0
+            if self._parking_until is not None:
+                if now < self._parking_until:
+                    self._apply(pi, 45535.0)
+                    time.sleep(0.15)
+                    continue
+                self._parking_until = None
+                self._apply(pi, target)
+                self._locked = True
+                time.sleep(0.3)
+                continue
             if row is None:
                 self._apply(pi, _HOLD_US)
-                if hidden_since is None:
-                    hidden_since = time.monotonic()
-                    self._locked = True
-                elif time.monotonic() - hidden_since > 40.0:
-                    self._apply(pi, 45415.0)
-                    time.sleep(1.5)
-                    self._apply(pi, _HOLD_US)
-                    hidden_since = time.monotonic()
-                time.sleep(1.0)
+                self._locked = True
+                self._prev_none = True
+                time.sleep(0.4)
                 continue
-            hidden_since = None
-            self._locked = False
-            self._apply(pi, 45535.0)
-            time.sleep(1.0)
+            if self._prev_none:
+                self._prev_none = False
+                self._rev_burst_until = None
+                self._parking_until = None
+            if row > 175.0:
+                self._locked = False
+                self._apply(pi, 45535.0)
+                time.sleep(0.15)
+                continue
+            if row > 18.0:
+                self._locked = False
+                self._apply(pi, 45400.0)
+                time.sleep(0.15)
+                continue
+            self._apply(pi, target)
+            self._locked = True
+            time.sleep(0.5)
 
     def _apply(self, pi, period_us, phase_us=None):
         per_changed = abs(self._period_us - period_us) >= 0.5
