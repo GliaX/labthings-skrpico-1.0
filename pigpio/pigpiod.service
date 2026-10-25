@@ -1,0 +1,11 @@
+[Unit]
+Description=pigpio daemon
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pigpiod -l
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
