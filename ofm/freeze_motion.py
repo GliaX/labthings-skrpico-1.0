@@ -56,6 +56,8 @@ class FreezeMotionThing(lt.Thing):
     _parking_until = None
     _rev_burst_until = None
     _prev_none = False
+    _hi_frac = 0.5
+    _row_hist = []
 
     @lt.action
     def pin_period(self, us: Optional[float] = None) -> None:
@@ -159,6 +161,10 @@ class FreezeMotionThing(lt.Thing):
     @lt.property
     def last_correction_us(self) -> float:
         return self._last_corr
+
+    @lt.property
+    def hi_frac(self) -> float:
+        return self._hi_frac
 
     @lt.property
     def locked(self) -> bool:
@@ -319,11 +325,25 @@ class FreezeMotionThing(lt.Thing):
                 continue
             row = self._band_row
             now = time.monotonic()
-            if now - self._dither_t >= 2.0:
-                self._dither_hi = not self._dither_hi
-                self._dither_t = now
-            target = 45475.0 if self._dither_hi else 45474.0
+            if row is not None:
+                self._row_hist = (self._row_hist + [(now, row)])[-40:]
+            if row is not None and row < 18.0:
+                self._locked = False
+                self._apply(pi, 45400.0)
+                time.sleep(0.15)
+                continue
             if row is None:
+                if now - self._dither_t >= 2.0 * self._hi_frac:
+                    self._dither_hi = not self._dither_hi
+                    self._dither_t = now
+                    self._hi_frac = max(0.2, min(0.8, self._hi_frac))
+                    if len(self._row_hist) >= 8:
+                        (t0, r0), (t1, r1) = self._row_hist[0], self._row_hist[-1]
+                        if t1 > t0:
+                            v = (r1 - r0) / (t1 - t0)
+                            self._hi_frac = max(0.2, min(0.8, 0.5 - v * 6.0))
+                            self._row_hist = self._row_hist[-2:]
+                target = 45475.0 if self._dither_hi else 45474.0
                 self._apply(pi, target)
                 self._locked = True
                 self._prev_none = True
