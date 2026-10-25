@@ -576,40 +576,46 @@ class StreamingPiCamera2(BaseCamera, ABC):
             skip = 17
             mask = row_mean < 0.78 * med
             mask[:skip] = False
-            if not mask.any():
-                try:
-                    _md = request.get_metadata()
-                except Exception:
-                    _md = None
-                ts = None
-                if isinstance(_md, dict):
-                    for k in ("SensorTimestamp", "sensor_timestamp"):
-                        if _md.get(k):
-                            ts = float(_md[k]) / 1e9
-                            break
-                cb(ts if ts is not None else time.monotonic(), None)
-                return
-            idx = _np.where(mask)[0]
             centroid = None
-            runs = []
-            s = p = int(idx[0])
-            for v in idx[1:].tolist():
-                if v <= p + 1:
-                    p = v
+            depth = 1.0
+            idx = _np.where(mask)[0]
+            if idx.size:
+                runs = []
+                s = p = int(idx[0])
+                for v in idx[1:].tolist():
+                    if v <= p + 1:
+                        p = v
+                    else:
+                        runs.append((s, p))
+                        s = p = v
+                runs.append((s, p))
+                best = None
+                bestd = 1.0
+                for s0, e0 in runs:
+                    if e0 - s0 > 70:
+                        continue
+                    d = float(row_mean[s0:e0 + 1].mean()) / med
+                    if d < bestd:
+                        bestd = d
+                        best = (s0 + e0) / 2.0
+                if best is not None:
+                    centroid = best
+                    depth = bestd
+            top_ref = getattr(self, "_top_row_ref", None)
+            if top_ref is None or top_ref.shape[0] != skip:
+                top_ref = row_mean[:skip].astype(_np.float64).copy()
+                self._top_row_ref = top_ref
+            else:
+                dipped = row_mean[:skip] < 0.92 * top_ref
+                top_idx = _np.where(dipped)[0]
+                if top_idx.size:
+                    dd = (top_ref[top_idx] - row_mean[:skip][top_idx]) / top_ref[top_idx]
+                    w = float(dd.sum())
+                    top_cent = float((top_idx * dd).sum() / w)
+                    if centroid is None or depth > 0.55:
+                        centroid = top_cent
                 else:
-                    runs.append((s, p))
-                    s = p = v
-            runs.append((s, p))
-            best = None
-            bestd = 1.0
-            for s0, e0 in runs:
-                if e0 - s0 > 70:
-                    continue
-                d = float(row_mean[s0:e0 + 1].mean()) / med
-                if d < bestd:
-                    bestd = d
-                    best = (s0 + e0) / 2.0
-            centroid = best
+                    top_ref[:] = 0.95 * top_ref + 0.05 * row_mean[:skip]
             try:
                 _md = request.get_metadata()
             except Exception:

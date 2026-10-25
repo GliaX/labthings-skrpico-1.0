@@ -323,39 +323,22 @@ class FreezeMotionThing(lt.Thing):
                 self._dither_hi = not self._dither_hi
                 self._dither_t = now
             target = 45475.0 if self._dither_hi else 45474.0
-            if self._parking_until is not None:
-                if now < self._parking_until:
-                    self._apply(pi, 45535.0)
-                    time.sleep(0.15)
-                    continue
-                self._parking_until = None
-                self._apply(pi, target)
-                self._locked = True
-                time.sleep(0.3)
-                continue
             if row is None:
-                self._apply(pi, _HOLD_US)
+                self._apply(pi, target)
                 self._locked = True
                 self._prev_none = True
                 time.sleep(0.4)
                 continue
             if self._prev_none:
                 self._prev_none = False
-                self._rev_burst_until = None
-                self._parking_until = None
             if row > 175.0:
                 self._locked = False
                 self._apply(pi, 45535.0)
                 time.sleep(0.15)
                 continue
-            if row > 18.0:
-                self._locked = False
-                self._apply(pi, 45400.0)
-                time.sleep(0.15)
-                continue
-            self._apply(pi, target)
-            self._locked = True
-            time.sleep(0.5)
+            self._locked = False
+            self._apply(pi, 45400.0)
+            time.sleep(1.0)
 
     def _apply(self, pi, period_us, phase_us=None):
         per_changed = abs(self._period_us - period_us) >= 0.5
