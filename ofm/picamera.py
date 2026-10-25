@@ -208,8 +208,6 @@ class StreamingPiCamera2(BaseCamera, ABC):
     mjpeg_bitrate: Optional[int] = lt.property(default=100000000)
     """Bitrate for MJPEG stream (None for default)."""
 
-    """Bitrate for MJPEG stream (None for default)."""
-
     stream_active: bool = lt.property(default=False, readonly=True)
     """Whether the MJPEG stream is active."""
 
@@ -511,7 +509,7 @@ class StreamingPiCamera2(BaseCamera, ABC):
             controls["ScalerCrop"] = mode_info.scaler_crop
         if mode_info.frame_rate is not None:
             controls["FrameRate"] = mode_info.frame_rate
-        controls["FrameDurationLimits"] = [45000, 45000]
+        controls["FrameDurationLimits"] = [45475, 45475]
 
         main_cfg: dict[str, Any] = {"size": mode_info.main_resolution}
         if mode_info.sensor_mode_resolution == (1332, 990):
@@ -772,7 +770,7 @@ class StreamingPiCamera2(BaseCamera, ABC):
                     PicameraStreamOutput(self.mjpeg_stream, encoder),
                     name=stream_name,
                 )
-                encoder = MJPEGEncoder(100000000)
+                encoder = MJPEGEncoder(self.mjpeg_bitrate)
                 picam.start_encoder(
                     encoder,
                     PicameraStreamOutput(self.lores_mjpeg_stream, encoder),
@@ -1329,15 +1327,16 @@ class PiCameraHQ(StreamingPiCamera2):
         return {
             "default": PiCamera2StreamingMode(
                 description=(
-                    "The standard mode that balances capture resolution and stream "
-                    "size."
+                    "Native 2800x2800 stream; captures are native resolution and "
+                    "never reconfigure the sensor. Preview is the 700x700 lores."
                 ),
-                main_resolution=(700, 700),
-                lores_resolution=(350, 350),
+                main_resolution=(2800, 2800),
+                lores_resolution=(700, 700),
                 sensor_mode_resolution=(2800, 2800),
                 bit_depth=12,
-                use_lores_as_preview=False,
+                use_lores_as_preview=True,
                 scaler_crop=None,
+                buffer_count=6,
             ),
             "full_resolution": PiCamera2StreamingMode(
                 description=(
@@ -1388,11 +1387,11 @@ class PiCameraHQ(StreamingPiCamera2):
         return {
             "standard": PiCamera2CaptureMode(
                 description=(
-                    "The standard mode, 2MP image created from downsampling an 8MP "
-                    "capture from the centre of the 12MP sensor."
+                    "Native-resolution capture from the streaming sensor without "
+                    "reconfiguring it."
                 ),
-                save_resolution=(1400, 1400),
-                streaming_mode="full_resolution",
+                save_resolution=None,
+                streaming_mode=None,
                 stream_name="main",
             ),
             "full": PiCamera2CaptureMode(

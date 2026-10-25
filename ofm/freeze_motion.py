@@ -56,6 +56,7 @@ class FreezeMotionThing(lt.Thing):
     _parking_until = None
     _rev_burst_until = None
     _prev_none = False
+    _upburst_until = None
     _hi_frac = 0.5
     _row_hist = []
 
@@ -70,10 +71,15 @@ class FreezeMotionThing(lt.Thing):
 
     @lt.action
     def strobe_on(self, tau: Optional[float] = 0.0003) -> None:
+        cam = self._cam
+        self._saved_ae = (
+            int(cam.exposure_time),
+            float(cam.analogue_gain),
+        )
+        cam.exposure_time = 45100
+        cam.analogue_gain = 1.0
         try:
-            self._cam.set_camera_control("AeEnable", False)
-            self._cam.set_camera_control("ExposureTime", 45000)
-            self._cam.set_camera_control("AnalogueGain", 1.0)
+            cam.set_camera_control("AeEnable", False)
         except Exception:
             pass
         self._tau = float(tau)
@@ -97,8 +103,14 @@ class FreezeMotionThing(lt.Thing):
         with self._lock:
             self._cam.set_band_hook(None)
         self._gpio_wave_stop()
+        saved = self._saved_ae
+        cam = self._cam
+        if saved is not None:
+            cam.exposure_time = int(saved[0])
+            cam.analogue_gain = float(saved[1])
+            self._saved_ae = None
         try:
-            self._cam.set_camera_control("AeEnable", True)
+            cam.set_camera_control("AeEnable", True)
         except Exception:
             pass
 
@@ -309,11 +321,20 @@ class FreezeMotionThing(lt.Thing):
         time.sleep(2.0)
         warm = 0
         hidden_since = None
+        ae_tick = 0.0
         while self._firing:
             pi = self._pi
             if pi is None:
                 time.sleep(1.0)
                 continue
+            if time.monotonic() - ae_tick > 3.0:
+                ae_tick = time.monotonic()
+                try:
+                    self._cam.set_camera_control("AeEnable", False)
+                    self._cam.exposure_time = 45100
+                    self._cam.analogue_gain = 1.0
+                except Exception:
+                    pass
             warm += 1
             if warm < 8:
                 time.sleep(1.5)
@@ -330,9 +351,21 @@ class FreezeMotionThing(lt.Thing):
             if row is not None and row < 18.0:
                 self._locked = False
                 self._apply(pi, 45400.0)
+                self._upburst_until = time.monotonic() + 1.5
                 time.sleep(0.15)
                 continue
             if row is None:
+                if self._upburst_until is not None:
+                    if now < self._upburst_until:
+                        self._apply(pi, 45400.0)
+                        time.sleep(0.12)
+                        continue
+                    self._upburst_until = None
+                    self._apply(pi, 45474.0)
+                    self._locked = True
+                    self._prev_none = True
+                    time.sleep(0.4)
+                    continue
                 if now - self._dither_t >= 2.0 * self._hi_frac:
                     self._dither_hi = not self._dither_hi
                     self._dither_t = now
