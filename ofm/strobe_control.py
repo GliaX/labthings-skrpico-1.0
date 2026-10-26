@@ -406,6 +406,22 @@ class StrobeControlThing(OFMThing):
         except Exception:
             return "default"
 
+    def on_mode_changed(self) -> None:
+        """Re-arm with this mode's calibrated duty after a stream restart.
+
+        Called by the camera thing whenever it (re)configures the sensor,
+        so the flash width always matches the mode that is streaming.
+        """
+        if not self.enabled:
+            return
+        try:
+            self._arm_with_duty(
+                self.mode_duties.get(self._current_mode(), self.flash_duty)
+            )
+        except Exception as exc:
+            self._last_error = str(exc)
+            self.logger.warning("re-arm after mode change failed: %s", exc)
+
     def _arm_with_duty(self, duty: float) -> None:
         period = self._period_us()
         self._pin_exposure(period)

@@ -782,6 +782,11 @@ class StreamingPiCamera2(BaseCamera, ABC):
             else:
                 self.stream_active = True
                 LOGGER.debug("Started MJPEG stream in %s mode.", mode)
+                try:
+                    if self._strobe_control is not None:
+                        self._strobe_control.on_mode_changed()
+                except Exception:
+                    LOGGER.exception("strobe mode-change notification failed")
 
     def _stop_streaming(self, stop_web_stream: bool = True) -> None:
         """Stop the MJPEG stream."""
