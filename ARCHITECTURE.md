@@ -111,49 +111,16 @@ Driver and device tree are a matched pair, both kept in `kernel/`:
   PREDIV=3 driver accepts only a 640M DT; a stock driver with a 640M DT
   fails probe (−22) and the camera is absent at boot.
 
-## Freeze-motion strobe (`freeze_motion` thing)
+## Illumination strobe (hardware-synced)
 
-Global-shutter imitation for histo scans: the integration window spans the
-whole frame period (E pinned at 45000 µs) and the LED delivers a short
-pulse (τ = 300 µs), so every row integrates the same instant. Frame timing
-is the native mode's 45.474 ms period (21.99 fps).
-
-- LED: Bridgelux Thrive BXEN-50S on the **Pi's** BCM 24 (header pins 18+20,
-  3.3 V through the existing resistor). The SKR Pico gpio24 / `[pwm_tool]`
-  path is retired: klippy PWM reprogramming emitted a full-ON glitch frame
-  and tore every frame in flight. Viewing light = pin HIGH; the pin is dark
-  between pulses in strobe mode.
-- Carrier: **pigpio wave engine** (built from source; not in trixie apt).
-  `pigpiod` runs Type=oneshot + RemainAfterExit (it double-forks), with a
-  SIGCONT-early-return patch in its signal handler. Free-running pulse
-  train at the camera period; retunes swap waves with REPEAT_SYNC at cycle
-  boundaries — glitch-free.
-- Frame-accuracy chain: the `imx477` driver carries the 2800×2800 overclock
-  mode AND a clamp — in that mode frame length ≤ 2848 and exposure ≤
-  frame − 22 (the exposure clamp prevents an IPA-requested overflow that
-  wedges the sensor). `picamera.py` pins `FrameDurationLimits` [45000,
-  45000] at every stream creation: a loose FDL lets the rpi IPA stretch
-  vblank to ~500 lines and the frame to 53 ms; metadata FrameDuration lies
-  about it — only SensorTimestamp deltas are truth.
-- Band geometry: the straddle band (rows being read out during the pulse)
-  wraps at the END of the frame into a wide invisible zone (~200 sensor
-  rows of end-of-frame blanking). Drift law, stopwatch-calibrated: 0.169
-  preview-rows/s per µs of period error; the null sits at ≈45474.5 µs,
-  between the wave engine's 1 µs ticks, so 45474 (−0.085 rows/s) is the
-  best integer pin.
-- Hold loop (`_pll_loop` in `things/freeze_motion.py`): walk band down at
-  45535 µs (~40 rows/s) → the instant the hook loses it (row = None, band
-  inside the end blanking) pin 45474 → every 40 s hidden, a 1.5 s burst at
-  45415 (≈ −14 rows backward) pushes it deeper into the blanking, then
-  re-pin. The band never re-enters the visible frame. A manual
-  `pin_period(us)` overrides the loop absolutely; `set_phase(µs)` exists
-  but the wave-swap phase actuator measured ~300× weaker than designed
-  (unresolved).
-- API: `strobe_on(tau=0.0003)` arms everything (AE off, E 45000, gain 1.0,
-  wave start, band hook, hold loop). `strobe_off` restores CW viewing
-  light. Properties: `last_band_row`, `period_us`, `locked`, `firing`.
-- Static artifact bands (dark top rows, bright ~1818–2020) are lens-shading
-  tables from the stock mode; LST recalibration pending.
+LED strobing runs on the motion MCU, synced to the camera's own frame
+sync: IMX477 CAM1_SYNC -> Pi GPIO18 -> SKR Pico gpio16 -> firmware pulse
+generator -> gpio24 LED. The Pi host is not in the timing path.
+Implementation, build recipe and operating notes live in the kalico fork
+(STROBE-README.md at the fork root): firmware `src/sync_pulse.c`, klippy
+extra `klippy/extras/hwsync_strobe.py`, armed with
+`HWSYNC_STROBE STROBE=camera ENABLE=1`. Working default-mode setting:
+500 us pulse at E 38527 / gain 1.0 with AEC pinned off.
 
 ## Calibration (`smooth_af_cal.json`)
 
