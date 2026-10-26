@@ -47,11 +47,14 @@ class StrobeControlThing(OFMThing):
         )
         self._last_width_us: Optional[int] = None
         self._last_error: Optional[str] = None
+        self._width_by_mode: dict[str, int] = {}
+        self._period_by_mode: dict[str, int] = {}
         super().__init__(thing_server_interface)
 
     enabled: bool = lt.setting(default=True)
     flash_duty: float = lt.setting(default=0.011)
     mode_duties: dict = lt.setting(default_factory=dict)
+    mode_periods: dict = lt.setting(default_factory=dict)
     exposure_us: int = lt.setting(default=0)
     analogue_gain: float = lt.setting(default=1.0)
 
@@ -67,16 +70,21 @@ class StrobeControlThing(OFMThing):
                 getattr(self._cam, "streaming_mode", "default"), self.flash_duty
             )
             width = max(20, min(int(duty * period), period - 1000))
+            boot_mode = self._current_mode()
+            self._period_by_mode[boot_mode] = period
+            self._width_by_mode[boot_mode] = width
+            self.mode_periods = {**self.mode_periods, boot_mode: period}
             self._send(
                 f"HWSYNC_STROBE STROBE=camera ENABLE=1 WIDTH={width / 1e6:.6f}"
             )
             self._send("SYNC_PULSE_STATUS STROBE=camera")
             self._last_width_us = width
             self.logger.info(
-                "Strobe armed at %d us (period %d us, duty %.5f)",
+                "Strobe armed at %d us (period %d us, duty %.5f, mode %s)",
                 width,
                 period,
-                self.flash_duty,
+                duty,
+                boot_mode,
             )
         except Exception as exc:
             self._last_error = str(exc)
@@ -137,8 +145,9 @@ class StrobeControlThing(OFMThing):
         """Arm the strobe at the calibrated duty for the current frame
         rate, or at an explicit width if given."""
         if width_us is None:
-            period = self._period_us()
-            duty = self.mode_duties.get(self._current_mode(), self.flash_duty)
+            mode = self._current_mode()
+            period = self._period_by_mode.get(mode, DEFAULT_PERIOD_US)
+            duty = self.mode_duties.get(mode, self.flash_duty)
             width_us = max(20, min(int(duty * period), period - 1000))
         self._send(
             f"HWSYNC_STROBE STROBE=camera ENABLE=1 WIDTH={width_us / 1e6:.6f}"
@@ -156,7 +165,7 @@ class StrobeControlThing(OFMThing):
     def set_pulse_width(self, microseconds: int) -> None:
         """Set the flash width directly (manual override; also updates
         ``flash_duty`` from the measured frame period)."""
-        period = self._period_us()
+        period = self._period_by_mode.get(self._current_mode(), DEFAULT_PERIOD_US)
         if microseconds >= period:
             raise ValueError(
                 f"{microseconds} us exceeds the {period} us frame period"
@@ -191,6 +200,7 @@ class StrobeControlThing(OFMThing):
         recovered as ``duty * period``.
         """
         period = self._period_us()
+        self.mode_periods = {**self.mode_periods, self._current_mode(): period}
         self._pin_exposure(period)
         hi = max_width_us if max_width_us is not None else int(period * 0.9)
         lo = max(min_width_us, 20)
@@ -241,6 +251,8 @@ class StrobeControlThing(OFMThing):
                 **self.mode_duties,
                 self._current_mode(): duty,
             }
+            self._width_by_mode[self._current_mode()] = chosen
+            self._period_by_mode[self._current_mode()] = period
         self._send("SYNC_PULSE_STATUS STROBE=camera")
         report = {
             "converged": converged,
@@ -412,6 +424,28 @@ class StrobeControlThing(OFMThing):
         Called by the camera thing whenever it (re)configures the sensor,
         so the flash width always matches the mode that is streaming.
         """
+        self._rearm_logged()
+
+    def pre_mode_change(self, mode: str) -> None:
+        """Arm the new mode's width BEFORE the sensor reconfigures.
+
+        Uses only cached calibration (never measures here - that would
+        stall the stream restart), so the very first frame of the new mode
+        already has the correct flash.
+        """
+        if not self.enabled:
+            return
+        if self._width_by_mode.get(mode) is None:
+            return
+        try:
+            self._arm_with_duty(
+                self.mode_duties.get(mode, self.flash_duty), mode=mode
+            )
+        except Exception as exc:
+            self._last_error = str(exc)
+            self.logger.warning("pre-arm for %s failed: %s", mode, exc)
+
+    def _rearm_logged(self) -> None:
         if not self.enabled:
             return
         try:
@@ -422,10 +456,23 @@ class StrobeControlThing(OFMThing):
             self._last_error = str(exc)
             self.logger.warning("re-arm after mode change failed: %s", exc)
 
-    def _arm_with_duty(self, duty: float) -> None:
-        period = self._period_us()
-        self._pin_exposure(period)
-        width = max(20, min(int(duty * period), period - 1000))
+    def _arm_with_duty(self, duty: float, mode: Optional[str] = None) -> None:
+        """Arm with the calibrated width for ``mode``.
+
+        Instant when the mode's period is already known (persisted from a
+        previous calibration or boot); on a true first encounter it measures
+        once, persists the period, then arms.
+        """
+        mode = mode or self._current_mode()
+        width = self._width_by_mode.get(mode)
+        if width is None:
+            period = self.mode_periods.get(mode)
+            if period is None:
+                period = self._period_us()
+                self.mode_periods = {**self.mode_periods, mode: period}
+            width = max(20, min(int(duty * period), period - 1000))
+            self._width_by_mode[mode] = width
+        self._pin_exposure(self.mode_periods.get(mode))
         self._send(
             f"HWSYNC_STROBE STROBE=camera ENABLE=1 WIDTH={width / 1e6:.6f}"
         )

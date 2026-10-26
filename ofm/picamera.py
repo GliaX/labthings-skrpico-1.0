@@ -746,6 +746,11 @@ class StreamingPiCamera2(BaseCamera, ABC):
         if mode not in self.streaming_modes:
             raise ValueError(f"Unknown mode {mode}")
         self.streaming_mode = mode
+        try:
+            if self._strobe_control is not None:
+                self._strobe_control.pre_mode_change(mode)
+        except Exception:
+            LOGGER.exception("strobe pre-mode-change failed")
 
         # This must be before getting the picamera hardware lock.
         controls = self._get_persistent_controls()
