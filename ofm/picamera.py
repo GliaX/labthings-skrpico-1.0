@@ -47,6 +47,7 @@ from picamera2.encoders import MJPEGEncoder
 from picamera2.outputs import Output
 
 from openflexure_microscope_server.things.background_detect import ChannelBlankError
+from openflexure_microscope_server.things.strobe_control import StrobeControlThing
 from openflexure_microscope_server.ui import (
     ActionButton,
     PropertyControl,
@@ -1094,7 +1095,7 @@ class StreamingPiCamera2(BaseCamera, ABC):
     @lt.property
     def primary_calibration_actions(self) -> list[ActionButton]:
         """The calibration actions for both calibration wizard and settings panel."""
-        return [
+        buttons = [
             action_button_for(
                 self,
                 "full_auto_calibrate",
@@ -1109,6 +1110,28 @@ class StreamingPiCamera2(BaseCamera, ABC):
                 success_message="Finished recalibration.",
             ),
         ]
+        try:
+            strobe = self._strobe_control
+        except Exception:
+            strobe = None
+        if strobe is not None:
+            buttons.append(
+                action_button_for(
+                    strobe,
+                    "calibrate_all_modes",
+                    submit_label="Calibrate Flash",
+                    can_terminate=False,
+                    requires_confirmation=True,
+                    confirmation_message=(
+                        "Calibrate the illumination flash for every streaming "
+                        "mode? The camera will switch modes and flash while "
+                        "measuring (about a minute)."
+                    ),
+                    notify_on_success=True,
+                    success_message="Finished flash calibration.",
+                )
+            )
+        return buttons
 
     @lt.property
     def secondary_calibration_actions(self) -> list[ActionButton]:
@@ -1321,6 +1344,8 @@ class PiCameraHQ(StreamingPiCamera2):
     _camera_board = "picamera_hq"
     _sensor_info = recalibrate_utils.IMX477_SENSOR_INFO
 
+    _strobe_control: Optional[StrobeControlThing] = lt.thing_slot()
+
     @lt.property
     def streaming_modes(self) -> Mapping[str, PiCamera2StreamingMode]:
         """Modes the camera can stream in."""
@@ -1351,20 +1376,6 @@ class PiCameraHQ(StreamingPiCamera2):
                 bit_depth=12,
                 use_lores_as_preview=True,
                 scaler_crop=None,
-            ),
-            "fast_preview": PiCamera2StreamingMode(
-                description=(
-                    "High frame rate mode for autofocus sweeps. The sensor is read "
-                    "out 2x2 binned at 2028x1520, raising the stream from ~12 to "
-                    "~37 fps. Stills requested in full-res capture modes "
-                    "automatically reconfigure and restore."
-                ),
-                main_resolution=(700, 700),
-                lores_resolution=(350, 350),
-                sensor_mode_resolution=(2028, 1520),
-                bit_depth=10,
-                use_lores_as_preview=False,
-                scaler_crop=(314, 60, 1400, 1400),
             ),
             "crop990": PiCamera2StreamingMode(
                 description=(
