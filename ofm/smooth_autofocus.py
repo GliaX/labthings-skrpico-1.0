@@ -774,13 +774,22 @@ class SmoothAutofocusThing(lt.Thing):
                 return
             held = getattr(self._cam, "stream_mode_held", False)
             mode = getattr(self._cam, "streaming_mode", "default")
-            try:
-                if mode != "default" and not held:
-                    self._cam._stop_streaming(stop_web_stream=False)
-                    self._cam._start_streaming("default")
-                    _log("COOL mode=default (restored)")
-            except Exception as e:
-                LOGGER.error("AF cooler: mode restore failed: %s", e)
+            if mode != "default" and not held:
+                for attempt in range(4):
+                    if getattr(self, "_AF_BUSY", False):
+                        break
+                    try:
+                        self._cam._stop_streaming(stop_web_stream=False)
+                        self._cam._start_streaming("default")
+                        _log("COOL mode=default (restored)")
+                        break
+                    except Exception as e:
+                        if attempt == 3:
+                            LOGGER.error(
+                                "AF cooler: mode restore failed: %s", e
+                            )
+                        else:
+                            time.sleep(1.5)
             try:
                 with self._cam._streaming_picamera() as picam:
                     if not picam.started:
