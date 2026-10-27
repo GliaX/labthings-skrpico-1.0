@@ -744,7 +744,8 @@ class StreamingPiCamera2(BaseCamera, ABC):
                         _np.int16)
                 except Exception:
                     a = y
-            a32 = a.astype(_np.int32)
+            a = a[::2, ::2].astype(_np.int32)
+            a32 = a
             dx = a32[:, 1:] - a32[:, :-1]
             dy = a32[1:, :] - a32[:-1, :]
             sharp = float((dx * dx).mean() + (dy * dy).mean())

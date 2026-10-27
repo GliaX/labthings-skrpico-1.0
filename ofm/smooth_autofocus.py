@@ -58,6 +58,16 @@ _EDGE_MARGIN = 0.12
 FPS = 140.0
 
 
+def _fps_safe_exp(cam) -> int:
+    try:
+        c = int(cam.exposure_range_max())
+        if 100 <= c <= 50000:
+            return c
+    except Exception:
+        pass
+    return 6013
+
+
 class NoFocusFoundError(RuntimeError):
     """No confident focus was found."""
 
@@ -1392,6 +1402,7 @@ class SmoothAutofocusThing(lt.Thing):
                 prev_exp_af = self._cam.exposure_time
                 if prev_exp_af:
                     _g, _e = _probe_regime(prev_gain_af, prev_exp_af)
+                    _e = max(100, min(_fps_safe_exp(self._cam), _e))
                     self._cam.set_probe_controls_raw(_g, _e)
                     _log(f"AFREGIME g={_g} e={_e} (from {prev_gain_af}/{prev_exp_af})")
                 else:
@@ -1455,7 +1466,7 @@ class SmoothAutofocusThing(lt.Thing):
                 type(self)._LAST_REGIME[0] if type(self)._LAST_REGIME else 2.0,
                 type(self)._LAST_REGIME[1] if type(self)._LAST_REGIME else far_exp_prev,
             )
-            far_exp = max(100, min(8000, far_exp))
+            far_exp = max(100, min(_fps_safe_exp(self._cam), far_exp))
         else:
             raise ValueError(
                 "no live exposure reading - refusing to invent far regime"
@@ -1520,8 +1531,11 @@ class SmoothAutofocusThing(lt.Thing):
                     break
 
         try:
-            self._cam.set_probe_controls_raw(far_gain_prev or 1.0,
-                                             far_exp_prev or 500)
+            self._cam.set_probe_controls_raw(
+                far_gain_prev or 1.0,
+                max(100, min(_fps_safe_exp(self._cam),
+                             far_exp if far_exp else 500)),
+            )
         except Exception:
             LOGGER.warning("Far exposure restore failed", exc_info=True)
 
@@ -1887,6 +1901,7 @@ class SmoothAutofocusThing(lt.Thing):
                     )
                     try:
                         _g, _e = _probe_regime(prev_gain, prev_exp)
+                        _e = max(100, min(_fps_safe_exp(self._cam), _e))
                         self._cam.set_probe_controls_raw(_g, _e)
                         try:
                             result = self._run_flow(monitor)
