@@ -374,6 +374,7 @@ class SmoothAutofocusThing(lt.Thing):
     _SCAN_TRUST: int = 0
     _LAST_FOCUS_S: float = 0.0
     _SCAN_S_HIST: list = []
+    _SCAN_S_REJ: int = 0
     _LAST_SCAN_TS: float = 0.0
 
     def _hw_steps_param(self, delta_hw):
@@ -1566,25 +1567,38 @@ class SmoothAutofocusThing(lt.Thing):
         if focus_static > 0:
             if update_ref:
                 hist = [
-                    s for s in type(self)._SCAN_S_HIST[-8:]
+                    s for s in type(self)._SCAN_S_HIST
                     if s > 0
                 ]
                 med = (
                     statistics.median(hist) if hist else 0.0
                 )
-                if med <= 0.0 or focus_static >= 0.5 * med:
+                if med <= 0.0 or focus_static >= 0.6 * med:
+                    type(self)._SCAN_S_REJ = 0
                     type(self)._LAST_FOCUS_S = float(
                         focus_static
                     )
                     type(self)._SCAN_S_HIST.append(
                         float(focus_static)
                     )
-                    del type(self)._SCAN_S_HIST[:-8]
                 else:
+                    type(self)._SCAN_S_REJ += 1
                     _log(
-                        "REF REJECT %.0f vs med %.0f"
-                        % (focus_static, med)
+                        "REF REJECT %.0f vs med %.0f (%d)"
+                        % (
+                            focus_static, med,
+                            type(self)._SCAN_S_REJ,
+                        )
                     )
+                    if type(self)._SCAN_S_REJ >= 10:
+                        type(self)._SCAN_S_HIST = [
+                            float(focus_static)
+                        ]
+                        type(self)._SCAN_S_REJ = 0
+                        _log(
+                            "REF RECAL: history reset "
+                            "after 10 rejects"
+                        )
         try:
             sender = getattr(self._stage, "_send_gcode_script", None)
             pos = self._stage.position if sender is not None else None
@@ -1835,7 +1849,7 @@ class SmoothAutofocusThing(lt.Thing):
 
     def _scan_ref(self) -> float:
         hist = [
-            s for s in type(self)._SCAN_S_HIST[-8:] if s > 0
+            s for s in type(self)._SCAN_S_HIST if s > 0
         ]
         if hist:
             return float(statistics.median(hist))
@@ -2027,14 +2041,7 @@ class SmoothAutofocusThing(lt.Thing):
         caller_span = float(
             getattr(_SCAN_LOCAL, "span", 0.0) or 0.0
         )
-        sess = float(type(self)._SESS_STATIC or 0.0)
-        hist = [
-            s for s in type(self)._SCAN_S_HIST[-8:] if s > 0
-        ]
-        if hist:
-            ref = float(statistics.median(hist))
-        else:
-            ref = float(type(self)._LAST_FOCUS_S or sess)
+        ref = self._scan_ref()
         _log(
             f"STATFAST med={static_med:.0f} ref={ref:.0f} "
             f"thr={0.8 * ref:.0f}"
