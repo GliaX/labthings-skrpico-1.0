@@ -615,6 +615,23 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
         data = _serialise_numpy_in_dict(data)
         self.last_calibration = data
 
+        backlash_vector = cal_xy.get("backlash_vector")
+        if backlash_vector is not None:
+            axis_names = self._stage.axis_names
+            steps = dict(self._stage.backlash_steps)
+            measured = {}
+            for cal in (cal_x, cal_y):
+                for ax, d in zip(axis_names, cal["stage_direction"]):
+                    if d:
+                        measured[ax] = int(
+                            round(float(backlash_vector[axis_names.index(ax)]))
+                        )
+            steps.update(measured)
+            self._stage.settings["backlash_steps"].set(steps)
+            self.logger.info(
+                f"Stage backlash_steps updated from calibration: {measured}"
+            )
+
         return data
 
     @lt.property
