@@ -41,7 +41,7 @@ _FAR_MEDIAN_BAR = 1.25
 _TINY_SPAN = 180.0
 _TINY_VELOCITY = 700.0
 _TINY_MIN_V = 100.0
-_SCAN_SPAN = 30.0
+_SCAN_SPAN = 60.0
 _SCAN_LOCAL = threading.local()
 _PARK_VELOCITY = 9000.0
 _PARK_CREEP = 300.0
@@ -50,6 +50,12 @@ _CAL_V_ACCEL = 4900.0
 
 def _SCAN_MODE() -> bool:
     return bool(getattr(_SCAN_LOCAL, "mode", False))
+
+
+def _regime_held() -> bool:
+    return _SCAN_MODE() or bool(
+        getattr(SmoothAutofocusThing, "_SCAN_REGIME_HOLD", False)
+    )
 
 
 _MEDIAN_BAR = 1.6
@@ -66,6 +72,17 @@ def _fps_safe_exp(cam) -> int:
     except Exception:
         pass
     return 6013
+
+
+def _af_fps(cam) -> float:
+    try:
+        m = cam.streaming_modes.get(cam.streaming_mode)
+        fr = getattr(m, "frame_rate", None)
+        if fr:
+            return float(fr)
+    except Exception:
+        pass
+    return 22.0
 
 
 class NoFocusFoundError(RuntimeError):
@@ -169,6 +186,8 @@ class _EncoderBurst:
         self._cam = camera
 
     def __enter__(self) -> "_EncoderBurst":
+        if getattr(self._cam, "streaming_mode", "default") == "default":
+            return self
         try:
             with self._cam._streaming_picamera() as picam:
                 if picam.started:
@@ -182,6 +201,8 @@ class _EncoderBurst:
         return self
 
     def __exit__(self, *exc) -> bool:
+        if getattr(self._cam, "streaming_mode", "default") == "default":
+            return True
         try:
             with self._cam._streaming_picamera() as picam:
                 mode_info = getattr(self._cam, "streaming_modes", {}).get(
@@ -858,6 +879,12 @@ class SmoothAutofocusThing(lt.Thing):
             if not reg:
                 _log("COOL regime skip: no calibrated base known")
                 return
+            if getattr(type(self), "_LAST_RUN_SCAN", False):
+                _log("COOL regime skip: last AF was scan, strobe owns exposure")
+                return
+            if _regime_held():
+                _log("COOL regime skip: scan mode, strobe owns exposure")
+                return
             try:
                 rb = self._cam.restore_calibration_raw()
                 g2 = float(rb["gain"])
@@ -1034,7 +1061,10 @@ class SmoothAutofocusThing(lt.Thing):
         cap expires. Motion-arrival gated, never a fixed sleep. Cap
         defaults to 2.0 s (button flow) or 0.2 s in scan flow."""
         if cap_s is None:
-            cap_s = 0.2 if _SCAN_MODE() else 2.0
+            if _SCAN_MODE():
+                cap_s = 0.6 if _af_fps(self._cam) < 100.0 else 0.2
+            else:
+                cap_s = 2.0
         m = len(monitor.times)
         prev = None
         t_end = time.monotonic() + cap_s
@@ -1395,8 +1425,8 @@ class SmoothAutofocusThing(lt.Thing):
             )
 
         try:
-            if _SCAN_MODE():
-                _log("AFREGIME scan: held by wrapper from saved base")
+            if _regime_held():
+                _log("AFREGIME held: strobe owns exposure")
             else:
                 prev_gain_af = self._cam.analogue_gain
                 prev_exp_af = self._cam.exposure_time
@@ -1412,7 +1442,10 @@ class SmoothAutofocusThing(lt.Thing):
             _log("AFREGIME SETFAIL")
 
         m_settle = len(monitor.times)
-        monitor.wait_frames(16, m_settle, timeout=0.25)
+        monitor.wait_frames(
+            16, m_settle,
+            timeout=0.25 if _af_fps(self._cam) >= 100.0 else 1.0,
+        )
         pre = monitor.frames_since(0)[-4:]
         static_med = (
             statistics.median([f[2] for f in pre]) if len(pre) >= 3 else 0.0
@@ -1461,7 +1494,9 @@ class SmoothAutofocusThing(lt.Thing):
                 far_gain_prev = self._cam.analogue_gain
             except Exception:
                 far_gain_prev = None
-        if far_exp_prev:
+        if _regime_held():
+            far_gain = far_exp = None
+        elif far_exp_prev:
             far_gain, far_exp = _probe_regime(
                 type(self)._LAST_REGIME[0] if type(self)._LAST_REGIME else 2.0,
                 type(self)._LAST_REGIME[1] if type(self)._LAST_REGIME else far_exp_prev,
@@ -1471,10 +1506,11 @@ class SmoothAutofocusThing(lt.Thing):
             raise ValueError(
                 "no live exposure reading - refusing to invent far regime"
             )
-        try:
-            self._cam.set_probe_controls_raw(far_gain, far_exp)
-        except Exception as e:
-            _log(f"FARREGIME SETFAIL {e!r}")
+        if far_gain is not None:
+            try:
+                self._cam.set_probe_controls_raw(far_gain, far_exp)
+            except Exception as e:
+                _log(f"FARREGIME SETFAIL {e!r}")
         _log(f"FARREGIME exp={far_exp} gain={far_gain} "
              f"prev={far_exp_prev}")
         for tag, target, prev_end in (("far", leg_a, cur), ("far2", leg_b, leg_a)):
@@ -1530,14 +1566,15 @@ class SmoothAutofocusThing(lt.Thing):
                     mode += "|far1_skip"
                     break
 
-        try:
-            self._cam.set_probe_controls_raw(
-                far_gain_prev or 1.0,
-                max(100, min(_fps_safe_exp(self._cam),
-                             far_exp if far_exp else 500)),
-            )
-        except Exception:
-            LOGGER.warning("Far exposure restore failed", exc_info=True)
+        if far_gain is not None:
+            try:
+                self._cam.set_probe_controls_raw(
+                    far_gain_prev or 1.0,
+                    max(100, min(_fps_safe_exp(self._cam),
+                                 far_exp if far_exp else 500)),
+                )
+            except Exception:
+                LOGGER.warning("Far exposure restore failed", exc_info=True)
 
         a_meas = self._accel_from_telemetry(
             segs.get("far"), segs.get("far2")
@@ -1591,7 +1628,9 @@ class SmoothAutofocusThing(lt.Thing):
             )
         tiny_lo = anchor - span_h
         tiny_hi = anchor + span_h
-        tiny_v = self.fine_sweep_velocity(fwhm)
+        tiny_v = self.fine_sweep_velocity(
+            fwhm, fps=_af_fps(self._cam)
+        )
         self._sync_move_pair(
             monitor,
             tiny_hi + 60.0, _PARK_VELOCITY, tiny_hi, _PARK_CREEP,
@@ -1729,11 +1768,15 @@ class SmoothAutofocusThing(lt.Thing):
         self._span_hint = 0.0
         ret_mark = len(monitor.times)
         self._sync_move(monitor, z0, _PARK_VELOCITY, ret_mark, labeled=False)
-        try:
-            self._cam.restore_calibration_raw()
-            _log("SCANFLOW reseed: base regime restored for full chain")
-        except Exception:
-            LOGGER.warning("reseed base restore failed", exc_info=True)
+        if self._cam.streaming_mode != "crop990":
+            try:
+                self._cam._start_streaming("crop990")
+                with self._cam._streaming_picamera() as picam:
+                    picam.set_controls({"FrameRate": float(FPS)})
+            except Exception:
+                LOGGER.warning(
+                    "reseed crop990 switch failed", exc_info=True
+                )
         _log(f"SCANFLOW {mode}")
         try:
             return self._run_flow_full_once(monitor)
@@ -1763,6 +1806,8 @@ class SmoothAutofocusThing(lt.Thing):
         span sets the sweep half-span in stage units (0 = default)."""
         _SCAN_LOCAL.span = float(span)
         _SCAN_LOCAL.mode = True
+        _saved_regime = type(self)._LAST_REGIME
+        type(self)._SCAN_REGIME_HOLD = True
         try:
             return self.smooth_focus(self._scan_params())
         except NoFocusFoundError as exc:
@@ -1772,6 +1817,8 @@ class SmoothAutofocusThing(lt.Thing):
                 str(exc).replace("scan|", "", 1)
             ) from exc
         finally:
+            type(self)._SCAN_REGIME_HOLD = False
+            type(self)._LAST_REGIME = _saved_regime
             _SCAN_LOCAL.mode = False
             _SCAN_LOCAL.span = 0.0
 
@@ -1780,22 +1827,30 @@ class SmoothAutofocusThing(lt.Thing):
         """Scan-only focus, forced full chain (no anchor tiny sweep)."""
         _SCAN_LOCAL.span = 0.0
         _SCAN_LOCAL.mode = True
+        _saved_regime = type(self)._LAST_REGIME
+        type(self)._SCAN_REGIME_HOLD = True
         try:
             return self.smooth_focus(self._scan_params())
         finally:
+            type(self)._SCAN_REGIME_HOLD = False
+            type(self)._LAST_REGIME = _saved_regime
             _SCAN_LOCAL.mode = False
 
     def _scan_params(self) -> SmoothAutofocusParams:
         return SmoothAutofocusParams(search_span_steps=0)
 
     @classmethod
-    def fine_sweep_velocity(cls, fwhm: float | None) -> float:
+    def fine_sweep_velocity(
+            cls, fwhm: float | None, fps: float | None = None
+    ) -> float:
         """Shared fine-sweep speed law: FPS x FWHM / 5, clamped.
 
         Single source of truth for the engine's tiny sweep and the
-        scanner's per-point fine sweeps."""
+        scanner's per-point fine sweeps. fps defaults to the crop990
+        rate; pass the live mode's rate for sweeps outside crop990."""
         f_ref = fwhm if fwhm else 20.0
-        return max(_TINY_MIN_V, min(_TINY_VELOCITY, FPS * f_ref / 5.0))
+        f = float(fps) if fps else FPS
+        return max(_TINY_MIN_V, min(_TINY_VELOCITY, f * f_ref / 5.0))
 
     @lt.action
     def smooth_focus(
@@ -1808,6 +1863,7 @@ class SmoothAutofocusThing(lt.Thing):
         """
         t0 = time.monotonic()
         burst = 140.0
+        was_scan = _regime_held()
         hint = float(params.search_span_steps)
         self._span_hint = (
             max(200.0, min(hint, 1024.0)) if hint > 0 else 0.0
@@ -1823,7 +1879,6 @@ class SmoothAutofocusThing(lt.Thing):
                     self._load_cal()
                 prev_gain = float(self._cam._analogue_gain)
                 prev_exp = int(self._cam._exposure_time)
-                type(self)._LAST_REGIME = (prev_gain, prev_exp)
             else:
                 prev_exp = self._cam.exposure_time
                 prev_gain = self._cam.analogue_gain
@@ -1860,11 +1915,17 @@ class SmoothAutofocusThing(lt.Thing):
             _t_switch = time.monotonic()
             _fast = True
             try:
-                if self._cam.streaming_mode != "crop990":
+                if _SCAN_MODE():
+                    if self._cam.streaming_mode != "default":
+                        self._cam._start_streaming("default")
+                        _fast = False
+                elif self._cam.streaming_mode != "crop990":
                     self._cam._start_streaming("crop990")
                     _fast = False
             except Exception:
-                LOGGER.warning("Could not switch to crop990", exc_info=True)
+                LOGGER.warning(
+                    "Could not switch AF streaming mode", exc_info=True
+                )
             try:
                 Path(
                     "/home/admin/openflexure-microscope-server/af_ts_probe.log"
@@ -1880,8 +1941,9 @@ class SmoothAutofocusThing(lt.Thing):
                 _probe_mod._AF_TS_PROBE["n"] = 0
                 _probe_mod._AF_TS_PROBE["t"] = time.time()
             with monitor:
-                with self._cam._streaming_picamera() as picam:
-                    picam.set_controls({"FrameRate": float(burst)})
+                if not _SCAN_MODE():
+                    with self._cam._streaming_picamera() as picam:
+                        picam.set_controls({"FrameRate": float(burst)})
                 _t_ramp = time.monotonic()
                 monitor.wait_frames(4, 0, timeout=2.0)
                 _log(
@@ -1900,9 +1962,10 @@ class SmoothAutofocusThing(lt.Thing):
                         f"SETUP burst_ready t={time.monotonic() - _t_burst:.3f}"
                     )
                     try:
-                        _g, _e = _probe_regime(prev_gain, prev_exp)
-                        _e = max(100, min(_fps_safe_exp(self._cam), _e))
-                        self._cam.set_probe_controls_raw(_g, _e)
+                        if not _regime_held():
+                            _g, _e = _probe_regime(prev_gain, prev_exp)
+                            _e = max(100, min(_fps_safe_exp(self._cam), _e))
+                            self._cam.set_probe_controls_raw(_g, _e)
                         try:
                             result = self._run_flow(monitor)
                         except NoFocusFoundError as exc:
@@ -1950,12 +2013,15 @@ class SmoothAutofocusThing(lt.Thing):
                         )
                         raise
         finally:
-            try:
-                self._cam.restore_calibration_raw()
-            except Exception:
-                LOGGER.warning("Exposure/gain restore failed", exc_info=True)
-            finally:
-                self._cam._raw_controls_held = False
+            type(self)._LAST_RUN_SCAN = was_scan
+            if not _regime_held():
+                try:
+                    self._cam.restore_calibration_raw()
+                except Exception:
+                    LOGGER.warning(
+                        "Exposure/gain restore failed", exc_info=True
+                    )
+            self._cam._raw_controls_held = False
             try:
                 if hasattr(self._stage, "update_position"):
                     self._stage.update_position()

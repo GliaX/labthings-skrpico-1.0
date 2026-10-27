@@ -31,15 +31,17 @@ MAX_DEPTH = 90.0
 TRANSIT_VELOCITY = 9000.0
 
 
-def _sweep_velocity() -> float:
-    """Engine's shared fine-sweep speed law (FPS x FWHM / 5, clamped)."""
+def _sweep_velocity(cam=None) -> float:
+    """Engine's shared fine-sweep speed law (live-fps x FWHM / 5, clamped)."""
     from openflexure_microscope_server.things.smooth_autofocus import (
         SmoothAutofocusThing,
+        _af_fps,
     )
 
     fw = SmoothAutofocusThing._CAL_FWHM
+    fps = _af_fps(cam) if cam is not None else None
     return SmoothAutofocusThing.fine_sweep_velocity(
-        float(fw) if fw else None
+        float(fw) if fw else None, fps=fps
     )
 
 
@@ -538,13 +540,13 @@ class ScanFocusPlaneThing(lt.Thing):
 
         traj, frames = self._sweep_leg(
             monitor, anchor - self._sweep_halfspan(),
-            _sweep_velocity()
+            _sweep_velocity(monitor.camera)
         )
         if not traj and getattr(self, "_last_leg_status", "") == "telestall":
             LOGGER.info("PLANE: telestall retry once")
             traj, frames = self._sweep_leg(
                 monitor, anchor - self._sweep_halfspan(),
-                _sweep_velocity()
+                _sweep_velocity(monitor.camera)
             )
         if not traj:
             return None, f"sweep:{getattr(self, '_last_leg_status', 'notraj')}"
@@ -557,7 +559,7 @@ class ScanFocusPlaneThing(lt.Thing):
         ):
             traj2, frames2 = self._sweep_leg(
                 monitor, anchor - depth - NEAR_SPAN,
-                _sweep_velocity()
+                _sweep_velocity(monitor.camera)
             )
             if not traj2:
                 break
@@ -571,7 +573,7 @@ class ScanFocusPlaneThing(lt.Thing):
             top_z = max(p[0] for p in pts)
             traj2, frames2 = self._sweep_leg(
                 monitor, top_z + NEAR_SPAN,
-                _sweep_velocity()
+                _sweep_velocity(monitor.camera)
             )
             if not traj2:
                 break
