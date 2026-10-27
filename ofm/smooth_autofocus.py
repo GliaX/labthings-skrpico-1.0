@@ -42,6 +42,7 @@ _TINY_SPAN = 180.0
 _TINY_VELOCITY = 700.0
 _TINY_MIN_V = 100.0
 _SCAN_SPAN = 60.0
+_SCAN_TINY_DIV = 3.3
 _SCAN_LOCAL = threading.local()
 _PARK_VELOCITY = 9000.0
 _PARK_CREEP = 300.0
@@ -516,6 +517,25 @@ class SmoothAutofocusThing(lt.Thing):
                     v_now = (
                         float(v_raw) if v_raw is not None else None
                     )
+                    start_deadline = time.monotonic() + max(
+                        0.5, min(2.0, seconds * 4.0 + 0.25)
+                    )
+                    while (
+                            time.monotonic() < start_deadline
+                            and (v_now is None or abs(v_now) < 0.5)
+                            and abs(z_now - cur) <= ztol
+                    ):
+                        if motion_wait is not None:
+                            motion_wait(timeout=0.1)
+                        st = query_state()
+                        lp = st.get("live_position")
+                        v_raw = st.get("live_velocity")
+                        if lp is None:
+                            break
+                        z_now = float(lp[2])
+                        v_now = (
+                            float(v_raw) if v_raw is not None else None
+                        )
                     settle_end = time.monotonic() + 2.0
                     while v_now is not None and abs(v_now) >= 0.5:
                         if time.monotonic() >= settle_end:
@@ -536,13 +556,20 @@ class SmoothAutofocusThing(lt.Thing):
                     z_ok = abs(z_now - (target + dz0)) <= ztol
                     v_ok = v_now is None or abs(v_now) < 0.5
                     if v_ok and not z_ok:
-                        self._frame_offset = z_now - target
-                        dz0 = self._frame_offset
-                        z_ok = abs(z_now - (target + dz0)) <= ztol
-                        _log(
-                            f"FRAME LEARN offset={dz0:.2f} "
-                            f"(live {z_now:.2f} vs target {target:.1f})"
-                        )
+                        learned = z_now - target
+                        if abs(learned) <= 50.0:
+                            self._frame_offset = learned
+                            dz0 = self._frame_offset
+                            z_ok = abs(z_now - (target + dz0)) <= ztol
+                            _log(
+                                f"FRAME LEARN offset={dz0:.2f} "
+                                f"(live {z_now:.2f} vs target {target:.1f})"
+                            )
+                        else:
+                            _log(
+                                f"FRAME LEARN REFUSED offset={learned:.2f} "
+                                f"(live {z_now:.2f} vs target {target:.1f})"
+                            )
                     if z_ok and v_ok:
                         et = (
                                 time.monotonic()
@@ -1053,6 +1080,143 @@ class SmoothAutofocusThing(lt.Thing):
             if poll_stop is not None:
                 poll_stop()
 
+    def _sync_move_chain(self, monitor, legs):
+        """N legs, one gcode submission, one certification at the chain
+        end. legs = [(z_target, velocity), ...] starting from the current
+        position. Returns (trajs, frames): trajs is a list of per-leg
+        [(t, z)] trajectories split by planned segment durations."""
+        st = self._stage
+        if getattr(st, "motion_since", None) is None:
+            mark0 = len(monitor.times)
+            trajs0 = []
+            for z_t, v_t in legs:
+                r = self._sync_move(monitor, z_t, v_t, mark0)
+                trajs0.append(r[0])
+            return trajs0, list(monitor.frames_since(mark0))
+        cur = self._last_hw
+        deltas = []
+        for z_t, _v in legs:
+            deltas.append(z_t - cur)
+            cur = z_t
+        if all(abs(d) < 0.5 for d in deltas):
+            return None, []
+        mark = len(monitor.times)
+        clear = getattr(st, "clear_motion_history", None)
+        if clear is not None:
+            clear()
+        poll_start = getattr(st, "_leg_poller_start", None)
+        poll_stop = getattr(st, "_leg_poller_stop_fn", None)
+        if poll_start is not None:
+            poll_start()
+        try:
+            durs = []
+            script = "G91\n"
+            inv = getattr(st, "axis_inverted", {}).get("z", False)
+            for d, (_z_t, v_t) in zip(deltas, legs):
+                s = abs(d) / v_t
+                durs.append(s)
+                dd = -d if inv else d
+                sp = abs(dd) / s if s > 0 else 0.0
+                if abs(dd) >= 0.5:
+                    script += (
+                        f"G1 Z{dd:.3f} S{sp:.6f} F{sp * 60.0:.3f}\n"
+                    )
+            st._send_gcode_script(st._client, script)
+            total = sum(durs)
+            grace_end = time.monotonic() + total * 2.0 + 0.2
+            motion_wait = getattr(st, "motion_wait", None)
+            motion_since = st.motion_since
+            ztol = max(2.0, 0.005 * abs(deltas[-1]))
+            dz0 = float(getattr(self, "_frame_offset", 0.0))
+            tgt_end = legs[-1][0] + dz0
+            marker = None
+            query_state = getattr(st, "query_motion_state", None)
+            while marker is None and time.monotonic() < grace_end:
+                if motion_wait is not None:
+                    motion_wait(timeout=max(
+                        0.02, grace_end - time.monotonic()
+                    ))
+                for s in motion_since(0):
+                    if (
+                            len(s) > 4
+                            and s[4] is not None
+                            and abs(s[2]) < 0.5
+                            and not s[3]
+                            and abs(s[1] - tgt_end) <= ztol
+                    ):
+                        marker = s
+                        break
+                if marker is None and query_state is not None:
+                    try:
+                        q = query_state()
+                        lp = q.get("live_position")
+                        v_raw = q.get("live_velocity")
+                        if lp is not None:
+                            z_now = float(lp[2])
+                            v_now = (
+                                float(v_raw)
+                                if v_raw is not None else None
+                            )
+                            if (
+                                    v_now is None or abs(v_now) < 0.5
+                            ) and abs(z_now - tgt_end) <= ztol:
+                                et = time.monotonic() + getattr(
+                                    st, "_et_handshake", 0.0
+                                )
+                                marker = (
+                                    et, z_now,
+                                    v_now if v_now is not None else 0.0,
+                                    0.0 if v_now is not None else 1.0,
+                                    et,
+                                )
+                    except Exception:
+                        pass
+            self._last_hw = legs[-1][0]
+            if marker is None:
+                _log(f"CHAIN TELESTALL z_end={legs[-1][0]:.1f} "
+                     f"t={time.time():.3f}")
+                self._telestall_run = True
+                return None, []
+            m_et = marker[4]
+            raw = [
+                s for s in motion_since(0)
+                if len(s) > 4 and s[4] is not None and s[4] <= m_et
+            ]
+            raw.sort(key=lambda s: s[4])
+            hoff_fn = getattr(st, "handshake_offset", None)
+            hoff = hoff_fn() if hoff_fn is not None else None
+            t_start = m_et - total
+            bounds = []
+            acc = t_start
+            for s in durs:
+                acc += s
+                bounds.append(acc)
+            trajs = []
+            lo = 0
+            for bi in bounds:
+                hi = lo
+                while hi < len(raw) and raw[hi][4] <= bi:
+                    hi += 1
+                seg = raw[lo:hi]
+                if hoff is not None:
+                    trajs.append([(s[4] - hoff, s[1]) for s in seg])
+                else:
+                    trajs.append([(s[0], s[1]) for s in seg])
+                lo = hi
+            if lo < len(raw) and trajs:
+                seg = raw[lo:]
+                if hoff is not None:
+                    trajs[-1].extend(
+                        [(s[4] - hoff, s[1]) for s in seg]
+                    )
+                else:
+                    trajs[-1].extend([(s[0], s[1]) for s in seg])
+            frames = list(monitor.frames_since(mark))
+            return trajs, frames
+        finally:
+            if poll_stop is not None:
+                poll_stop()
+
     def _rest_static(
             self, monitor: StreamSharpnessMonitor, cap_s: float | None = None
     ) -> float:
@@ -1082,6 +1246,21 @@ class SmoothAutofocusThing(lt.Thing):
             m = len(monitor.times)
         return prev if prev is not None else 0.0
 
+    def _scan_static(
+            self, monitor: StreamSharpnessMonitor, frames: int = 12
+    ) -> float:
+        """Scan-mode one-window settle read: median of a single frame
+        window after motion. At 22fps the two-window plateau can't fit
+        any sane cap; motion-arrival + one full window carries the same
+        information at half the dwell."""
+        fps = _af_fps(self._cam)
+        m = len(monitor.times)
+        monitor.wait_frames(frames, m, timeout=0.6 if fps < 100.0 else 0.25)
+        win = monitor.frames_since(m)[-frames:]
+        if len(win) < max(6, frames * 2 // 3):
+            return 0.0
+        return statistics.median([f[2] for f in win])
+
     def _refine_landing(
             self, monitor: StreamSharpnessMonitor, park_z: float
     ) -> tuple:
@@ -1089,7 +1268,10 @@ class SmoothAutofocusThing(lt.Thing):
         known, else +-12u probes with one +-24u extension; 16-frame
         medians, +8% to accept a step. Skips entirely when the landing
         already reads >=200 (clearly focused in scan regime)."""
-        s0 = self._rest_static(monitor)
+        if _SCAN_MODE():
+            s0 = self._scan_static(monitor)
+        else:
+            s0 = self._rest_static(monitor)
         if s0 >= 200.0:
             _log("REFINE skip: landing sharp (%.0f)" % s0)
             return park_z, s0
@@ -1195,15 +1377,19 @@ class SmoothAutofocusThing(lt.Thing):
 
     def _revert_if_worse(
             self, monitor: StreamSharpnessMonitor, z0: float,
-            start_s: float, land_z: float,
-    ):
-        land_s = self._rest_static(monitor)
+            start_s: float, land_z: float, land_s: float | None = None,
+    ) -> tuple:
+        if land_s is None:
+            if _SCAN_MODE():
+                land_s = self._scan_static(monitor)
+            else:
+                land_s = self._rest_static(monitor)
         if start_s < 30.0 or land_s >= 0.7 * start_s:
             _log(
                 "LAND start=%.0f land=%.0f verdict=keep"
                 % (start_s, land_s)
             )
-            return None
+            return None, land_s
         _log(
             "REGRESS start=%.0f land=%.0f verdict=revert"
             % (start_s, land_s)
@@ -1211,14 +1397,17 @@ class SmoothAutofocusThing(lt.Thing):
         self._sync_move(
             monitor, z0, _PARK_VELOCITY, len(monitor.times), labeled=False,
         )
-        rev_s = self._rest_static(monitor)
+        rev_s = (
+            self._scan_static(monitor) if _SCAN_MODE()
+            else self._rest_static(monitor)
+        )
         zr = self._stage_z()
         if rev_s > land_s:
             _log(
                 "REVERTED z=%.2f static=%.0f (start=%.0f land=%.0f)"
                 % (zr, rev_s, start_s, land_s)
             )
-            return zr
+            return zr, rev_s
         _log(
             "REVERT-REFUSED z0=%.0f <= land=%.0f, returning to landing"
             % (rev_s, land_s)
@@ -1227,7 +1416,7 @@ class SmoothAutofocusThing(lt.Thing):
             monitor, land_z, _PARK_VELOCITY, len(monitor.times),
             labeled=False,
         )
-        return self._stage_z()
+        return self._stage_z(), rev_s
 
     def _load_cal(self) -> None:
         try:
@@ -1340,14 +1529,17 @@ class SmoothAutofocusThing(lt.Thing):
             pass
 
     def _save_last_focus(
-            self, monitor: "StreamSharpnessMonitor", mark: int, peak: float
+            self, monitor: "StreamSharpnessMonitor", mark: int, peak: float,
+            focus_static: float | None = None,
     ) -> None:
-        mark2 = len(monitor.times)
-        monitor.wait_frames(4, mark2, timeout=0.5)
-        post = monitor.frames_since(mark2)[-4:]
-        focus_static = (
-            statistics.median([f[2] for f in post]) if len(post) >= 3 else 0.0
-        )
+        if focus_static is None:
+            mark2 = len(monitor.times)
+            monitor.wait_frames(4, mark2, timeout=0.5)
+            post = monitor.frames_since(mark2)[-4:]
+            focus_static = (
+                statistics.median([f[2] for f in post])
+                if len(post) >= 3 else 0.0
+            )
         _log(
             f"SAVE anchor={peak:.1f} focus_static={focus_static:.0f} "
             f"pre_static={type(self)._SESS_STATIC:.0f}"
@@ -1443,8 +1635,8 @@ class SmoothAutofocusThing(lt.Thing):
 
         m_settle = len(monitor.times)
         monitor.wait_frames(
-            16, m_settle,
-            timeout=0.25 if _af_fps(self._cam) >= 100.0 else 1.0,
+            8, m_settle,
+            timeout=0.25 if _af_fps(self._cam) >= 100.0 else 0.6,
         )
         pre = monitor.frames_since(0)[-4:]
         static_med = (
@@ -1631,14 +1823,37 @@ class SmoothAutofocusThing(lt.Thing):
         tiny_v = self.fine_sweep_velocity(
             fwhm, fps=_af_fps(self._cam)
         )
-        self._sync_move_pair(
-            monitor,
-            tiny_hi + 60.0, _PARK_VELOCITY, tiny_hi, _PARK_CREEP,
-        )
-        tiny_mark2 = len(monitor.times)
-        traj3, frames3 = self._sync_move(
-            monitor, tiny_lo, tiny_v, tiny_mark2
-        )
+        if _SCAN_MODE():
+            fps_now = _af_fps(self._cam)
+            tiny_v = max(
+                _TINY_MIN_V,
+                min(
+                    _TINY_VELOCITY,
+                    fps_now * (fwhm if fwhm else 20.0) / _SCAN_TINY_DIV,
+                ),
+            )
+            _trajs, _frames = self._sync_move_chain(monitor, [
+                (tiny_hi + 60.0, _PARK_VELOCITY),
+                (tiny_hi, _PARK_CREEP),
+                (tiny_lo, tiny_v),
+            ])
+            if _trajs is None or not _trajs:
+                traj3, frames3 = None, []
+            else:
+                traj3 = _trajs[-1]
+                sweep_t0 = traj3[0][0] if traj3 else 0.0
+                frames3 = [
+                    f for f in _frames if f[0] >= sweep_t0 - 0.05
+                ]
+        else:
+            self._sync_move_pair(
+                monitor,
+                tiny_hi + 60.0, _PARK_VELOCITY, tiny_hi, _PARK_CREEP,
+            )
+            tiny_mark2 = len(monitor.times)
+            traj3, frames3 = self._sync_move(
+                monitor, tiny_lo, tiny_v, tiny_mark2
+            )
         corr = type(self)._CORR or {}
         tau_t = 0.0
         if type(self)._TAU_TINY is not None:
@@ -1699,13 +1914,15 @@ class SmoothAutofocusThing(lt.Thing):
             mode += f"|park{park_z:.1f}"
             park_z, _rs = self._refine_landing(monitor, park_z)
             mode += f"|refine{park_z:.1f}"
-            rev = self._revert_if_worse(
-                monitor, z0, static_med, park_z
+            rev, rev_s = self._revert_if_worse(
+                monitor, z0, static_med, park_z, land_s=_rs
             )
             if rev is not None:
                 park_z = rev
                 mode += "|reverted"
-            self._save_last_focus(monitor, len(monitor.times), fit.peak)
+            self._save_last_focus(
+                monitor, len(monitor.times), fit.peak, focus_static=rev_s
+            )
             return SmoothFocusResult(
                 peak_z=park_z, mode=mode, fit=fit,
                 curve=[
@@ -1772,6 +1989,12 @@ class SmoothAutofocusThing(lt.Thing):
             try:
                 self._cam._start_streaming("crop990")
                 with self._cam._streaming_picamera() as picam:
+                    if picam.started:
+                        try:
+                            picam.stop_encoder()
+                            _log("RESEED encoders stopped for burst")
+                        except Exception:
+                            _log("RESEED encoder stop failed")
                     picam.set_controls({"FrameRate": float(FPS)})
             except Exception:
                 LOGGER.warning(
@@ -1788,6 +2011,15 @@ class SmoothAutofocusThing(lt.Thing):
                 mode += f"|reseed_fail({exc2})"
                 _log(f"SCANFLOW {mode}")
                 raise NoFocusFoundError(mode) from exc2
+        finally:
+            if self._cam.streaming_mode != "default":
+                try:
+                    self._cam._start_streaming("default")
+                    _log("SCANFLOW reseed: default restored")
+                except Exception:
+                    LOGGER.warning(
+                        "reseed default restore failed", exc_info=True
+                    )
 
     def _run_flow_full_once(
             self, monitor: StreamSharpnessMonitor

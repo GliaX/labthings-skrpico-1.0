@@ -4,6 +4,7 @@ This module contains the base ``ScanWorkflow`` class that all workflows should s
 as well as specific workflows.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import (
     Generic,
     Literal,
@@ -475,13 +476,26 @@ class SmartStackMixin:
             return
         self.stack_dz = max(10, min(400, int(round(fwhm / 2))))
 
+    _save_executor = ThreadPoolExecutor(max_workers=1)
+    _pending_saves: list = []
+
+    def _drain_pending_saves(self, timeout: float = 30.0) -> None:
+        for fut in list(self._pending_saves):
+            try:
+                fut.result(timeout=timeout)
+            except Exception:
+                self.logger.exception("Tile save failed")
+        self._pending_saves.clear()
+
     def _focus_and_ladder(
         self, settings: SmartStackCompatibleSettings, xyz_pos: tuple[int, int, int]
     ) -> tuple[bool, Optional[int], int]:
         """Find focus with the smooth engine, then capture a short ladder
         around it: images_to_save images spaced stack_dz apart, centred
         so the sharpest-z sits in the middle. images_to_save=1 saves a
-        single image at the focused z."""
+        single image at the focused z. Sensor grabs stay synchronous at
+        the parked position; JPEG encode+write run on a worker thread
+        and are joined before the next tile's grab."""
         af_params = settings.smart_stack_params
         images_to_save = max(1, af_params.images_to_save)
         step = af_params.stack_dz
@@ -494,8 +508,13 @@ class SmartStackMixin:
             self.as_workflow._autofocus.fast_autofocus(
                 dz=settings.autofocus_params.dz
             )
-        focus_height = self.as_workflow._stage.get_xyz_position()[2]
-        if self.stack_sharp_set:
+        if images_to_save > 1:
+            focus_height: Optional[int] = (
+                self.as_workflow._stage.get_xyz_position()[2]
+            )
+        else:
+            focus_height = None
+        if images_to_save > 1 and self.stack_sharp_set:
             half = step
             step = (2 * half) // (images_to_save - 1) if images_to_save > 1 else 0
         else:
@@ -505,13 +524,24 @@ class SmartStackMixin:
         for k in range(images_to_save):
             if k and step:
                 self.as_workflow._stage.move_relative(z=step)
-            filename = (
-                f"img_{xyz_pos[0]}_{xyz_pos[1]}_"
-                f"{self.as_workflow._stage.get_xyz_position()[2]}.jpeg"
+            z_now = self.as_workflow._stage.get_xyz_position()[2]
+            filename = f"img_{xyz_pos[0]}_{xyz_pos[1]}_{z_now}.jpeg"
+            self._drain_pending_saves()
+            buf = self.as_workflow._cam.capture_to_memory(
+                capture_mode=settings.capture_params.capture_mode
             )
-            self.as_workflow._cam.capture_and_save_to_path(
-                path=settings.capture_params.images_dir.join(filename),
-                capture_mode=settings.capture_params.capture_mode,
+            path = settings.capture_params.images_dir.join(filename)
+            cam = self.as_workflow._cam
+            raw_save = getattr(
+                cam.save_from_memory, "__wrapped__", None
+            )
+            if raw_save is None:
+                desc = type(cam).save_from_memory
+                raw_save = getattr(desc, "func", cam.save_from_memory)
+            self._pending_saves.append(
+                self._save_executor.submit(
+                    raw_save, cam, path=path, buffer_id=buf,
+                )
             )
         return True, focus_height, images_to_save
 

@@ -646,6 +646,9 @@ class SmartScanThing(OFMThing):
             self.ongoing_scan.save_scan_log(self)
 
         completion_reason = route_planner.completion_reason
+        drain = getattr(workflow, "_drain_pending_saves", None)
+        if drain is not None:
+            drain()
         self.logger.info(f"Scan finished after {self.scan_data.image_count} images.")
         self.logger.info(f"{completion_reason}")
         return completion_reason
