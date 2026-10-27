@@ -1150,7 +1150,7 @@ class ScanFocusPlaneThing(lt.Thing):
         """Grid the sample with relative moves, sweep +-30 at each point,
         fit each curve, and hand the surface to SAMPLE_MESH.
 
-        Camera runs the proven AF lifecycle: crop990 at 120fps with the
+        Camera runs the proven AF lifecycle: crop990 at 140fps with the
         encoder burst, per-frame metrics from the pre_callback hook.
         Points sit on a (grid x grid) lattice spaced `step` apart, visited
         center-out (nearest first) so interior fits seed the outer windows;
@@ -1256,7 +1256,7 @@ class ScanFocusPlaneThing(lt.Thing):
                 self._cam._start_streaming("crop990")
             with StreamSharpnessMonitor(self._cam, plane="main") as monitor:
                 with self._cam._streaming_picamera() as picam:
-                    picam.set_controls({"FrameRate": 120.0})
+                    picam.set_controls({"FrameRate": 140.0})
                 monitor.wait_frames(4, 0, timeout=2.0)
                 with _EncoderBurst(self._cam):
                     _g, _e = _probe_regime(prev_gain, prev_exp)

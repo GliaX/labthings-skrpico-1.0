@@ -102,9 +102,9 @@ class StrobeControlThing(OFMThing):
                 "frame_period_us": 45475,
             },
             "crop990": {
-                "fps": 102.4,
-                "blanking_us": 2930,
-                "frame_period_us": 9755,
+                "fps": 140.0,
+                "blanking_us": 1029,
+                "frame_period_us": 7143,
             },
         }
 
@@ -199,9 +199,30 @@ class StrobeControlThing(OFMThing):
         the result as ``flash_duty`` so any other frame rate can be
         recovered as ``duty * period``.
         """
+        self._pin_exposure(None)
         period = self._period_us()
+        sensor_period: Optional[int]
+        try:
+            sensor_period = self._cam.sensor_frame_period_us()
+        except Exception as exc:
+            self.logger.warning("sensor cadence cross-check failed: %s", exc)
+            sensor_period = None
+        if sensor_period is not None:
+            if abs(sensor_period - period) > max(500, period // 8):
+                self.logger.warning(
+                    "sync line says %d us but sensor timestamps say %d us; "
+                    "trusting the sensor",
+                    period,
+                    sensor_period,
+                )
+                period = sensor_period
         self.mode_periods = {**self.mode_periods, self._current_mode(): period}
-        self._pin_exposure(period)
+        ceiling = self.exposure_ceiling_us()
+        if ceiling is not None and period > ceiling + 2000:
+            raise RuntimeError(
+                "measured period %d us exceeds the fps-safe ceiling %d us; "
+                "refusing to calibrate a stretched frame" % (period, ceiling)
+            )
         hi = max_width_us if max_width_us is not None else int(period * 0.9)
         lo = max(min_width_us, 20)
         if hi <= lo:
@@ -342,34 +363,43 @@ class StrobeControlThing(OFMThing):
     def _period_us(self) -> int:
         """Frame period in microseconds from the camera sync line.
 
-        pigpio counts GPIO18 edges over 2 s; the sync line toggles once per
-        frame in every streaming mode. Falls back to the firmware pulse
-        counter, which is only valid when the flash outlasts the sync HIGH
-        time.
-        """
+        The sync line carries two rising edges per frame: consecutive
+        gaps alternate between two populations (one anchored on the
+        exposure, one spanning it plus blanking twice), so any
+        single-gap statistic - median, mode - reports one population
+        and not the frame rate. The mean over all gaps is the true
+        frame period. Falls back to the firmware pulse counter, which
+        has proven unreliable and is a last resort only."""
         for attempt in range(3):
             try:
                 import pigpio
                 pi = pigpio.pi()
                 if not pi.connected:
                     raise RuntimeError("pigpiod unreachable")
-                count = 0
+                deltas: list[int] = []
+                last: list = [None]
 
-                def _tick(_gpio, _level, _tick):
-                    nonlocal count
-                    count += 1
+                def _tick(_gpio, _level, tick):
+                    if last[0] is not None:
+                        deltas.append(tick - last[0])
+                    last[0] = tick
 
                 cb = pi.callback(18, pigpio.RISING_EDGE, _tick)
                 time.sleep(2.0)
                 cb.cancel()
                 pi.stop()
-                fps = count / 2.0
-                if 2.0 <= fps <= 500.0:
-                    return round(1e6 / fps)
+                if len(deltas) < 20:
+                    raise RuntimeError(
+                        "only %d sync edges in 2s; is the camera streaming?"
+                        % (len(deltas) + 1)
+                    )
+                period = round(sum(deltas) / len(deltas))
+                if 1000 <= period <= 200000:
+                    return period
                 self.logger.warning(
-                    "sync-edge attempt %d gave %.1f fps; retrying",
+                    "sync-edge attempt %d gave period %d us; retrying",
                     attempt + 1,
-                    fps,
+                    period,
                 )
             except ImportError:
                 break
@@ -479,8 +509,31 @@ class StrobeControlThing(OFMThing):
         self._send("SYNC_PULSE_STATUS STROBE=camera")
         self._last_width_us = width
 
+    def exposure_ceiling_us(self, mode: Optional[str] = None) -> Optional[int]:
+        """Highest exposure that keeps the mode at full frame rate.
+
+        The camera's own exposure-range maximum is the authority: it is
+        derived from the sensor's real frame geometry (frame length
+        minus integration offset), so it already encodes the true
+        blanking. Falls back to the sync spec only when the camera
+        cannot be asked."""
+        try:
+            ceiling = int(self._cam.exposure_range_max())
+            if ceiling > 0:
+                return ceiling
+        except Exception:
+            pass
+        spec = self.sync_calibration.get(mode or self._current_mode())
+        if not spec:
+            return None
+        return int(spec["frame_period_us"] - spec["blanking_us"] - 100)
+
     def _pin_exposure(self, period_us: Optional[int] = None) -> None:
-        """Disable AEC and pin exposure high so it spans most of the frame."""
+        """Disable AEC and pin exposure high but fps-safe.
+
+        The pin spans most of the frame without spilling into blanking:
+        the mode's active window (period minus blanking) caps the write,
+        keeping the sensor at its full frame rate."""
         try:
             self._cam.set_camera_control("AeEnable", False)
         except AttributeError:
@@ -491,6 +544,9 @@ class StrobeControlThing(OFMThing):
         if period_us is None:
             period_us = self._period_us()
         exposure = self.exposure_us if self.exposure_us > 0 else period_us - 1000
+        ceiling = self.exposure_ceiling_us()
+        if ceiling is not None:
+            exposure = min(exposure, ceiling)
         self._cam.exposure_time = exposure
         self._cam.analogue_gain = self.analogue_gain
 

@@ -69,6 +69,13 @@ MODULE_PARM_DESC(fstrobe_delay, "Set fstrobe delay from end all lines starting t
 
 /* Pixel rate */
 #define IMX477_PIXEL_RATE		984000000
+/*
+ * The 2x2-binned 1332x990 mode runs its line clock at the stock
+ * rate regardless of the overclocked PLL (measured 6.6865 us per
+ * line at HMAX 5619). Report this so userspace frame-length math
+ * matches the wall clock.
+ */
+#define IMX477_PIXEL_RATE_BINNED	840000000
 
 /* V_TIMING internal */
 #define IMX477_REG_FRAME_LENGTH		CCI_REG16(0x0340)
@@ -911,9 +918,9 @@ static const struct cci_reg_sequence mode_1332x990_regs[] = {
 	{CCI_REG8(0x034d), 0x34},
 	{CCI_REG8(0x034e), 0x03},
 	{CCI_REG8(0x034f), 0xde},
-	{CCI_REG8(0x0305), 0x02},
-	{CCI_REG8(0x0306), 0x00},
-	{CCI_REG8(0x0307), 0xaf},
+	{CCI_REG8(0x0305), 0x04},
+	{CCI_REG8(0x0306), 0x01},
+	{CCI_REG8(0x0307), 0x5e},
 	{CCI_REG8(0xe04c), 0x00},
 	{CCI_REG8(0xe04d), 0x5f},
 	{CCI_REG8(0xe04e), 0x00},
@@ -1005,7 +1012,7 @@ static const struct imx477_mode supported_modes[] = {
 		},
 	},
 	{
-		/* 120fps. 2x2 binned and cropped */
+		/* 140fps. 2x2 binned and cropped */
 		.width = 1332,
 		.height = 990,
 		.crop = {
@@ -1022,7 +1029,7 @@ static const struct imx477_mode supported_modes[] = {
 			.width = 2664,
 			.height = 1980,
 		},
-		.frm_length_default = 1050,
+		.frm_length_default = 1068,
 		.reg_list = {
 			.num_of_regs = ARRAY_SIZE(mode_1332x990_regs),
 			.regs = mode_1332x990_regs,
@@ -1540,6 +1547,27 @@ static void imx477_set_framing_limits(struct imx477 *imx477)
 	__v4l2_ctrl_modify_range(imx477->hblank, hblank_min,
 				 IMX477_LINE_LENGTH_MAX, 1, hblank_min);
 	__v4l2_ctrl_s_ctrl(imx477->hblank, hblank_min);
+
+	/*
+	 * The 1332x990 binned mode clocks lines at the stock rate; keep
+	 * the reported pixel rate matched to the mode so libcamera's
+	 * frame-length computations hold on the wall clock.
+	 */
+	if (mode->width == 1332 && mode->height == 990) {
+		__v4l2_ctrl_modify_range(imx477->pixel_rate,
+					 IMX477_PIXEL_RATE_BINNED,
+					 IMX477_PIXEL_RATE_BINNED, 1,
+					 IMX477_PIXEL_RATE_BINNED);
+		*imx477->pixel_rate->p_cur.p_s32 = IMX477_PIXEL_RATE_BINNED;
+		*imx477->pixel_rate->p_new.p_s32 = IMX477_PIXEL_RATE_BINNED;
+	} else {
+		__v4l2_ctrl_modify_range(imx477->pixel_rate,
+					 IMX477_PIXEL_RATE,
+					 IMX477_PIXEL_RATE, 1,
+					 IMX477_PIXEL_RATE);
+		*imx477->pixel_rate->p_cur.p_s32 = IMX477_PIXEL_RATE;
+		*imx477->pixel_rate->p_new.p_s32 = IMX477_PIXEL_RATE;
+	}
 }
 
 static int imx477_set_pad_format(struct v4l2_subdev *sd,

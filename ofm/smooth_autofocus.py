@@ -54,7 +54,7 @@ def _SCAN_MODE() -> bool:
 
 _MEDIAN_BAR = 1.6
 _EDGE_MARGIN = 0.12
-FPS = 120.0
+FPS = 140.0
 
 
 class NoFocusFoundError(RuntimeError):
@@ -280,27 +280,23 @@ def _log(line: str) -> None:
 
 
 def _probe_regime(prev_gain, prev_exp):
-    """Probe imaging regime from the pre-AF state: gain doubled, exposure
-    halved (less motion blur), clamped to keep 120fps and sane frames.
+    """Probe imaging regime from the pre-AF state.
 
-    Single-trip law: if the camera already sits at probe-class gain the
-    previous flow died before restoring, and probing again would compound
-    (half-of-half into gain 4). Raise instead - the caller's law is to
-    refuse, never to invent."""
+    Pre-strobe this halved exposure to cut motion blur; the LED flash is
+    the shutter now, so halving buys nothing and only pushed the frame
+    out of its fps-safe window. State passes through unchanged and the
+    camera clamps exposure to the mode's fps ceiling."""
     g_in = float(prev_gain or 0.0)
     if g_in >= 3.5:
         raise ValueError(
             "camera already in probe regime (gain %.1f) - a previous "
             "flow died before restore; refusing to stack halvings" % g_in
         )
-    g = 2.0 * prev_gain if prev_gain else 2.0
-    g = max(1.0, min(16.0, g))
     if not prev_exp:
         raise ValueError(
             "no live exposure reading - refusing to invent an AF regime"
         )
-    e = max(100.0, min(8000.0, prev_exp // 2))
-    return g, int(e)
+    return float(prev_gain) if prev_gain else 1.0, int(prev_exp)
 
 
 def _dump_json(name: str, payload: dict) -> None:

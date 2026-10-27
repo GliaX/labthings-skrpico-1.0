@@ -20,6 +20,7 @@ import copy
 import json
 import logging
 import os
+import statistics
 import tempfile
 import time
 from abc import ABC, abstractmethod
@@ -329,10 +330,26 @@ class StreamingPiCamera2(BaseCamera, ABC):
                 # sets a lower value than requested, even if the requested is allowed
                 cam.set_controls({"ExposureTime": value + 1})
 
+    def _strobe_exposure_ceiling(self) -> Optional[int]:
+        """Fps-safe exposure ceiling for the active mode, from the strobe."""
+        strobe = self._strobe_control
+        if strobe is None:
+            return None
+        try:
+            return strobe.exposure_ceiling_us()
+        except Exception:
+            return None
+
     def set_probe_controls_raw(self, gain: float, exposure: int) -> None:
         """Apply sweep imaging controls directly on the sensor. No
         lt.setting writes: the persisted calibration is untouched, and
-        restore_calibration_raw returns exactly what the settings say."""
+        restore_calibration_raw returns exactly what the settings say.
+
+        Exposure above the mode's fps-safe ceiling would stretch the
+        frame below its full rate, so it is clamped here."""
+        ceiling = self._strobe_exposure_ceiling()
+        if ceiling is not None:
+            exposure = min(int(exposure), ceiling)
         with self._streaming_picamera() as cam:
             cam.set_controls({"AnalogueGain": float(gain)})
 
@@ -341,9 +358,13 @@ class StreamingPiCamera2(BaseCamera, ABC):
 
     def restore_calibration_raw(self) -> dict:
         """Re-apply the persisted calibration straight to the sensor and
-        return its readback. Never writes settings."""
+        return its readback. Never writes settings. Exposure is clamped
+        to the mode's fps-safe ceiling."""
         gain = float(self._analogue_gain)
         expo = int(self._exposure_time)
+        ceiling = self._strobe_exposure_ceiling()
+        if ceiling is not None:
+            expo = min(expo, ceiling)
         with self._streaming_picamera() as cam:
             cam.set_controls({"AnalogueGain": gain})
             cam.set_controls({"ExposureTime": expo + 1})
@@ -510,7 +531,10 @@ class StreamingPiCamera2(BaseCamera, ABC):
             controls["ScalerCrop"] = mode_info.scaler_crop
         if mode_info.frame_rate is not None:
             controls["FrameRate"] = mode_info.frame_rate
-        controls["FrameDurationLimits"] = [45475, 45475]
+            frame_us = round(1e6 / mode_info.frame_rate)
+        else:
+            frame_us = 45475
+        controls["FrameDurationLimits"] = [frame_us, frame_us]
 
         main_cfg: dict[str, Any] = {"size": mode_info.main_resolution}
         if mode_info.sensor_mode_resolution == (1332, 990):
@@ -523,6 +547,51 @@ class StreamingPiCamera2(BaseCamera, ABC):
         )
         stream_config["buffer_count"] = mode_info.buffer_count
         return stream_config
+
+    def exposure_range_max(self) -> int:
+        """The sensor's own maximum exposure for the active mode.
+
+        Read from the camera control's range, which the kernel derives
+        from the real frame geometry (frame length minus integration
+        offset) - the authoritative fps-safe ceiling."""
+        with self._streaming_picamera() as cam:
+            ctrl = cam.camera_controls["ExposureTime"]
+            return int(ctrl[1])
+
+    @lt.action
+    def sensor_frame_period_us(self, samples: int = 24) -> int:
+        """Measure the sensor frame cadence from SensorTimestamp metadata.
+
+        Consecutive frames report the sensor's own clock in their
+        metadata; the median of the smallest half of the deltas is the
+        true frame period. The smallest half matters: the delivery
+        cadence can only ever stretch gaps, never shrink them, so the
+        fastest deltas are the sensor and the rest is consumer jitter.
+        Returns the period in microseconds; raises when the stream is
+        not delivering frames."""
+        stamps: list[int] = []
+        with self._streaming_picamera() as picam:
+            if not picam.started:
+                raise RuntimeError("camera stream is not running")
+            deadline = time.monotonic() + 5.0
+            while len(stamps) < samples and time.monotonic() < deadline:
+                req = picam.capture_request()
+                try:
+                    md = req.get_metadata()
+                    ts = md.get("SensorTimestamp")
+                    if ts is not None:
+                        stamps.append(int(ts))
+                finally:
+                    req.release()
+        if len(stamps) < 4:
+            raise RuntimeError(
+                "only %d timestamped frames in 5s; is the stream running?"
+                % len(stamps)
+            )
+        deltas = [b - a for a, b in zip(stamps, stamps[1:])]
+        deltas.sort()
+        fastest = deltas[: max(1, len(deltas) // 2)]
+        return int(round(statistics.median(fastest) / 1000))
 
     def set_af_metric_hook(self, callback, plane: str = "lores") -> None:
         """Install a per-frame sharpness callback fed from the raw lores Y plane.
@@ -1398,7 +1467,7 @@ class PiCameraHQ(StreamingPiCamera2):
                 bit_depth=10,
                 use_lores_as_preview=False,
                 scaler_crop=None,
-                frame_rate=120.0,
+                frame_rate=140.0,
             ),
         }
 
