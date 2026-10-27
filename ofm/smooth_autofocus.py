@@ -53,6 +53,7 @@ def _SCAN_MODE() -> bool:
 
 
 _MEDIAN_BAR = 1.6
+_POOL_MIN_DP = 15.0
 _EDGE_MARGIN = 0.12
 FPS = 140.0
 
@@ -631,7 +632,7 @@ class SmoothAutofocusThing(lt.Thing):
         p_max = max(p_vals)
         thr = p_med + 0.35 * max(p_max - p_med, 1e-9)
         pp = [(z, p) for (z, _c, _s, p) in pts if p >= thr]
-        if len(pp) >= 3:
+        if len(pp) >= 3 and p_max - p_med >= _POOL_MIN_DP:
             zp = sorted(z for z, _p in pp)
             if zp[-1] - zp[0] <= 260.0:
                 hit = sum(z * p for z, p in pp) / sum(p for z, p in pp)
@@ -1509,7 +1510,12 @@ class SmoothAutofocusThing(lt.Thing):
             if (tag == "far" and hit is not None and leg_pts):
                 s_med1 = statistics.median(
                     [q[2] for q in leg_pts]) or 1e-9
-                if max(q[2] for q in leg_pts) >= 1.35 * s_med1:
+                if (
+                    max(q[2] for q in leg_pts) >= 3.0 * max(s_med1, 1e-9)
+                    and max(q[3] for q in leg_pts)
+                    - statistics.median([q[3] for q in leg_pts])
+                    >= 15.0
+                ):
                     mode += "|far1_skip"
                     break
 
@@ -1718,9 +1724,13 @@ class SmoothAutofocusThing(lt.Thing):
         try:
             return self._run_flow_full_once(monitor)
         except NoFocusFoundError as exc:
-            mode += f"|reseed_fail({exc})"
-            _log(f"SCANFLOW {mode}")
-            raise NoFocusFoundError(mode) from exc
+            _log("SCANFLOW reseed whiff - retrying full chain once")
+            try:
+                return self._run_flow_full_once(monitor)
+            except NoFocusFoundError as exc2:
+                mode += f"|reseed_fail({exc2})"
+                _log(f"SCANFLOW {mode}")
+                raise NoFocusFoundError(mode) from exc2
 
     def _run_flow_full_once(
             self, monitor: StreamSharpnessMonitor
@@ -1887,7 +1897,13 @@ class SmoothAutofocusThing(lt.Thing):
                                     f"mode={exc} NORETRY"
                                 )
                                 raise
-                            if "tiny_fail" not in str(exc):
+                            if not (
+                                "tiny_fail" in str(exc)
+                                or (
+                                    "no_anchor_refuse" in str(exc)
+                                    and not _SCAN_MODE()
+                                )
+                            ):
                                 _log(
                                     f"RUN total={time.monotonic() - t0:.2f} "
                                     f"mode={exc} NORETRY"

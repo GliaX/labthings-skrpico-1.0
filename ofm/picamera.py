@@ -744,11 +744,12 @@ class StreamingPiCamera2(BaseCamera, ABC):
                         _np.int16)
                 except Exception:
                     a = y
-            dx = a[:, 1:] - a[:, :-1]
-            dy = a[1:, :] - a[:-1, :]
+            a32 = a.astype(_np.int32)
+            dx = a32[:, 1:] - a32[:, :-1]
+            dy = a32[1:, :] - a32[:-1, :]
             sharp = float((dx * dx).mean() + (dy * dy).mean())
-            bx = a[:, 2:] - a[:, :-2]
-            by = a[2:, :] - a[:-2, :]
+            bx = a32[:, 2:] - a32[:, :-2]
+            by = a32[2:, :] - a32[:-2, :]
             brenner = float((bx * bx).mean() + (by * by).mean())
             bright = float(y.mean())
             chroma = 0.0
