@@ -371,6 +371,9 @@ class SmoothAutofocusThing(lt.Thing):
     _CORR: dict = {}
     _SCAN_LAST_Z: Optional[float] = None
     _SCAN_FAILS: int = 0
+    _SCAN_TRUST: int = 0
+    _LAST_FOCUS_S: float = 0.0
+    _SCAN_S_HIST: list = []
     _LAST_SCAN_TS: float = 0.0
 
     def _hw_steps_param(self, delta_hw):
@@ -1257,7 +1260,7 @@ class SmoothAutofocusThing(lt.Thing):
         m = len(monitor.times)
         monitor.wait_frames(frames, m, timeout=0.6 if fps < 100.0 else 0.25)
         win = monitor.frames_since(m)[-frames:]
-        if len(win) < max(6, frames * 2 // 3):
+        if len(win) < max(3, frames * 2 // 3):
             return 0.0
         return statistics.median([f[2] for f in win])
 
@@ -1269,7 +1272,7 @@ class SmoothAutofocusThing(lt.Thing):
         medians, +8% to accept a step. Skips entirely when the landing
         already reads >=200 (clearly focused in scan regime)."""
         if _SCAN_MODE():
-            s0 = self._scan_static(monitor)
+            s0 = self._scan_static(monitor, frames=4)
         else:
             s0 = self._rest_static(monitor)
         if s0 >= 200.0:
@@ -1531,6 +1534,7 @@ class SmoothAutofocusThing(lt.Thing):
     def _save_last_focus(
             self, monitor: "StreamSharpnessMonitor", mark: int, peak: float,
             focus_static: float | None = None,
+            update_ref: bool = False,
     ) -> None:
         if focus_static is None:
             mark2 = len(monitor.times)
@@ -1546,6 +1550,28 @@ class SmoothAutofocusThing(lt.Thing):
         )
         if focus_static > 0 and focus_static > type(self)._SESS_STATIC:
             type(self)._SESS_STATIC = float(focus_static)
+        if focus_static > 0:
+            if update_ref:
+                hist = [
+                    s for s in type(self)._SCAN_S_HIST[-8:]
+                    if s > 0
+                ]
+                med = (
+                    statistics.median(hist) if hist else 0.0
+                )
+                if med <= 0.0 or focus_static >= 0.5 * med:
+                    type(self)._LAST_FOCUS_S = float(
+                        focus_static
+                    )
+                    type(self)._SCAN_S_HIST.append(
+                        float(focus_static)
+                    )
+                    del type(self)._SCAN_S_HIST[:-8]
+                else:
+                    _log(
+                        "REF REJECT %.0f vs med %.0f"
+                        % (focus_static, med)
+                    )
         try:
             sender = getattr(self._stage, "_send_gcode_script", None)
             pos = self._stage.position if sender is not None else None
@@ -1635,8 +1661,8 @@ class SmoothAutofocusThing(lt.Thing):
 
         m_settle = len(monitor.times)
         monitor.wait_frames(
-            8, m_settle,
-            timeout=0.25 if _af_fps(self._cam) >= 100.0 else 0.6,
+            6, m_settle,
+            timeout=0.25 if _af_fps(self._cam) >= 100.0 else 0.5,
         )
         pre = monitor.frames_since(0)[-4:]
         static_med = (
@@ -1921,7 +1947,8 @@ class SmoothAutofocusThing(lt.Thing):
                 park_z = rev
                 mode += "|reverted"
             self._save_last_focus(
-                monitor, len(monitor.times), fit.peak, focus_static=rev_s
+                monitor, len(monitor.times), fit.peak,
+                focus_static=rev_s, update_ref=(rev is None),
             )
             return SmoothFocusResult(
                 peak_z=park_z, mode=mode, fit=fit,
@@ -1949,9 +1976,41 @@ class SmoothAutofocusThing(lt.Thing):
         falls back to one full-chain run to re-seed the anchor."""
         mode = "scan"
         t0 = time.monotonic()
-        span = float(
-            getattr(_SCAN_LOCAL, "span", 0.0) or _SCAN_SPAN
+        caller_span = float(
+            getattr(_SCAN_LOCAL, "span", 0.0) or 0.0
         )
+        sess = float(type(self)._SESS_STATIC or 0.0)
+        hist = [
+            s for s in type(self)._SCAN_S_HIST[-8:] if s > 0
+        ]
+        if hist:
+            ref = float(statistics.median(hist))
+        else:
+            ref = float(type(self)._LAST_FOCUS_S or sess)
+        _log(
+            f"STATFAST med={static_med:.0f} ref={ref:.0f} "
+            f"thr={0.8 * ref:.0f}"
+        )
+        if (
+                not caller_span
+                and ref > 0.0
+                and static_med >= 0.8 * ref
+        ):
+            type(self)._SCAN_FAILS = 0
+            z_here = self._stage_z()
+            mode += "|static_ok"
+            self._save_last_focus(
+                monitor, len(monitor.times), z_here,
+                focus_static=static_med,
+            )
+            return SmoothFocusResult(
+                peak_z=z_here, mode=mode,
+                fit=FitOutcome(ok=True, peak=z_here, fwhm=None),
+                curve=[], elapsed_s=time.monotonic() - t0,
+            )
+        span = caller_span or _SCAN_SPAN
+        if not caller_span and type(self)._SCAN_TRUST >= 3:
+            span = min(span, 30.0)
         if type(self)._SCAN_LAST_Z is None:
             type(self)._SCAN_LAST_Z = self._stage_z()
         anchor = float(type(self)._SCAN_LAST_Z)
@@ -1960,9 +2019,16 @@ class SmoothAutofocusThing(lt.Thing):
             time.monotonic(), span,
         )
         if result is not None:
+            if abs(float(result.peak_z) - anchor) <= 20.0:
+                type(self)._SCAN_TRUST = min(
+                    type(self)._SCAN_TRUST + 1, 4
+                )
+            else:
+                type(self)._SCAN_TRUST = 0
             type(self)._SCAN_LAST_Z = float(result.peak_z)
             type(self)._SCAN_FAILS = 0
             return result
+        type(self)._SCAN_TRUST = 0
         type(self)._SCAN_FAILS += 1
         mode += f"|miss{type(self)._SCAN_FAILS}"
         if type(self)._SCAN_FAILS < 2:
