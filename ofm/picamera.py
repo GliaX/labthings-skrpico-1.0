@@ -928,6 +928,12 @@ class StreamingPiCamera2(BaseCamera, ABC):
         required_streaming_mode = capture_mode_info.streaming_mode
         if (
                 required_streaming_mode is None
+                and self.streaming_mode != "default"
+                and not self.stream_mode_held
+        ):
+            required_streaming_mode = "default"
+        if (
+                required_streaming_mode is None
                 or required_streaming_mode == self.streaming_mode
         ):
             with self._streaming_picamera() as cam:
