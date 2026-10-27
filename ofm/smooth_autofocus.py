@@ -1265,7 +1265,9 @@ class SmoothAutofocusThing(lt.Thing):
         return statistics.median([f[2] for f in win])
 
     def _refine_landing(
-            self, monitor: StreamSharpnessMonitor, park_z: float
+            self, monitor: StreamSharpnessMonitor, park_z: float,
+            on_anchor: float | None = None,
+            sweep_best: float | None = None,
     ) -> tuple:
         """Rest-truth arbiter after the park: banked direct jump when
         known, else +-12u probes with one +-24u extension; 16-frame
@@ -1275,6 +1277,17 @@ class SmoothAutofocusThing(lt.Thing):
             s0 = self._scan_static(monitor, frames=4)
         else:
             s0 = self._rest_static(monitor)
+        if (
+                _SCAN_MODE() and on_anchor is not None
+                and sweep_best is not None
+                and abs(park_z - on_anchor) <= 20.0
+                and s0 >= 0.75 * sweep_best
+        ):
+            _log(
+                "REFINE skip: fit landed close "
+                "(%.0f vs sweep %.0f)" % (s0, sweep_best)
+            )
+            return park_z, s0
         if s0 >= 200.0:
             _log("REFINE skip: landing sharp (%.0f)" % s0)
             return park_z, s0
@@ -1820,6 +1833,17 @@ class SmoothAutofocusThing(lt.Thing):
         mode += f"|return{self._stage_z():.1f}"
         raise NoFocusFoundError(mode)
 
+    def _scan_ref(self) -> float:
+        hist = [
+            s for s in type(self)._SCAN_S_HIST[-8:] if s > 0
+        ]
+        if hist:
+            return float(statistics.median(hist))
+        return float(
+            type(self)._LAST_FOCUS_S
+            or type(self)._SESS_STATIC or 0.0
+        )
+
     def _tiny_and_park(
             self,
             monitor: StreamSharpnessMonitor,
@@ -1849,7 +1873,28 @@ class SmoothAutofocusThing(lt.Thing):
         tiny_v = self.fine_sweep_velocity(
             fwhm, fps=_af_fps(self._cam)
         )
+        near = False
         if _SCAN_MODE():
+            ref = self._scan_ref()
+            near = (
+                ref > 0.0
+                and static_med >= 0.35 * ref
+            )
+        if near:
+            span_h = min(span_h, 40.0)
+            tiny_lo = anchor - span_h
+            tiny_hi = anchor + span_h
+            mode += "|shortsweep"
+            self._sync_move_pair(
+                monitor,
+                tiny_hi + 20.0, _PARK_VELOCITY,
+                tiny_hi, _PARK_CREEP,
+            )
+            tiny_mark2 = len(monitor.times)
+            traj3, frames3 = self._sync_move(
+                monitor, tiny_lo, tiny_v, tiny_mark2
+            )
+        elif _SCAN_MODE():
             fps_now = _af_fps(self._cam)
             tiny_v = max(
                 _TINY_MIN_V,
@@ -1938,7 +1983,10 @@ class SmoothAutofocusThing(lt.Thing):
                 len(monitor.times),
             )
             mode += f"|park{park_z:.1f}"
-            park_z, _rs = self._refine_landing(monitor, park_z)
+            park_z, _rs = self._refine_landing(
+                monitor, park_z,
+                on_anchor=anchor, sweep_best=best,
+            )
             mode += f"|refine{park_z:.1f}"
             rev, rev_s = self._revert_if_worse(
                 monitor, z0, static_med, park_z, land_s=_rs
