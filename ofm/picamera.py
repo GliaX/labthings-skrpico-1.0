@@ -624,6 +624,26 @@ class StreamingPiCamera2(BaseCamera, ABC):
         except Exception:
             pass
 
+    def _pin_exposure_to_mode(self, mode: Optional[str] = None) -> None:
+        """Clamp the live exposure to the new mode's fps ceiling.
+
+        A mode switch leaves the previous mode's exposure in place
+        (e.g. default's 38527us into crop990), blowing out frames until
+        something writes a mode-appropriate value. Pin immediately at
+        entry so the first frame of the new mode is correctly exposed."""
+        strobe = self._strobe_control
+        if strobe is None:
+            return
+        try:
+            ceiling = strobe.exposure_ceiling_us(mode)
+            if ceiling is not None:
+                with self._streaming_picamera() as cam:
+                    current = cam.capture_metadata().get("ExposureTime")
+                    if current is not None and int(current) > ceiling:
+                        cam.set_controls({"ExposureTime": int(ceiling) + 1})
+        except Exception:
+            LOGGER.exception("mode-entry exposure pin failed")
+
     def _pre_callback_dispatch(self, request) -> None:
         self._band_pre_callback(request)
         self._af_pre_callback(request)
@@ -856,6 +876,7 @@ class StreamingPiCamera2(BaseCamera, ABC):
             else:
                 self.stream_active = True
                 LOGGER.debug("Started MJPEG stream in %s mode.", mode)
+                self._pin_exposure_to_mode(mode)
                 try:
                     if self._strobe_control is not None:
                         self._strobe_control.on_mode_changed()

@@ -1783,7 +1783,7 @@ class SmoothAutofocusThing(lt.Thing):
         than parking on an unverified peak.
         """
         t0 = time.monotonic()
-        burst = 120.0
+        burst = 140.0
         hint = float(params.search_span_steps)
         self._span_hint = (
             max(200.0, min(hint, 1024.0)) if hint > 0 else 0.0
