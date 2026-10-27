@@ -36,7 +36,7 @@ sys.setswitchinterval(0.001)
 LOGGER = logging.getLogger(__name__)
 
 _FAR_SPAN = 1024.0
-_FAR_VELOCITY = 4900.0
+_FAR_VELOCITY = 2800.0
 _FAR_MEDIAN_BAR = 1.25
 _TINY_SPAN = 180.0
 _TINY_VELOCITY = 700.0
@@ -311,7 +311,7 @@ def _dump_json(name: str, payload: dict) -> None:
 class SmoothAutofocusThing(lt.Thing):
     """Autofocus from a continuous sharpness curve sampled while the stage sweeps.
 
-    Flow: static reference -> far sweep (both legs, 4900; early exit
+    Flow: static reference -> far sweep (both legs, 2800; early exit
     after leg 1 on a strong hit) ->
     claw -> tiny sweep -> two-stage park. Every wait is a happens-before
     on telemetry events; no timed waits, no M400.
