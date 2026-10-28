@@ -375,6 +375,10 @@ class SmoothAutofocusThing(lt.Thing):
     _LAST_FOCUS_S: float = 0.0
     _SCAN_S_HIST: list = []
     _SCAN_S_REJ: int = 0
+    _SPHERE_SAMPLES: list = []
+    _SPHERE_N: int = 0
+    _SPHERE_FIT: dict | None = None
+    _SPHERE_MESH_LIVE: bool = False
     _LAST_SCAN_TS: float = 0.0
 
     def _hw_steps_param(self, delta_hw):
@@ -1599,6 +1603,8 @@ class SmoothAutofocusThing(lt.Thing):
                             "REF RECAL: history reset "
                             "after 10 rejects"
                         )
+            if update_ref and _SCAN_MODE():
+                self._sphere_collect(self._stage_z())
         try:
             sender = getattr(self._stage, "_send_gcode_script", None)
             pos = self._stage.position if sender is not None else None
@@ -1685,6 +1691,21 @@ class SmoothAutofocusThing(lt.Thing):
         except Exception:
             LOGGER.warning("AF regime set failed", exc_info=True)
             _log("AFREGIME SETFAIL")
+
+        if _SCAN_MODE():
+            _z_pred = self._sphere_corr()
+            if _z_pred is not None:
+                _dz = _z_pred - self._stage_z()
+                if type(self)._SPHERE_N < 4 and len(
+                        type(self)._SPHERE_SAMPLES
+                ) < 4:
+                    _dz = max(-30.0, min(30.0, _dz))
+                if abs(_dz) > 3.0:
+                    self._sync_move(
+                        monitor, _z_pred, _PARK_VELOCITY,
+                        len(monitor.times), labeled=False,
+                    )
+                    _log("SPHERE apply dz=%+.1f" % _dz)
 
         m_settle = len(monitor.times)
         monitor.wait_frames(
@@ -1847,6 +1868,139 @@ class SmoothAutofocusThing(lt.Thing):
         mode += f"|return{self._stage_z():.1f}"
         raise NoFocusFoundError(mode)
 
+    def _mesh_live_on_klippy(self) -> bool:
+        try:
+            st = self._stage._get_status(payload={
+                "objects": {"sample_mesh": None}
+            })
+            sm = (
+                (st.get("result") or {}).get("status") or {}
+            ).get("sample_mesh") or {}
+            return bool(sm.get("active"))
+        except Exception:
+            return False
+
+    def _sphere_path(self) -> str:
+        return (
+            "/home/admin/openflexure-microscope-server/"
+            "smooth_af_sphere.json"
+        )
+
+    def _sphere_save(self) -> None:
+        fit = type(self)._SPHERE_FIT
+        if fit is None or len(type(self)._SPHERE_SAMPLES) < 24:
+            return
+        try:
+            with open(self._sphere_path(), "w") as f:
+                json.dump(fit, f)
+            _log("SPHERE fit saved n=%d" % fit.get("n", 0))
+        except Exception:
+            LOGGER.warning("sphere save failed", exc_info=True)
+
+    def _sphere_load(self) -> None:
+        try:
+            with open(self._sphere_path()) as f:
+                fit = json.load(f)
+            if not (
+                    isinstance(fit, dict) and "A" in fit
+                    and int(fit.get("n", 0)) >= 24
+            ):
+                type(self)._SPHERE_FIT = None
+                return
+            type(self)._SPHERE_FIT = fit
+            _log(
+                "SPHERE warm start n=%d A=%.3e"
+                % (fit.get("n", 0), fit["A"])
+            )
+        except FileNotFoundError:
+            type(self)._SPHERE_FIT = None
+        except Exception:
+            LOGGER.warning(
+                "sphere load failed", exc_info=True
+            )
+            type(self)._SPHERE_FIT = None
+
+    def _sphere_install_mesh(self) -> bool:
+        fit = type(self)._SPHERE_FIT
+        if fit is None or len(type(self)._SPHERE_SAMPLES) < 24:
+            return False
+        xy = self._xy_now()
+        if xy is None:
+            return False
+        x0, x1 = (
+            fit.get("xmin", 0.0), fit.get("xmax", 0.0)
+        )
+        y0, y1 = (
+            fit.get("ymin", 0.0), fit.get("ymax", 0.0)
+        )
+        margin = 30.0
+        if not (
+                x0 - margin <= xy[0] <= x1 + margin
+                and y0 - margin <= xy[1] <= y1 + margin
+        ):
+            _log(
+                "SPHERE mesh skip: pos (%.0f,%.0f) outside "
+                "fit span x=[%.0f..%.0f] y=[%.0f..%.0f]"
+                % (xy[0], xy[1], x0, x1, y0, y1)
+            )
+            return False
+        try:
+            import numpy as np
+        except Exception:
+            return False
+        A, B, C, D = fit["A"], fit["B"], fit["C"], fit["D"]
+        N = 5
+        pad = 0.05
+        x0, x1 = fit.get("xmin", 0.0), fit.get("xmax", 0.0)
+        y0, y1 = fit.get("ymin", 0.0), fit.get("ymax", 0.0)
+        if x1 - x0 < 300.0 or y1 - y0 < 300.0:
+            return False
+        gx0 = x0 - pad * (x1 - x0)
+        gx1 = x1 + pad * (x1 - x0)
+        gy0 = y0 - pad * (y1 - y0)
+        gy1 = y1 + pad * (y1 - y0)
+        zs = np.array([
+            [
+                A * (gx * gx + gy * gy) + B * gx + C * gy + D
+                for gx in np.linspace(gx0, gx1, N)
+            ]
+            for gy in np.linspace(gy0, gy1, N)
+        ])
+        base = float(zs[0][0])
+        rel = zs - base
+        if float(rel.max() - rel.min()) > 400.0:
+            return False
+        grid_s = " ".join(
+            f"{v:.3f}" for v in rel.flatten()
+        )
+        sender = getattr(self._stage, "_send_gcode_script", None)
+        client = getattr(self._stage, "_client", None)
+        if sender is None or client is None:
+            return False
+        script = (
+            f"SAMPLE_MESH COLS={N} ROWS={N} "
+            f"MIN_X={gx0:.3f} MAX_X={gx1:.3f} "
+            f"MIN_Y={gy0:.3f} MAX_Y={gy1:.3f} "
+            f"ZREF={base:.3f} "
+            f"GRID=\"{grid_s}\""
+        )
+        try:
+            sender(client=client, script=script)
+        except Exception:
+            LOGGER.warning(
+                "sphere mesh install failed", exc_info=True
+            )
+            return False
+        type(self)._SPHERE_MESH_LIVE = True
+        _log(
+            "SPHERE mesh installed %dx%d "
+            "x=[%.0f..%.0f] y=[%.0f..%.0f] "
+            "ptp=%.1f (OFM corr stands down)"
+            % (N, N, gx0, gx1, gy0, gy1,
+               float(rel.max() - rel.min()))
+        )
+        return True
+
     def _scan_ref(self) -> float:
         hist = [
             s for s in type(self)._SCAN_S_HIST if s > 0
@@ -1856,6 +2010,124 @@ class SmoothAutofocusThing(lt.Thing):
         return float(
             type(self)._LAST_FOCUS_S
             or type(self)._SESS_STATIC or 0.0
+        )
+
+    def _xy_now(self):
+        try:
+            p = self._stage.position
+            return float(p["x"]), float(p["y"])
+        except Exception:
+            return None
+
+    def _sphere_collect(self, z_cert: float) -> None:
+        xy = self._xy_now()
+        if xy is None:
+            return
+        type(self)._SPHERE_SAMPLES.append(
+            (xy[0], xy[1], float(z_cert))
+        )
+        type(self)._SPHERE_N += 1
+        if type(self)._SPHERE_N % 12 == 0:
+            self._sphere_fit()
+            self._sphere_save()
+
+    def _sphere_fit(self) -> None:
+        S = type(self)._SPHERE_SAMPLES
+        if len(S) < 8:
+            return
+        try:
+            import numpy as np
+            xs = np.array([s[0] for s in S], dtype=float)
+            ys = np.array([s[1] for s in S], dtype=float)
+            zs = np.array([s[2] for s in S], dtype=float)
+            r2 = xs * xs + ys * ys
+            M = np.column_stack([r2, xs, ys, np.ones_like(xs)])
+            coef, res, rank, _ = np.linalg.lstsq(
+                M, zs, rcond=None
+            )
+            if rank < 4:
+                _log("SPHERE fit rank<4, skip")
+                return
+            pred = M @ coef
+            rms = float(np.sqrt(
+                np.mean((zs - pred) ** 2)
+            ))
+            rms0 = float(np.sqrt(
+                np.mean(
+                    (zs - float(np.mean(zs))) ** 2
+                )
+            ))
+            if rms >= 0.75 * rms0:
+                _log(
+                    "SPHERE fit weak: rms=%.1f "
+                    "vs flat=%.1f" % (rms, rms0)
+                )
+                return
+            span = float(max(
+                float(np.max(xs)) - float(np.min(xs)),
+                float(np.max(ys)) - float(np.min(ys)),
+            ))
+            if span < 300.0:
+                _log("SPHERE fit span too small")
+                return
+            A, B, C, D = (float(c) for c in coef)
+            half = span / 2.0
+            max_corr = (
+                abs(A) * half * half
+                + abs(B) * half + abs(C) * half
+                + abs(D)
+            )
+            if max_corr > 400.0:
+                _log(
+                    "SPHERE fit range too large "
+                    "(%.0fu)" % max_corr
+                )
+                return
+            h_eff = (
+                0.5 / A if abs(A) > 1e-9 else None
+            )
+            type(self)._SPHERE_FIT = {
+                "A": A, "B": B, "C": C, "D": D,
+                "rms": rms, "n": len(S),
+                "h_eff": h_eff,
+                "xmin": float(np.min(xs)),
+                "xmax": float(np.max(xs)),
+                "ymin": float(np.min(ys)),
+                "ymax": float(np.max(ys)),
+            }
+            _log(
+                "SPHERE fit n=%d rms=%.1fu "
+                "flat=%.1fu A=%.3e h_eff=%s"
+                % (
+                    len(S), rms, rms0, A,
+                    "%.0f" % h_eff if h_eff else "-",
+                )
+            )
+        except Exception:
+            LOGGER.warning(
+                "sphere fit failed", exc_info=True
+            )
+
+    def _sphere_corr(self) -> float | None:
+        if type(self)._SPHERE_MESH_LIVE:
+            return None
+        fit = type(self)._SPHERE_FIT
+        if fit is None:
+            return None
+        xy = self._xy_now()
+        if xy is None:
+            return None
+        if not (
+                fit.get("xmin", 0.0) - 30.0
+                <= xy[0] <= fit.get("xmax", 0.0) + 30.0
+                and fit.get("ymin", 0.0) - 30.0
+                <= xy[1] <= fit.get("ymax", 0.0) + 30.0
+        ):
+            return None
+        x, y = xy
+        return (
+            fit["A"] * (x * x + y * y)
+            + fit["B"] * x + fit["C"] * y + fit["D"]
         )
 
     def _tiny_and_park(
@@ -2159,6 +2431,48 @@ class SmoothAutofocusThing(lt.Thing):
         span sets the sweep half-span in stage units (0 = default)."""
         _SCAN_LOCAL.span = float(span)
         _SCAN_LOCAL.mode = True
+        if time.monotonic() - type(self)._LAST_SCAN_TS > 60.0:
+            type(self)._SPHERE_SAMPLES = []
+            type(self)._SPHERE_N = 0
+            self._sphere_load()
+            if not self._mesh_live_on_klippy():
+                type(self)._SPHERE_MESH_LIVE = False
+                self._sphere_install_mesh()
+            else:
+                fit = type(self)._SPHERE_FIT
+                xy = self._xy_now()
+                stale = (
+                    fit is None or xy is None
+                    or not (
+                        fit.get("xmin", 0.0) - 30.0
+                        <= xy[0] <=
+                        fit.get("xmax", 0.0) + 30.0
+                        and fit.get("ymin", 0.0) - 30.0
+                        <= xy[1] <=
+                        fit.get("ymax", 0.0) + 30.0
+                    )
+                )
+                if stale:
+                    try:
+                        sender = getattr(
+                            self._stage,
+                            "_send_gcode_script",
+                            None,
+                        )
+                        if sender is not None:
+                            sender(script="SAMPLE_MESH_CLEAR")
+                        _log(
+                            "SPHERE mesh cleared: stale for "
+                            "this position"
+                        )
+                    except Exception:
+                        LOGGER.warning(
+                            "stale mesh clear failed",
+                            exc_info=True,
+                        )
+                    type(self)._SPHERE_MESH_LIVE = False
+                else:
+                    type(self)._SPHERE_MESH_LIVE = True
         _saved_regime = type(self)._LAST_REGIME
         type(self)._SCAN_REGIME_HOLD = True
         try:
