@@ -350,15 +350,11 @@ class StrobeControlThing(OFMThing):
                         "target_p99": 225.0,
                     }
                     if mode == "crop990"
-                    else {}
+                    else {"target_p99": target_p99}
                 )
                 try:
                     results.append(
-                        dict(
-                            self.calibrate_flash(
-                                target_p99=target_p99, **bounds
-                            )
-                        )
+                        dict(self.calibrate_flash(**bounds))
                     )
                 except Exception as exc:
                     self.logger.warning(
