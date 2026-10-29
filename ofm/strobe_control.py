@@ -97,8 +97,10 @@ class StrobeControlThing(OFMThing):
         """Reference sync timings measured on this camera."""
         return {
             "default": {"fps": 22.0, "blanking_us": 225, "frame_period_us": 45475},
+            # full_resolution is an alias of default in the HQ camera class;
+            # timings are identical, key kept for that mode name.
             "full_resolution": {
-                "fps": 20.8,
+                "fps": 22.0,
                 "blanking_us": 225,
                 "frame_period_us": 45475,
             },
