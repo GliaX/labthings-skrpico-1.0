@@ -1086,25 +1086,35 @@ class StreamingPiCamera2(BaseCamera, ABC):
         a raw image and effectively divide every subsequent image by the current
         one. This uses the camera's "tuning" file to correct the preview and
         the processed images. It should not affect raw images.
+
+        With a strobe thing present, the illumination is switched to
+        continuous light for the measurement and the flash-as-shutter
+        operating point is restored afterwards: a strobe-lit raw capture
+        is too dark to calibrate from.
+
         """
-        with self._streaming_picamera(pause_stream=True) as cam:
-            # Suppress lint warning that L, Cr, and Cb are not lowercase, as these are
-            # the standard mathematical terms for:
-            # luminance (L), red-difference chroma (Cr), and blue-difference chroma
-            # (Cb).
-            L, Cr, Cb = recalibrate_utils.lst_from_camera(cam, self._sensor_info)  # noqa: N806
-            self.tuning = tf_utils.set_lst(
-                self.tuning,
-                luminance=L,
-                cr=Cr,
-                cb=Cb,
-                colour_temp=tf_utils.CALIBRATED_COLOUR_TEMP,
-            )
+        strobe = self._strobe_control
+        use_strobe = strobe is not None and strobe.enabled
+        if use_strobe:
+            strobe.enter_continuous_light()
+        try:
+            with self._streaming_picamera(pause_stream=True) as cam:
+                L, Cr, Cb = recalibrate_utils.lst_from_camera(cam, self._sensor_info)
+                self.tuning = tf_utils.set_lst(
+                    self.tuning,
+                    luminance=L,
+                    cr=Cr,
+                    cb=Cb,
+                    colour_temp=tf_utils.CALIBRATED_COLOUR_TEMP,
+                )
 
-            # Re-initialise the picamera to reload the tuning file.
-            self._initialise_picamera()
+                # Re-initialise the picamera to reload the tuning file.
+                self._initialise_picamera()
 
-        self.colour_gains = tf_utils.get_colour_gains_from_lst(self.tuning)
+            self.colour_gains = tf_utils.get_colour_gains_from_lst(self.tuning)
+        finally:
+            if use_strobe:
+                strobe.exit_continuous_light()
 
     @lt.property
     def colour_correction_matrix(
@@ -1178,27 +1188,42 @@ class StreamingPiCamera2(BaseCamera, ABC):
         This function will call the other calibration actions in sequence:
 
         * ``flat_lens_shading`` to disable flat-field
-        * ``auto_expose_from_minimum``
+        * ``auto_expose_from_minimum`` under continuous illumination;
+          the chosen gain and shutter become the pinned operating
+          point, captured into the strobe settings before the strobe
+          re-arms
         * ``set_static_green_equalisation`` to set geq offset to max
-        * ``calibrate_lens_shading`` (also sets colour gains for white balance)
+        * ``calibrate_lens_shading`` under the same continuous light
         * ``set_background``
+        * ``strobe_control``/``calibrate_all_modes`` last, so the flash
+          duty is solved against the final corrected field
         """
+        strobe = self._strobe_control
         self.flat_lens_shading()
-        self.auto_expose_from_minimum()
-        self.set_static_green_equalisation()
-        self.set_ce_enable_to_off()
-        self.calibrate_lens_shading()
+        if strobe is not None:
+            strobe.enter_continuous_light()
+        try:
+            self.auto_expose_from_minimum()
+            self.set_static_green_equalisation()
+            self.set_ce_enable_to_off()
+            self.calibrate_lens_shading()
+            if strobe is not None:
+                strobe.capture_operating_point()
+        finally:
+            if strobe is not None:
+                strobe.exit_continuous_light()
         if self.background_detector is not None:
             for _i in range(3):
                 try:
                     time.sleep(self._sensor_info.long_pause)
                     self.set_background()
-                    # Return if background is set
-                    return
+                    break
                 except ChannelBlankError:
-                    # If channel is blank, sleep a second and try again.
                     pass
-        raise RuntimeError("Couldn't set background")
+            else:
+                raise RuntimeError("Couldn't set background")
+        if strobe is not None:
+            strobe.calibrate_all_modes()
 
     @lt.property
     def primary_calibration_actions(self) -> list[ActionButton]:
@@ -1218,33 +1243,12 @@ class StreamingPiCamera2(BaseCamera, ABC):
                 success_message="Finished recalibration.",
             ),
         ]
-        try:
-            strobe = self._strobe_control
-        except Exception:
-            strobe = None
-        if strobe is not None:
-            buttons.append(
-                action_button_for(
-                    strobe,
-                    "calibrate_all_modes",
-                    submit_label="Calibrate Flash",
-                    can_terminate=False,
-                    requires_confirmation=True,
-                    confirmation_message=(
-                        "Calibrate the illumination flash for every streaming "
-                        "mode? The camera will switch modes and flash while "
-                        "measuring (about a minute)."
-                    ),
-                    notify_on_success=True,
-                    success_message="Finished flash calibration.",
-                )
-            )
         return buttons
 
     @lt.property
     def secondary_calibration_actions(self) -> list[ActionButton]:
         """The calibration actions that appear only in settings panel."""
-        return [
+        buttons = [
             action_button_for(
                 self,
                 "auto_expose_from_minimum",
@@ -1287,6 +1291,28 @@ class StreamingPiCamera2(BaseCamera, ABC):
                 button_primary=False,
             ),
         ]
+        try:
+            strobe = self._strobe_control
+        except Exception:
+            strobe = None
+        if strobe is not None:
+            buttons.append(
+                action_button_for(
+                    strobe,
+                    "calibrate_all_modes",
+                    submit_label="Calibrate Flash",
+                    can_terminate=False,
+                    requires_confirmation=True,
+                    confirmation_message=(
+                        "Calibrate the illumination flash for every streaming "
+                        "mode? The camera will switch modes and flash while "
+                        "measuring (about a minute)."
+                    ),
+                    notify_on_success=True,
+                    success_message="Finished flash calibration.",
+                )
+            )
+        return buttons
 
     @lt.property
     def manual_camera_settings(self) -> list[PropertyControl]:

@@ -49,6 +49,7 @@ class StrobeControlThing(OFMThing):
         self._last_error: Optional[str] = None
         self._width_by_mode: dict[str, int] = {}
         self._period_by_mode: dict[str, int] = {}
+        self._continuous = False
         super().__init__(thing_server_interface)
 
     enabled: bool = lt.setting(default=True)
@@ -179,6 +180,36 @@ class StrobeControlThing(OFMThing):
         self._send("SYNC_PULSE_STATUS STROBE=camera")
         self.flash_duty = microseconds / period
         self._last_width_us = microseconds
+
+    def capture_operating_point(self) -> None:
+        """Store the camera's calibrated gain as the pinned operating
+        point used by later strobe re-arms.
+
+        Exposure is deliberately NOT persisted: the continuous-light
+        value is meaningless per mode. Leaving ``exposure_us`` at 0
+        makes ``_pin_exposure`` re-derive the fps-safe per-mode pin
+        (period - 1000 us, ceiling-clamped) on every re-arm."""
+        self.exposure_us = 0
+        self.analogue_gain = float(self._cam.analogue_gain)
+        self.logger.info(
+            "operating point captured: gain %.2f (exposure re-pinned per mode)",
+            self.analogue_gain,
+        )
+
+    def enter_continuous_light(self) -> None:
+        """Light the LED continuously for measurements that need
+        continuous illumination (WIDTH=1 s holds it HIGH across
+        many frames). Suppresses mode-change re-arms until
+        ``exit_continuous_light``."""
+        self._continuous = True
+        self._send("HWSYNC_STROBE STROBE=camera ENABLE=1 WIDTH=1")
+        self._send("SYNC_PULSE_STATUS STROBE=camera")
+
+    def exit_continuous_light(self) -> None:
+        """Re-arm the calibrated flash width and re-pin the exposure."""
+        self._continuous = False
+        self.strobe_on()
+        self._pin_exposure()
 
     @lt.action
     def calibrate_flash(
@@ -454,6 +485,8 @@ class StrobeControlThing(OFMThing):
         Called by the camera thing whenever it (re)configures the sensor,
         so the flash width always matches the mode that is streaming.
         """
+        if self._continuous:
+            return
         self._rearm_logged()
 
     def pre_mode_change(self, mode: str) -> None:
@@ -463,6 +496,8 @@ class StrobeControlThing(OFMThing):
         stall the stream restart), so the very first frame of the new mode
         already has the correct flash.
         """
+        if self._continuous:
+            return
         if not self.enabled:
             return
         if self._width_by_mode.get(mode) is None:

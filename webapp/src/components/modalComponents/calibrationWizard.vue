@@ -167,18 +167,6 @@ export default {
       this.includeWelcome = includeWelcome;
       const tasks = [];
 
-      // Illumination flash first: later steps depend on working
-      // illumination, so calibrate it before anything else happens.
-      if (this.thingAvailable("strobe_control")) {
-        tasks.push({
-          component: markRaw(singleStepTask),
-          props: {
-            stepComponent: markRaw(strobeFlashStep),
-            title: "Illumination Flash",
-          },
-        });
-      }
-
       // Optionally include the welcome screen
       if (includeWelcome) {
         tasks.push({
@@ -192,6 +180,18 @@ export default {
       // Add calibration task for each thing
       for (const thing of thingsToCal) {
         tasks.push(this.availableCalibrationTasks[thing]);
+      }
+
+      // Illumination flash last: the duty is solved against the final
+      // flat-field-corrected image, after all other calibration.
+      if (this.thingAvailable("strobe_control")) {
+        tasks.push({
+          component: markRaw(singleStepTask),
+          props: {
+            stepComponent: markRaw(strobeFlashStep),
+            title: "Illumination Flash",
+          },
+        });
       }
 
       // Always include the final step

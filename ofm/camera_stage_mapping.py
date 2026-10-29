@@ -25,7 +25,7 @@ from camera_stage_mapping.camera_stage_tracker import Tracker
 from camera_stage_mapping.exceptions import MappingError
 from labthings_fastapi.types.numpy import DenumpifyingDict
 
-from .camera import BaseCamera
+from .camera import BaseCamera, downsample
 from .smooth_autofocus import _EncoderBurst, _probe_regime
 from .stage import BaseStage
 from .view_alignment import ViewAlignmentMixin
@@ -270,7 +270,8 @@ class _CappedSafeTracker(Tracker):
 
 
 class _DwellRecordedMove(RecordedMove):
-    """RecordedMove that dwells after each move so the sample settles."""
+    """RecordedMove that dwells after each move so the sample
+    settles, and rejects runaway step moves."""
 
     def __call__(self, new_position: np.ndarray) -> None:
         from numpy.linalg import norm as _norm
@@ -281,13 +282,13 @@ class _DwellRecordedMove(RecordedMove):
         )
         if _norm(
             np.asarray(new_position, dtype=float) - np.asarray(cur, dtype=float)
-        ) > 120.0:
+        ) > 600.0:
             raise MappingError(
-                "Calibration attempted a move of more than 120 units - "
+                "Calibration attempted a move of more than 600 units - "
                 "steps_per_pixel estimate exploded; aborting to protect travel."
             )
         super().__call__(new_position)
-        time.sleep(1.0)
+        time.sleep(0.35)
 
 
 class CSMUncalibratedError(lt.exceptions.InvocationError):
@@ -312,11 +313,12 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
     _stage: BaseStage = lt.thing_slot()
 
     def _use_fast_cal(self) -> bool:
-        """True when the stage is an skrPico-class stage: calibration runs
-        in the camera's high-fps crop990 mode because the stage is fast
-        enough to outrun the full-res frame rate. Any other stage keeps
-        the stock full-resolution behaviour."""
-        return hasattr(self._stage, "query_motion_state")
+        """False: calibration always runs in the default 2800x2800
+        mode. The crop990 fast path tracks on anisotropically
+        squeezed frames of the non-square sensor crop, which bent
+        the matrix 1.6-1.8x (verified by displacement measurement
+        2026-10-28). Full-res tracking is slower but correct."""
+        return False
 
     def _velocity_settle(self) -> None:
         """Wait until the stage is actually stationary (motion_report
@@ -520,10 +522,20 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
         """Move a microscope's stage in 1D, and figure out the relationship with the camera."""
         if self._use_fast_cal():
             return self._calibrate_1d_fast(direction)
-        # Record positions and times for stage calibration
-        recorded_move = RecordedMove(self._stage)
+        # Record positions and times for stage calibration. The dwell
+        # variant is required on this stage: moves complete far faster
+        # than the 22fps tracker samples, so without a settle the
+        # tracker sees mid-motion or stale frames and the fit
+        # residuals blow up (seen 2026-10-28, Y-axis full-res cal).
+        recorded_move = _DwellRecordedMove(self._stage)
+        dsf = self._cam.downsampled_array_factor
+
+        def _stream_grab() -> np.ndarray:
+            img = self._cam.grab_as_array(stream_name="main")
+            return downsample(dsf, img)
+
         tracker = Tracker(
-            self._cam.capture_downsampled_array,
+            _stream_grab,
             self._stage.get_xyz_position,
             settle=self._cam.settle,
         )
@@ -534,6 +546,13 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
             result: dict = calibrate_backlash_1d(
                 tracker, recorded_move, direction_array, logger=self.logger
             )
+        except MappingError as e:
+            self.logger.error(
+                "CSM 1d fit failed (%s); positions visited: %s",
+                e,
+                getattr(recorded_move, "_history", None),
+            )
+            raise
         except lt.exceptions.InvocationCancelledError as e:
             self.logger.info("User cancelled the camera stage mapping calibration")
             self.logger.info("Returning to starting position")
@@ -548,7 +567,7 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
             )
             raise e
         result["move_history"] = recorded_move.history
-        result["image_resolution"] = self._cam.capture_downsampled_array().shape[:2]
+        result["image_resolution"] = _stream_grab().shape[:2]
         return result
 
     @lt.action
@@ -589,9 +608,12 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
 
         # Combine X and Y calibrations to make a 2D calibration
         cal_xy: dict = image_to_stage_displacement_from_1d([cal_x, cal_y])
-        # Correct the result for downsampling performed in the hardware interface
-        # (this may be to speed up correlation, or to avoid debayering artifacts)
-        cal_xy["image_to_stage_displacement"] /= downsampling_factor
+        # Full-res calibration path: frames come from
+        # capture_downsampled_array (dsf=2 on 2800 => 1400), so the
+        # measured units-per-pixel belong to 1400-space. Rescale to
+        # 2800-space and label accordingly. (The old dsf division
+        # double-corrected and bent the matrix; measured 2026-10-28.)
+        cal_xy["image_to_stage_displacement"] *= downsampling_factor
         corrected_resolution = tuple(
             r * downsampling_factor for r in cal_x["image_resolution"]
         )

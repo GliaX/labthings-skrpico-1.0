@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import queue
 import statistics
 import sys
@@ -84,6 +85,20 @@ def _af_fps(cam) -> float:
     except Exception:
         pass
     return 22.0
+
+
+def _cal_mode() -> bool:
+    """Calibration mode: AF measures the raw machine surface with
+    zero model interference. Entered by touching the marker file;
+    scans then warm-start nowhere, apply nothing, install no mesh,
+    and only collect fit samples."""
+    try:
+        return os.path.isfile(
+            "/home/admin/openflexure-microscope-server/"
+            "smooth_af_calibration"
+        )
+    except Exception:
+        return False
 
 
 class NoFocusFoundError(RuntimeError):
@@ -1692,7 +1707,7 @@ class SmoothAutofocusThing(lt.Thing):
             LOGGER.warning("AF regime set failed", exc_info=True)
             _log("AFREGIME SETFAIL")
 
-        if _SCAN_MODE():
+        if _SCAN_MODE() and not _cal_mode():
             _z_pred = self._sphere_corr()
             if _z_pred is not None:
                 _dz = _z_pred - self._stage_z()
@@ -1887,6 +1902,8 @@ class SmoothAutofocusThing(lt.Thing):
         )
 
     def _sphere_save(self) -> None:
+        if _cal_mode():
+            return
         fit = type(self)._SPHERE_FIT
         if fit is None or len(type(self)._SPHERE_SAMPLES) < 24:
             return
@@ -2109,7 +2126,7 @@ class SmoothAutofocusThing(lt.Thing):
             )
 
     def _sphere_corr(self) -> float | None:
-        if type(self)._SPHERE_MESH_LIVE:
+        if type(self)._SPHERE_MESH_LIVE or _cal_mode():
             return None
         fit = type(self)._SPHERE_FIT
         if fit is None:
@@ -2434,45 +2451,50 @@ class SmoothAutofocusThing(lt.Thing):
         if time.monotonic() - type(self)._LAST_SCAN_TS > 60.0:
             type(self)._SPHERE_SAMPLES = []
             type(self)._SPHERE_N = 0
-            self._sphere_load()
-            if not self._mesh_live_on_klippy():
+            if _cal_mode():
+                type(self)._SPHERE_FIT = None
                 type(self)._SPHERE_MESH_LIVE = False
-                self._sphere_install_mesh()
+                _log("CAL MODE: raw calibration scan, no model")
             else:
-                fit = type(self)._SPHERE_FIT
-                xy = self._xy_now()
-                stale = (
-                    fit is None or xy is None
-                    or not (
-                        fit.get("xmin", 0.0) - 30.0
-                        <= xy[0] <=
-                        fit.get("xmax", 0.0) + 30.0
-                        and fit.get("ymin", 0.0) - 30.0
-                        <= xy[1] <=
-                        fit.get("ymax", 0.0) + 30.0
-                    )
-                )
-                if stale:
-                    try:
-                        sender = getattr(
-                            self._stage,
-                            "_send_gcode_script",
-                            None,
-                        )
-                        if sender is not None:
-                            sender(script="SAMPLE_MESH_CLEAR")
-                        _log(
-                            "SPHERE mesh cleared: stale for "
-                            "this position"
-                        )
-                    except Exception:
-                        LOGGER.warning(
-                            "stale mesh clear failed",
-                            exc_info=True,
-                        )
+                self._sphere_load()
+                if not self._mesh_live_on_klippy():
                     type(self)._SPHERE_MESH_LIVE = False
+                    self._sphere_install_mesh()
                 else:
-                    type(self)._SPHERE_MESH_LIVE = True
+                    fit = type(self)._SPHERE_FIT
+                    xy = self._xy_now()
+                    stale = (
+                        fit is None or xy is None
+                        or not (
+                            fit.get("xmin", 0.0) - 30.0
+                            <= xy[0] <=
+                            fit.get("xmax", 0.0) + 30.0
+                            and fit.get("ymin", 0.0) - 30.0
+                            <= xy[1] <=
+                            fit.get("ymax", 0.0) + 30.0
+                        )
+                    )
+                    if stale:
+                        try:
+                            sender = getattr(
+                                self._stage,
+                                "_send_gcode_script",
+                                None,
+                            )
+                            if sender is not None:
+                                sender(script="SAMPLE_MESH_CLEAR")
+                            _log(
+                                "SPHERE mesh cleared: stale for "
+                                "this position"
+                            )
+                        except Exception:
+                            LOGGER.warning(
+                                "stale mesh clear failed",
+                                exc_info=True,
+                            )
+                        type(self)._SPHERE_MESH_LIVE = False
+                    else:
+                        type(self)._SPHERE_MESH_LIVE = True
         _saved_regime = type(self)._LAST_REGIME
         type(self)._SCAN_REGIME_HOLD = True
         try:
