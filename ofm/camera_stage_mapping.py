@@ -25,7 +25,7 @@ from camera_stage_mapping.camera_stage_tracker import Tracker
 from camera_stage_mapping.exceptions import MappingError
 from labthings_fastapi.types.numpy import DenumpifyingDict
 
-from .camera import BaseCamera, downsample
+from .camera import BaseCamera
 from .smooth_autofocus import _EncoderBurst, _probe_regime
 from .stage import BaseStage
 from .view_alignment import ViewAlignmentMixin
@@ -528,11 +528,9 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
         # tracker sees mid-motion or stale frames and the fit
         # residuals blow up (seen 2026-10-28, Y-axis full-res cal).
         recorded_move = _DwellRecordedMove(self._stage)
-        dsf = self._cam.downsampled_array_factor
 
         def _stream_grab() -> np.ndarray:
-            img = self._cam.grab_as_array(stream_name="main")
-            return downsample(dsf, img)
+            return self._cam.grab_as_array(stream_name="main")
 
         tracker = Tracker(
             _stream_grab,
@@ -576,7 +574,6 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
 
         This performs two 1d calibrations in x and y, then combines their results.
         """
-        downsampling_factor = self._cam.downsampled_array_factor
         # Calibrate y-axis first as it is more likely to fail.
         # The x-y difference is due to the camera aspect ratio, not the stage hardware.
         self.logger.info("Calibrating Y axis:")
@@ -608,15 +605,6 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
 
         # Combine X and Y calibrations to make a 2D calibration
         cal_xy: dict = image_to_stage_displacement_from_1d([cal_x, cal_y])
-        # Full-res calibration path: frames come from
-        # capture_downsampled_array (dsf=2 on 2800 => 1400), so the
-        # measured units-per-pixel belong to 1400-space. Rescale to
-        # 2800-space and label accordingly. (The old dsf division
-        # double-corrected and bent the matrix; measured 2026-10-28.)
-        cal_xy["image_to_stage_displacement"] *= downsampling_factor
-        corrected_resolution = tuple(
-            r * downsampling_factor for r in cal_x["image_resolution"]
-        )
 
         csm_matrix = cal_xy["image_to_stage_displacement"]
         csm_as_string = (
@@ -630,8 +618,7 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
             "linear_calibration_x": cal_x,
             "linear_calibration_y": cal_y,
             "downsampled_image_resolution": cal_x["image_resolution"],
-            "image_resolution": corrected_resolution,
-            "downsampling": downsampling_factor,
+            "image_resolution": cal_x["image_resolution"],
         }
 
         data = _serialise_numpy_in_dict(data)
