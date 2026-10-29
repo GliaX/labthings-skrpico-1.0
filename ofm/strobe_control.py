@@ -183,16 +183,12 @@ class StrobeControlThing(OFMThing):
 
     def capture_operating_point(self) -> None:
         """Store the camera's calibrated gain as the pinned operating
-        point used by later strobe re-arms.
-
-        Exposure is deliberately NOT persisted: the continuous-light
-        value is meaningless per mode. Leaving ``exposure_us`` at 0
-        makes ``_pin_exposure`` re-derive the fps-safe per-mode pin
-        (period - 1000 us, ceiling-clamped) on every re-arm."""
-        self.exposure_us = 0
+        point used during the continuous-light phase."""
+        self.exposure_us = int(self._cam.exposure_time)
         self.analogue_gain = float(self._cam.analogue_gain)
         self.logger.info(
-            "operating point captured: gain %.2f (exposure re-pinned per mode)",
+            "operating point captured: exposure %d us, gain %.2f",
+            self.exposure_us,
             self.analogue_gain,
         )
 
@@ -206,8 +202,13 @@ class StrobeControlThing(OFMThing):
         self._send("SYNC_PULSE_STATUS STROBE=camera")
 
     def exit_continuous_light(self) -> None:
-        """Re-arm the calibrated flash width and re-pin the exposure."""
+        """Re-arm the calibrated flash width and re-pin the exposure.
+
+        Entering the strobe phase drops the continuous-light exposure:
+        zeroing ``exposure_us`` makes every re-arm derive the full-frame
+        fps-safe pin for the active mode."""
         self._continuous = False
+        self.exposure_us = 0
         self.strobe_on()
         self._pin_exposure()
 

@@ -1077,6 +1077,21 @@ class StreamingPiCamera2(BaseCamera, ABC):
                 target_white_level=target_white_level,
                 percentile=percentile,
             )
+            self._exposure_time = int(
+                cam.capture_metadata()["ExposureTime"]
+            )
+            self._analogue_gain = float(
+                cam.capture_metadata()["AnalogueGain"]
+            )
+
+    def _capture_converged_operating_point(self) -> None:
+        """Persist the sensor's converged exposure and gain so stream
+        restarts re-apply the calibrated pair instead of stale values."""
+        with self._streaming_picamera() as cam:
+            meta = cam.capture_metadata()
+        self._exposure_time = int(meta["ExposureTime"])
+        self._analogue_gain = float(meta["AnalogueGain"])
+        self.save_settings()
 
     @lt.action
     def calibrate_lens_shading(self) -> None:
@@ -1200,15 +1215,22 @@ class StreamingPiCamera2(BaseCamera, ABC):
         """
         strobe = self._strobe_control
         self.flat_lens_shading()
+        time.sleep(0.2)
         if strobe is not None:
             strobe.enter_continuous_light()
         try:
             self.auto_expose_from_minimum()
+            time.sleep(0.2)
             self.set_static_green_equalisation()
+            time.sleep(0.2)
             self.set_ce_enable_to_off()
+            time.sleep(0.2)
             self.calibrate_lens_shading()
+            time.sleep(0.2)
             if strobe is not None:
                 strobe.capture_operating_point()
+            else:
+                self._capture_converged_operating_point()
         finally:
             if strobe is not None:
                 strobe.exit_continuous_light()
