@@ -345,11 +345,9 @@ class StreamingPiCamera2(BaseCamera, ABC):
         lt.setting writes: the persisted calibration is untouched, and
         restore_calibration_raw returns exactly what the settings say.
 
-        Exposure above the mode's fps-safe ceiling would stretch the
-        frame below its full rate, so it is clamped here."""
-        ceiling = self._strobe_exposure_ceiling()
-        if ceiling is not None:
-            exposure = min(int(exposure), ceiling)
+        The raw control write bypasses the driver's reported exposure
+        range, which clamps below the frame period in fast modes; only
+        the frame period itself bounds the request."""
         with self._streaming_picamera() as cam:
             cam.set_controls({"AnalogueGain": float(gain)})
 
@@ -358,13 +356,9 @@ class StreamingPiCamera2(BaseCamera, ABC):
 
     def restore_calibration_raw(self) -> dict:
         """Re-apply the persisted calibration straight to the sensor and
-        return its readback. Never writes settings. Exposure is clamped
-        to the mode's fps-safe ceiling."""
+        return its readback. Never writes settings."""
         gain = float(self._analogue_gain)
         expo = int(self._exposure_time)
-        ceiling = self._strobe_exposure_ceiling()
-        if ceiling is not None:
-            expo = min(expo, ceiling)
         with self._streaming_picamera() as cam:
             cam.set_controls({"AnalogueGain": gain})
             cam.set_controls({"ExposureTime": expo + 1})
@@ -1093,6 +1087,43 @@ class StreamingPiCamera2(BaseCamera, ABC):
         self._analogue_gain = float(meta["AnalogueGain"])
         self.save_settings()
 
+    def _neutralize_colour_gains(
+            self, tolerance: float = 0.01, rounds: int = 3
+    ) -> None:
+        """Iterate colour gains against the delivered image until the
+        field is neutral. The LST-derived gains leave a residual global
+        cast under this illumination; the delivered image is the truth."""
+        for _ in range(rounds):
+            with self._streaming_picamera() as cam:
+                frame = np.asarray(cam.capture_array("main"))
+            rgb = frame[..., :3].astype(np.float64)
+            med = [float(np.median(rgb[..., c])) for c in range(3)]
+            if med[1] < 50:
+                self.logger.warning(
+                    "gain neutralisation skipped: frame too dark"
+                )
+                return
+            r_gain, b_gain = self.colour_gains
+            r_ratio = med[0] / med[1]
+            b_ratio = med[2] / med[1]
+            if abs(r_ratio - 1) <= tolerance and abs(b_ratio - 1) <= tolerance:
+                self.logger.info(
+                    "colour gains neutral: R/G %.3f B/G %.3f",
+                    r_ratio,
+                    b_ratio,
+                )
+                return
+            self.logger.info(
+                "colour gains adjust: R/G %.3f B/G %.3f -> "
+                "gains (%.3f, %.3f)",
+                r_ratio,
+                b_ratio,
+                r_gain / r_ratio,
+                b_gain / b_ratio,
+            )
+            self.colour_gains = (r_gain / r_ratio, b_gain / b_ratio)
+            time.sleep(0.5)
+
     @lt.action
     def calibrate_lens_shading(self) -> None:
         """Take an image and use it for flat-field correction.
@@ -1127,6 +1158,7 @@ class StreamingPiCamera2(BaseCamera, ABC):
                 self._initialise_picamera()
 
             self.colour_gains = tf_utils.get_colour_gains_from_lst(self.tuning)
+            self._neutralize_colour_gains()
         finally:
             if use_strobe:
                 strobe.exit_continuous_light()

@@ -104,7 +104,7 @@ class StrobeControlThing(OFMThing):
             },
             "crop990": {
                 "fps": 140.0,
-                "blanking_us": 1029,
+                "blanking_us": 523,
                 "frame_period_us": 7143,
             },
         }
@@ -178,7 +178,9 @@ class StrobeControlThing(OFMThing):
             f"WIDTH={microseconds / 1e6:.6f}"
         )
         self._send("SYNC_PULSE_STATUS STROBE=camera")
-        self.flash_duty = microseconds / period
+        mode = self._current_mode()
+        self.mode_duties = {**self.mode_duties, mode: microseconds / period}
+        self._width_by_mode[mode] = microseconds
         self._last_width_us = microseconds
 
     def capture_operating_point(self) -> None:
@@ -215,7 +217,7 @@ class StrobeControlThing(OFMThing):
     @lt.action
     def calibrate_flash(
             self,
-            target_p99: float = 230.0,
+            target_p99: float = 245.0,
             min_width_us: int = 20,
             max_width_us: Optional[int] = None,
             settle_s: float = 0.6,
@@ -298,14 +300,12 @@ class StrobeControlThing(OFMThing):
                 "stream running?"
             )
         duty = chosen / period
-        self.flash_duty = duty
+        mode = self._current_mode()
+        self.mode_duties = {**self.mode_duties, mode: duty}
+        self._width_by_mode[mode] = chosen
+        self._period_by_mode[mode] = period
         if converged:
-            self.mode_duties = {
-                **self.mode_duties,
-                self._current_mode(): duty,
-            }
-            self._width_by_mode[self._current_mode()] = chosen
-            self._period_by_mode[self._current_mode()] = period
+            self.flash_duty = duty
         self._send("SYNC_PULSE_STATUS STROBE=camera")
         report = {
             "converged": converged,
@@ -328,7 +328,7 @@ class StrobeControlThing(OFMThing):
         return report
 
     @lt.action
-    def calibrate_all_modes(self, target_p99: float = 230.0) -> Mapping[str, Any]:
+    def calibrate_all_modes(self, target_p99: float = 245.0) -> Mapping[str, Any]:
         """Calibrate the flash in every legal streaming mode, then restore.
 
         Switches the camera through each of its streaming modes, calibrates
@@ -343,9 +343,22 @@ class StrobeControlThing(OFMThing):
                 if mode != self._current_mode():
                     self._cam.change_streaming_mode(mode=mode)
                     time.sleep(3.0)
+                bounds = (
+                    {
+                        "min_width_us": 50,
+                        "max_width_us": 1000,
+                        "target_p99": 225.0,
+                    }
+                    if mode == "crop990"
+                    else {}
+                )
                 try:
                     results.append(
-                        dict(self.calibrate_flash(target_p99=target_p99))
+                        dict(
+                            self.calibrate_flash(
+                                target_p99=target_p99, **bounds
+                            )
+                        )
                     )
                 except Exception as exc:
                     self.logger.warning(
@@ -379,17 +392,14 @@ class StrobeControlThing(OFMThing):
     @lt.action
     def apply_flash_for_current_mode(self) -> Mapping[str, Any]:
         """Apply ``flash_duty`` scaled to the measured frame period."""
-        period = self._period_us()
-        width = self._width_for_period(period)
-        self._send(
-            f"HWSYNC_STROBE STROBE=camera ENABLE=1 WIDTH={width / 1e6:.6f}"
+        mode = self._current_mode()
+        self._arm_with_duty(
+            self.mode_duties.get(mode, self.flash_duty), mode=mode
         )
-        self._send("SYNC_PULSE_STATUS STROBE=camera")
-        self._last_width_us = width
         return {
-            "period_us": period,
-            "width_us": width,
-            "flash_duty": self.flash_duty,
+            "period_us": self._period_by_mode.get(mode),
+            "width_us": self._width_by_mode.get(mode),
+            "flash_duty": self.mode_duties.get(mode, self.flash_duty),
         }
 
     def _period_us(self) -> int:
@@ -565,11 +575,14 @@ class StrobeControlThing(OFMThing):
         return int(spec["frame_period_us"] - spec["blanking_us"] - 100)
 
     def _pin_exposure(self, period_us: Optional[int] = None) -> None:
-        """Disable AEC and pin exposure high but fps-safe.
+        """Disable AEC and pin the shutter to the full frame period.
 
-        The pin spans most of the frame without spilling into blanking:
-        the mode's active window (period minus blanking) caps the write,
-        keeping the sensor at its full frame rate."""
+        Every row then integrates for the whole period, so the flash is
+        captured wherever it falls inside the frame. The raw control
+        write accepts the full-period value (as with the 45 ms pin in
+        the 22 fps mode) even where the reported control range would
+        clamp it; frame rate is set by the mode's framing limits, not
+        by ExposureTime."""
         try:
             self._cam.set_camera_control("AeEnable", False)
         except AttributeError:
@@ -579,12 +592,18 @@ class StrobeControlThing(OFMThing):
             return
         if period_us is None:
             period_us = self._period_us()
-        exposure = self.exposure_us if self.exposure_us > 0 else period_us - 1000
-        ceiling = self.exposure_ceiling_us()
-        if ceiling is not None:
-            exposure = min(exposure, ceiling)
-        self._cam.exposure_time = exposure
-        self._cam.analogue_gain = self.analogue_gain
+        exposure = (
+            self.exposure_us if self.exposure_us > 0 else int(period_us)
+        )
+        try:
+            self._cam.set_probe_controls_raw(self.analogue_gain, exposure)
+        except Exception as exc:
+            self.logger.warning(
+                "raw exposure pin failed (%s); falling back to property",
+                exc,
+            )
+            self._cam.exposure_time = exposure
+            self._cam.analogue_gain = self.analogue_gain
 
     def _send(self, script: str) -> None:
         response = self._client.post(
