@@ -36,6 +36,20 @@ sys.setswitchinterval(0.001)
 
 LOGGER = logging.getLogger(__name__)
 
+# Machine surface (stage bowl) from the scan_0005/scan_0007 180-deg pair
+# decomposition (2026-10-31, fiber-landmark alignment 178deg + dy=-200),
+# re-referenced to the apex: apex at (0,0), z=0 there. z = A*r^2, drop is
+# radial. SPAN is the half-width of the square mesh install (symmetric).
+# Raw-fit station note: stage (0,0) sat at (407,41) from the apex.
+MACHINE_SURFACE = {
+    "A": -1.83e-4,
+    "APEX_X": -407.1,
+    "APEX_Y": -41.0,
+    "APEX_Z": 30.6,
+    "SPAN": 1346.0,
+    "LATTICE": 129,
+}
+
 _FAR_SPAN = 1024.0
 _FAR_VELOCITY = 2800.0
 _FAR_MEDIAN_BAR = 1.25
@@ -45,7 +59,7 @@ _TINY_MIN_V = 100.0
 _SCAN_SPAN = 60.0
 _SCAN_TINY_DIV = 3.3
 _SCAN_LOCAL = threading.local()
-_PARK_VELOCITY = 9000.0
+_PARK_VELOCITY = 2800.0
 _PARK_CREEP = 300.0
 _CAL_V_ACCEL = 4900.0
 
@@ -1937,6 +1951,82 @@ class SmoothAutofocusThing(lt.Thing):
             )
             type(self)._SPHERE_FIT = None
 
+    @lt.action
+    def install_machine_mesh(self) -> dict:
+        """Install the hardcoded machine surface as a klipper bed mesh
+        via SAMPLE_MESH. Refuses in calibration mode. OFM sphere
+        correction stands down while the mesh is live."""
+        if _cal_mode():
+            raise RuntimeError(
+                "install_machine_mesh: calibration mode is active - "
+                "refusing to install (cal scans must stay clean)"
+            )
+        if not self._machine_install_mesh():
+            raise RuntimeError("install_machine_mesh: install failed")
+        return {"installed": True}
+
+    def _machine_install_mesh(self) -> bool:
+        """Install the hardcoded machine surface as a klipper bed mesh
+        via SAMPLE_MESH. Never runs in calibration mode."""
+        if _cal_mode():
+            return False
+        A = MACHINE_SURFACE["A"]
+        ax = float(MACHINE_SURFACE["APEX_X"])
+        ay = float(MACHINE_SURFACE["APEX_Y"])
+        az = float(MACHINE_SURFACE["APEX_Z"])
+        half = float(MACHINE_SURFACE["SPAN"])
+        gx0, gx1, gy0, gy1 = -half, half, -half, half
+        try:
+            import numpy as np
+        except Exception:
+            return False
+        N = MACHINE_SURFACE.get("LATTICE", 129)
+        vals = np.linspace(-half, half, N)
+        XX, YY = np.meshgrid(vals, vals)
+        zs = A * ((XX - ax) ** 2 + (YY - ay) ** 2) + az
+        base = 0.0
+        rel = zs - base
+        ptp = float(rel.max() - rel.min())
+        if ptp > 1000.0:
+            _log("MACHINE mesh refuse: ptp %.1f" % ptp)
+            return False
+        grid_s = " ".join(f"{v:.3f}" for v in rel.flatten())
+        sender = getattr(self._stage, "_send_gcode_script", None)
+        client = getattr(self._stage, "_client", None)
+        if sender is None or client is None:
+            return False
+        script = (
+            f"SAMPLE_MESH COLS={N} ROWS={N} "
+            f"MIN_X={gx0:.3f} MAX_X={gx1:.3f} "
+            f"MIN_Y={gy0:.3f} MAX_Y={gy1:.3f} "
+            f"ZREF={base:.3f} "
+            f'GRID="{grid_s}"'
+        )
+        try:
+            sender(client=client, script=script)
+        except Exception:
+            LOGGER.warning("machine mesh install failed", exc_info=True)
+            return False
+        type(self)._SPHERE_MESH_LIVE = True
+        _log(
+            "MACHINE mesh installed %dx%d x=[%.0f..%.0f] y=[%.0f..%.0f] "
+            "ptp=%.1f (OFM corr stands down)"
+            % (N, N, gx0, gx1, gy0, gy1, ptp)
+        )
+        return True
+
+    @lt.action
+    def install_machine_mesh(self) -> dict:
+        """Manual trigger for the always-on machine bed mesh."""
+        if _cal_mode():
+            raise RuntimeError(
+                "install_machine_mesh: calibration mode is active - "
+                "refusing to install"
+            )
+        if not self._machine_install_mesh():
+            raise RuntimeError("install_machine_mesh: install failed")
+        return {"installed": True}
+
     def _sphere_install_mesh(self) -> bool:
         fit = type(self)._SPHERE_FIT
         if fit is None or len(type(self)._SPHERE_SAMPLES) < 24:
@@ -2250,6 +2340,7 @@ class SmoothAutofocusThing(lt.Thing):
             "p": [q[3] for q in tiny_pts],
         })
         gate = self._fit_gate(tiny_pts)
+        fallback = False
         if gate is None and tiny_pts:
             s_floor_t = sorted(q[2] for q in tiny_pts)[
                 max(0, len(tiny_pts) * 3 // 10 - 1)
@@ -2269,6 +2360,7 @@ class SmoothAutofocusThing(lt.Thing):
                     else t_arg[0]
                 )
                 mode += "|tiny_near"
+                fallback = True
                 gate = (
                     FitOutcome(ok=True, peak=z_fit, fwhm=None),
                     t_arg[2],
@@ -2280,9 +2372,34 @@ class SmoothAutofocusThing(lt.Thing):
                 type(self)._CAL_FWHM = fit.fwhm
                 self._save_cal("fwhm_u", fit.fwhm)
                 mode += f"|fwhm{fit.fwhm:.1f}"
+            frame_best_z = None
+            frame_decisive = False
+            if tiny_pts:
+                fb = max(tiny_pts, key=lambda q: q[2])
+                floor = sorted(q[2] for q in tiny_pts)[
+                    max(0, len(tiny_pts) * 3 // 10 - 1)
+                ]
+                if fb[2] >= 1.25 * max(floor, 1e-9):
+                    frame_best_z = fb[0]
+                    frame_decisive = True
+            if frame_decisive:
+                target_z = frame_best_z + (
+                    type(self)._REFINE_DZ or 0.0
+                )
+                mode += "|framepick"
+            else:
+                target_z = fit.peak + (
+                    type(self)._REFINE_DZ or 0.0
+                )
+                mode += "|fitpick"
+            lo_b = anchor - span_h
+            hi_b = anchor + span_h
+            if target_z < lo_b or target_z > hi_b:
+                target_z = min(hi_b, max(lo_b, target_z))
+                mode += "|clamped"
             park_z = self._park(
                 monitor,
-                fit.peak + (type(self)._REFINE_DZ or 0.0),
+                target_z,
                 len(monitor.times),
             )
             mode += f"|park{park_z:.1f}"
@@ -2459,7 +2576,8 @@ class SmoothAutofocusThing(lt.Thing):
                 self._sphere_load()
                 if not self._mesh_live_on_klippy():
                     type(self)._SPHERE_MESH_LIVE = False
-                    self._sphere_install_mesh()
+                    if not self._machine_install_mesh():
+                        self._sphere_install_mesh()
                 else:
                     fit = type(self)._SPHERE_FIT
                     xy = self._xy_now()

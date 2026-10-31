@@ -508,12 +508,9 @@ class SmartStackMixin:
             self.as_workflow._autofocus.fast_autofocus(
                 dz=settings.autofocus_params.dz
             )
-        if images_to_save > 1:
-            focus_height: Optional[int] = (
-                self.as_workflow._stage.get_xyz_position()[2]
-            )
-        else:
-            focus_height = None
+        focus_height: Optional[int] = (
+            self.as_workflow._stage.get_xyz_position()[2]
+        )
         if images_to_save > 1 and self.stack_sharp_set:
             half = step
             step = (2 * half) // (images_to_save - 1) if images_to_save > 1 else 0
