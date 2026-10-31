@@ -356,12 +356,26 @@ class StreamingPiCamera2(BaseCamera, ABC):
 
     def restore_calibration_raw(self) -> dict:
         """Re-apply the persisted calibration straight to the sensor and
-        return its readback. Never writes settings."""
+        return its readback. Never writes settings. When the strobe is
+        live the flash operating point owns exposure, so the persisted
+        value is immediately overridden by the strobe's mode pin -
+        without this, a restore after a mode bounce leaves the stale
+        (or driver-clamped) setting on the sensor and the frame goes
+        dark except for the flash-lit rows."""
         gain = float(self._analogue_gain)
         expo = int(self._exposure_time)
         with self._streaming_picamera() as cam:
             cam.set_controls({"AnalogueGain": gain})
             cam.set_controls({"ExposureTime": expo + 1})
+        strobe = self._strobe_control
+        if strobe is not None:
+            try:
+                if strobe.enabled and not strobe._continuous:
+                    strobe._pin_exposure(
+                        strobe.mode_periods.get(self.streaming_mode)
+                    )
+            except Exception:
+                LOGGER.exception("strobe re-pin after restore failed")
         return {"gain": gain, "exposure": expo}
 
     def _get_persistent_controls(self) -> dict:
@@ -627,6 +641,8 @@ class StreamingPiCamera2(BaseCamera, ABC):
         entry so the first frame of the new mode is correctly exposed."""
         strobe = self._strobe_control
         if strobe is None:
+            return
+        if strobe.enabled and not strobe._continuous:
             return
         try:
             ceiling = strobe.exposure_ceiling_us(mode)

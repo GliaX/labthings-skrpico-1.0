@@ -5,24 +5,22 @@
     class="stream-display uk-width-1-1 uk-height-1-1 scrollTarget"
   >
     <img
-      v-if="isVisible"
+      v-show="isVisible && streamEnabled"
       ref="click-frame"
-      class="uk-align-center uk-margin-remove-bottom"
-      :hidden="!streamEnabled"
+      class="uk-align-center uk-margin-remove-bottom stream-image"
+      :style="rotateStyle"
       :src="streamImgUri"
       alt="Stream"
+      @load="updateStreamAspectRatio"
       @dblclick="clickMonitor"
     />
 
     <div v-if="!streamEnabled" class="uk-height-1-1">
-      <div v-if="$store.state.waiting" class="uk-position-center">
+      <div v-if="waiting" class="uk-position-center">
         <div uk-spinner="ratio: 4.5"></div>
       </div>
 
-      <div
-        v-else-if="$store.state.disableStream"
-        class="uk-position-center position-relative text-center"
-      >
+      <div v-else-if="disableStream" class="uk-position-center position-relative text-center">
         Stream preview disabled
       </div>
 
@@ -36,60 +34,108 @@
 <script>
 import { eventBus } from "../../eventBus.js";
 import { useIntersectionObserver } from "@vueuse/core";
+import { useSettingsStore } from "@/stores/settings.js";
+import { mapState } from "pinia";
+
+const ONE_PIXEL_FALLBACK = "data:image/PNG;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=";
 
 // Export main app
 export default {
   name: "StreamDisplay",
+
+  props: {
+    streamId: {
+      type: [String],
+      required: true,
+    },
+  },
+
+  setup() {
+    const store = useSettingsStore();
+    return {
+      store,
+    };
+  },
 
   data: function () {
     return {
       isVisible: false,
       displaySize: [0, 0],
       displayPosition: [0, 0],
-      resizeTimeoutId: setTimeout(this.doneResizing, 500),
+      resizeTimeoutId: null,
     };
   },
 
   computed: {
-    streamEnabled: function () {
-      return this.$store.getters.ready && !this.$store.state.disableStream;
+    ...mapState(useSettingsStore, [
+      "ready",
+      "baseUri",
+      "disableStream",
+      "waiting",
+      "navigationRotate",
+      "navigationMirror",
+    ]),
+    rotateStyle: function () {
+      const rot = (((this.navigationRotate || 0) % 360) + 360) % 360;
+      const mirror = this.navigationMirror ? "scaleX(-1) " : "";
+      if (rot === 90 || rot === 270) {
+        return {
+          transform: `${mirror}scaleY(-1) rotate(${rot}deg)`,
+          maxWidth: "100%",
+          maxHeight: "100%",
+          width: "auto",
+          height: "100%",
+        };
+      }
+      if (rot !== 180) {
+        return { transform: `${mirror}rotate(${rot}deg) scaleY(-1)` };
+      }
+      return { transform: `${mirror}scaleY(-1) rotate(${rot}deg)` };
     },
-    thisStreamOpen: function () {
-      // Only a single MJPEG connection should be open at a time
-      return !(this.displaySize[0] == 0) && !(this.displaySize[1] == 0);
+    streamEnabled: function () {
+      return this.ready && !this.disableStream;
     },
     streamImgUri: function () {
-      return `${this.$store.getters.baseUri}/camera/mjpeg_stream`;
+      // Only request the real stream if it's enabled AND currently visible on screen
+      if (this.isVisible && this.streamEnabled) {
+        const url = new URL(`${this.baseUri}/camera/mjpeg_stream`);
+        url.searchParams.append("streamId", this.streamId);
+        return url.toString();
+      }
+
+      // Force the browser to kill the connection by loading a 1 pixel image
+      return ONE_PIXEL_FALLBACK;
     },
   },
 
   mounted() {
-    //set up an intersection observer
-    useIntersectionObserver(
+    // Initial Timeout
+    this.resizeTimeoutId = setTimeout(this.handleDoneResize, 500);
+
+    // set up an intersection observer
+    // We capture the 'stop' function returned by VueUse so we can kill it later
+    const { stop } = useIntersectionObserver(
       this.$refs.streamDisplay,
       ([{ isIntersecting }]) => {
         this.isVisible = isIntersecting;
       },
-      {
-        threshold: 0.0,
-      },
+      { threshold: 0.0 },
     );
+    this.stopIntersectionObserver = stop;
     // A global signal listener to flash the stream element
-    this.onFlashStream = () => {
-      this.flashStream();
-    };
-
-    eventBus.on("globalFlashStream", this.onFlashStream);
+    eventBus.on("globalFlashStream", this.flashStream);
 
     // Mutation observer
     this.sizeObserver = new ResizeObserver(() => {
       this.handleResize(); // For any element attached to the observer, run handleResize() on change
     });
-    // Fetch streamDisplay component by ref
-    if (this.$refs.streamDisplay && this.$refs.streamDisplay.parentNode) {
-      const streamDisplayElement = this.$refs.streamDisplay.parentNode;
+
+    // Safely fetch the DOM element (handles both native HTML and Vue components)
+    const streamElement = this.$refs.streamDisplay?.$el || this.$refs.streamDisplay;
+
+    if (streamElement && streamElement.parentNode) {
       // Attach streamDisplay to the size observer
-      this.sizeObserver.observe(streamDisplayElement);
+      this.sizeObserver.observe(streamElement.parentNode);
     }
   },
 
@@ -97,22 +143,58 @@ export default {
     // Do nothing: preview stream now runs all the time
   },
 
-  beforeUnmount: function () {
-    // Disconnect the size observer
-    this.sizeObserver.disconnect();
-    // Remove from the array of active streams
-    this.$store.commit("removeStream", this._uid);
+  beforeUnmount() {
+    // Kill the resize timeout
+    clearTimeout(this.resizeTimeoutId);
+
+    // Kill the flash animation timeout (Fixes Beth's MR comment)
+    if (this.flashTimeoutId) {
+      clearTimeout(this.flashTimeoutId);
+    }
+
+    // Kill the Intersection Observer
+    if (this.stopIntersectionObserver) {
+      this.stopIntersectionObserver();
+    }
+
+    // Unregister the event bus listener
+    eventBus.off("globalFlashStream", this.flashStream);
+
+    // Disconnect the size Observer
+    if (this.sizeObserver) {
+      this.sizeObserver.disconnect();
+      this.store.removeStream(this.streamId);
+    }
+    const imgElement = this.$refs["click-frame"];
+    if (imgElement) {
+      imgElement.src = ONE_PIXEL_FALLBACK;
+    }
   },
 
   methods: {
     flashStream: function () {
       // Run an animation that flashes the stream (for capture feedback)
       let element = this.$refs.streamDisplay;
+
+      // Defensive check in case the ref isn't available
+      if (!element) return;
+
       element.classList.remove("uk-animation-fade");
-      element.offsetHeight; /* trigger reflow */
+      /* trigger reflow */
+      element.offsetHeight;
       element.classList.add("uk-animation-fade");
-      setTimeout(function () {
-        element.classList.remove("uk-animation-fade");
+
+      // Clear the timer if flashStream is called again before the 800ms is up
+      if (this.flashTimeoutId) {
+        clearTimeout(this.flashTimeoutId);
+      }
+
+      // Track the timeout ID
+      this.flashTimeoutId = setTimeout(() => {
+        // Extra defensive check just in case
+        if (element && element.classList) {
+          element.classList.remove("uk-animation-fade");
+        }
       }, 800);
     },
 
@@ -134,6 +216,11 @@ export default {
       let xRelative = (0.5 * event.target.offsetWidth - xCoordinate) * scale;
       let yRelative = (0.5 * event.target.offsetHeight - yCoordinate) * scale;
 
+      // NB offsetX/offsetY are element-local: the browser already maps the
+      // click through the inverse of the preview CSS rotation, so these are
+      // raw camera-frame coordinates even when the preview is rotated —
+      // no extra transform is wanted here.
+
       // Emit a signal to move, acted on by paneControl.vue
       eventBus.emit("globalMoveInImageCoordinatesEvent", {
         x: -xRelative,
@@ -149,17 +236,16 @@ export default {
 
     handleDoneResize: function () {
       // Recalculate size
-
       this.recalculateSize();
       // Handle closed stream
       if (this.displaySize[0] == 0 && this.displaySize[1] == 0) {
         // If this stream was previously active
-        if (this.$store.state.activeStreams[this._uid] == true) {
-          this.$store.commit("removeStream", this._uid);
+        if (this.store.activeStreams[this.streamId] == true) {
+          this.store.removeStream(this.streamId);
         }
         // If resized to anything other than zero
       } else {
-        this.$store.commit("addStream", this._uid);
+        this.store.addStream(this.streamId);
       }
     },
 
@@ -180,6 +266,15 @@ export default {
 
       this.displaySize = elementSize;
       this.displayPosition = elementPositionOnDisplay;
+    },
+    updateStreamAspectRatio(event) {
+      if (!this.store.cameraStreamAspectRatio) {
+        const img = event.target;
+
+        if (img && img.naturalWidth > 1 && img.naturalHeight > 1) {
+          this.store.setCameraStreamAspectRatio(img.naturalWidth, img.naturalHeight);
+        }
+      }
     },
   },
 };

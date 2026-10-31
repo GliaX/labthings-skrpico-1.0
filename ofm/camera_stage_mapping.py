@@ -764,7 +764,9 @@ def csm_img_to_stage(
     :param y: the y image coordinate (keyword only)
     :return: The resulting stage coordinates as a mapping.
     """
-    # Note this is (y,x) not (x,y) to put it in numpy image indices
+    # (y,x) row product: legacy convention kept byte-compatible for the
+    # scan path and the UI image-jog (which carries preview-rotation
+    # compensation). Recenter does not use this; see stage_measure.
     relative_move: np.ndarray = np.dot(np.array([y, x]), np.array(matrix))
     return {"x": round(relative_move[0]), "y": round(relative_move[1])}
 

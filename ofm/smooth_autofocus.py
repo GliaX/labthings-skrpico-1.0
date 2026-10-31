@@ -1284,7 +1284,7 @@ class SmoothAutofocusThing(lt.Thing):
         return prev if prev is not None else 0.0
 
     def _scan_static(
-            self, monitor: StreamSharpnessMonitor, frames: int = 12
+            self, monitor: StreamSharpnessMonitor, frames: int = 2
     ) -> float:
         """Scan-mode one-window settle read: median of a single frame
         window after motion. At 22fps the two-window plateau can't fit
@@ -1294,7 +1294,7 @@ class SmoothAutofocusThing(lt.Thing):
         m = len(monitor.times)
         monitor.wait_frames(frames, m, timeout=0.6 if fps < 100.0 else 0.25)
         win = monitor.frames_since(m)[-frames:]
-        if len(win) < max(3, frames * 2 // 3):
+        if len(win) < frames:
             return 0.0
         return statistics.median([f[2] for f in win])
 
@@ -1738,7 +1738,7 @@ class SmoothAutofocusThing(lt.Thing):
 
         m_settle = len(monitor.times)
         monitor.wait_frames(
-            6, m_settle,
+            1, m_settle,
             timeout=0.25 if _af_fps(self._cam) >= 100.0 else 0.5,
         )
         pre = monitor.frames_since(0)[-4:]

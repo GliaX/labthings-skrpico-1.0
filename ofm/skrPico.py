@@ -703,7 +703,6 @@ class SkrPicoThing(BaseStage):
         stage.
         """
         client = self._client
-        self._send_gcode_script(client, "SAMPLE_MESH_CLEAR")
         self._send_gcode_script(client, "SET_KINEMATIC_POSITION X=0 Y=0 Z=0 SET_HOMED=XYZ")
         self.update_position()
 
