@@ -14,7 +14,7 @@
         class="uk-button uk-button-primary dpad-btn"
         @pointerdown="jog($event, 0, 1, 0)"
         @pointerup="jogStop()"
-        @mouseLeave="jogStop()"
+        @pointercancel="jogStop()"
       >
         <span class="material-symbols-outlined sync-icon"> arrow_upward </span>
       </button>
@@ -79,6 +79,8 @@
 
 <script>
 import { eventBus } from "@/eventBus.js";
+import { mapWritableState } from "pinia";
+import { useSettingsStore } from "@/stores/settings.js";
 
 export default {
   name: "StageControlButtons",
@@ -94,9 +96,18 @@ export default {
   },
   data: () => ({
     jogIntervalId: null,
-    jogDistance: 10,
-    jogTime: 3,
+    jogTime: 30,
   }),
+
+  computed: {
+    ...mapWritableState(useSettingsStore, [
+      "navigationInvert",
+      "navigationStepSize",
+      "navigationRotate",
+      "stageToImageRotation",
+    ]),
+  },
+
   methods: {
     /**
      * Jog d-pad and focus buttons.
@@ -116,13 +127,24 @@ export default {
       // pointer is.
       pointerEvent.target.setPointerCapture(pointerEvent.pointerId);
 
-      const navigationInvert = this.$store.state.navigationInvert;
-      let invokeJog = () =>
+      let invokeJog = () => {
+        let jx = x * this.navigationStepSize.x * (this.navigationInvert.x ? -1 : 1);
+        let jy = y * this.navigationStepSize.y * (this.navigationInvert.y ? -1 : 1);
+        const delta =
+          ((((this.navigationRotate || 0) + (this.stageToImageRotation || 0)) % 360) + 360) % 360;
+        if (delta === 90) {
+          [jx, jy] = [jy, -jx];
+        } else if (delta === 180) {
+          [jx, jy] = [-jx, -jy];
+        } else if (delta === 270) {
+          [jx, jy] = [-jy, jx];
+        }
         this.invokeAction("stage", "jog", {
-          x: x * this.jogDistance * (navigationInvert.x ? -1 : 1),
-          y: y * this.jogDistance * (navigationInvert.y ? -1 : 1),
-          z: z * this.jogDistance,
+          x: jx,
+          y: jy,
+          z: z * this.navigationStepSize.z,
         });
+      };
       invokeJog();
       this.jogIntervalId = setInterval(invokeJog, this.jogTime);
     },
@@ -171,14 +193,17 @@ export default {
   grid-column: 2;
   grid-row: 1;
 }
+
 .dpad-grid #left-button {
   grid-column: 1;
   grid-row: 2;
 }
+
 .dpad-grid #right-button {
   grid-column: 3;
   grid-row: 2;
 }
+
 .dpad-grid #down-button {
   grid-column: 2;
   grid-row: 3;
@@ -188,6 +213,7 @@ export default {
   grid-column: 1;
   grid-row: 5;
 }
+
 .both-controls #focus-in-button {
   grid-column: 3;
   grid-row: 5;
@@ -197,6 +223,7 @@ export default {
   grid-column: 1;
   grid-row: 1;
 }
+
 .focus-only #focus-in-button {
   grid-column: 3;
   grid-row: 1;

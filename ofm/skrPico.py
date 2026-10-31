@@ -580,7 +580,7 @@ class SkrPicoThing(BaseStage):
         gcode_axes = "".join(
             f"{axis.upper()}{axisDisplacement} " for axis, axisDisplacement in displacement_axis.items())
         if planned:
-            script = (f"{move_type.value}\nG1 {gcode_axes}S9000 F45000\nM400\n")
+            script = (f"{move_type.value}\nG1 {gcode_axes}S2800 F168000\nM400\n")
         else:
             scale = max(abs(d) for d in displacement_axis.values()) / 600
             jog_dir = [1 if d > 0 else -1 if d < 0 else 0 for d in displacement_axis.values()]

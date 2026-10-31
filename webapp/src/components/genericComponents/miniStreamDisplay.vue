@@ -65,17 +65,14 @@ export default {
       const mirror = this.navigationMirror ? "scaleX(-1) " : "";
       if (rot === 90 || rot === 270) {
         return {
-          transform: `${mirror}scaleY(-1) rotate(${rot}deg)`,
+          transform: `${mirror}rotate(${rot}deg)`,
           maxWidth: "100%",
           maxHeight: "100%",
           width: "auto",
           height: "100%",
         };
       }
-      if (rot !== 180) {
-        return { transform: `${mirror}rotate(${rot}deg) scaleY(-1)` };
-      }
-      return { transform: `${mirror}scaleY(-1) rotate(${rot}deg)` };
+      return { transform: `${mirror}rotate(${rot}deg)` };
     },
     streamEnabled: function () {
       return this.ready && !this.disableStream;

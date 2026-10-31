@@ -7,9 +7,7 @@ This includes:
 """
 
 import json
-import labthings_fastapi as lt
 import math
-import numpy as np
 import os
 import time
 from copy import copy
@@ -17,9 +15,12 @@ from datetime import datetime
 from threading import Lock
 from typing import Any, Literal, Mapping, Optional, overload
 
-from camera_stage_mapping import fft_image_tracking
+import labthings_fastapi as lt
+import numpy as np
 # Things
 from openflexure_microscope_server.things import OFMThing
+
+from camera_stage_mapping import fft_image_tracking
 from .autofocus import AutofocusThing
 from .camera import BaseCamera
 from .camera_stage_mapping import CameraStageMapper

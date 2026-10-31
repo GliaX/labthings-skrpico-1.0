@@ -10,13 +10,12 @@ This module is only intended to be called from the OpenFlexure Microscope
 server, and depends on that server and its underlying LabThings library.
 """
 
-import json
-import logging
-import time
-from typing import Any, List, Mapping, NamedTuple, Optional, Tuple, cast
-
 import labthings_fastapi as lt
+import logging
+import math
 import numpy as np
+import time
+from pathlib import Path
 from camera_stage_mapping.camera_stage_calibration_1d import (
     calibrate_backlash_1d,
     image_to_stage_displacement_from_1d,
@@ -24,14 +23,11 @@ from camera_stage_mapping.camera_stage_calibration_1d import (
 from camera_stage_mapping.camera_stage_tracker import Tracker
 from camera_stage_mapping.exceptions import MappingError
 from labthings_fastapi.types.numpy import DenumpifyingDict
+from typing import Any, List, Mapping, NamedTuple, Optional, Tuple, cast
 
 from .camera import BaseCamera
-from .smooth_autofocus import _EncoderBurst, _probe_regime
 from .stage import BaseStage
 from .view_alignment import ViewAlignmentMixin
-
-
-
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -170,7 +166,6 @@ def _patch_relative_motion_ladder(limits=None, cam=None, stage=None) -> None:
     _cal_mod.fit_backlash = _fit_backlash_lenient
 
 
-
 class MoveHistory(NamedTuple):
     """A named tuple containing the position over time for a single move.
 
@@ -178,10 +173,12 @@ class MoveHistory(NamedTuple):
 
     * ``times``
     * ``stage_positions``
+    * ``image_positions``
     """
 
     times: List[float]
     stage_positions: List[tuple[int, int, int]]
+    image_positions: List[tuple[float, float]]
 
 
 def _array_to_stage_tuple(pos: np.ndarray) -> tuple[int, int, int]:
@@ -281,14 +278,286 @@ class _DwellRecordedMove(RecordedMove):
             else new_position
         )
         if _norm(
-            np.asarray(new_position, dtype=float) - np.asarray(cur, dtype=float)
+                np.asarray(new_position, dtype=float) - np.asarray(cur, dtype=float)
         ) > 600.0:
             raise MappingError(
                 "Calibration attempted a move of more than 600 units - "
                 "steps_per_pixel estimate exploded; aborting to protect travel."
             )
         super().__call__(new_position)
-        time.sleep(0.35)
+        time.sleep(1.0)
+
+
+def _ncc_track(image, tmpl_f, tsize, anchor, span):
+    """Locate the template in ``image`` near ``anchor`` by NCC.
+
+    The search region is a ``(tsize + 2*span)`` square centred on
+    ``anchor`` (the predicted position), so features further away
+    than ``span`` are structurally outside the search. Returns
+    ``(dx, dy, score)`` offsets of the template centre relative to
+    its position in the template-acquisition frame, or None when the
+    peak correlation is too weak to trust."""
+    half = tsize // 2
+    region = tsize + 2 * span
+    ax = int(round(anchor[0]))
+    ay = int(round(anchor[1]))
+    x0 = ax - half - span
+    y0 = ay - half - span
+    if (
+            x0 < 0 or y0 < 0
+            or y0 + region > image.shape[0]
+            or x0 + region > image.shape[1]
+    ):
+        return None
+    reg = image[y0:y0 + region, x0:x0 + region].astype(np.float32)
+    corr = np.fft.ifft2(np.fft.fft2(reg) * np.conj(tmpl_f)).real
+    valid = corr[: region - tsize + 1, : region - tsize + 1]
+    f64 = reg.astype(np.float64)
+    sat = np.zeros((region + 1, region + 1))
+    sat[1:, 1:] = np.cumsum(np.cumsum(f64, 0), 1)
+    sat2 = np.zeros((region + 1, region + 1))
+    sat2[1:, 1:] = np.cumsum(np.cumsum(f64 * f64, 0), 1)
+    tt = float(tsize * tsize)
+    box1 = (
+        sat[tsize:, tsize:] - sat[:-tsize, tsize:]
+        - sat[tsize:, :-tsize] + sat[:-tsize, :-tsize]
+    )
+    box2 = (
+        sat2[tsize:, tsize:] - sat2[:-tsize, tsize:]
+        - sat2[tsize:, :-tsize] + sat2[:-tsize, :-tsize]
+    )
+    var = box2 - box1 * box1 / tt
+    norm = np.sqrt(np.maximum(var, 0.0))
+    scores = valid / np.maximum(norm, 1e-6)
+    scores = np.where(norm > 1e-6, scores, -2.0)
+    s = 2 * span + 1
+    j, i = np.unravel_index(int(np.argmax(scores)), scores.shape)
+    if scores[j, i] < 0.35:
+        return None
+    sx, sy = 0.0, 0.0
+    if 0 < i < s - 1:
+        row = scores[j]
+        denom = row[i - 1] - 2.0 * row[i] + row[i + 1]
+        if denom < -1e-9:
+            sx = 0.5 * (row[i - 1] - row[i + 1]) / denom
+    if 0 < j < s - 1:
+        col = scores[:, i]
+        denom = col[j - 1] - 2.0 * col[j] + col[j + 1]
+        if denom < -1e-9:
+            sy = 0.5 * (col[j - 1] - col[j + 1]) / denom
+    px = x0 + i + sx + half
+    py = y0 + j + sy + half
+    return float(px), float(py), float(scores[j, i])
+
+
+_TRACK_SPAN = 60
+
+
+def _make_csm_template(image, tsize=64):
+    """Pick a high-texture central patch and return its FFT + centre."""
+    if image.ndim == 3:
+        image = image.mean(axis=2)
+    half = tsize // 2
+    H, W = image.shape
+    best = None
+    best_var = 100.0
+    for cy in range(H // 2 - 200, H // 2 + 200 - tsize, 24):
+        for cx in range(W // 2 - 200, W // 2 + 200 - tsize, 24):
+            v = float(image[cy:cy + tsize, cx:cx + tsize].astype(
+                np.float32
+            ).var())
+            if v > best_var:
+                best_var = v
+                best = (cy, cx)
+    if best is None:
+        raise MappingError(
+            "CSM template: no textured patch near the field centre"
+        )
+    cy, cx = best
+    ref = image[cy:cy + tsize, cx:cx + tsize].astype(np.float32)
+    ref -= ref.mean()
+    n = math.sqrt(float((ref * ref).sum()))
+    if n < 1e-6:
+        raise MappingError("CSM template: degenerate patch")
+    ref /= n
+    region = tsize + 2 * _TRACK_SPAN
+    pad = np.zeros((region, region), dtype=np.float32)
+    pad[:tsize, :tsize] = ref
+    return np.fft.fft2(pad), (float(cx + half), float(cy + half))
+
+
+class _LocalWindowTracker(Tracker):
+    """Tracker with a prediction-anchored local correlation window.
+
+    The stock tracker correlates the template against the whole frame
+    and takes a global argmax; on quasi-periodic samples the match can
+    re-lock onto a wrong texture period hundreds of px away, and the
+    least-squares backlash fit cannot survive such points. Here the
+    search region is re-centred on a stage-space prediction of the
+    sample position each step, so wrong-period peaks are outside the
+    window by construction."""
+
+    dropped_points: List[tuple] = []
+
+    def _slope_estimate(self) -> np.ndarray:
+        sp = self._stage_positions
+        ip = self._image_positions
+        n = min(len(sp), len(ip))
+        if n < 2:
+            return np.zeros(2)
+        spA = np.asarray(sp[:n], dtype=float)
+        ipA = np.asarray(ip[:n], dtype=float)
+        j = n - 1
+        while j > 0 and float(
+                np.linalg.norm(spA[j][:2] - spA[j - 1][:2])
+        ) < 0.5:
+            j -= 1
+        if j == 0:
+            return np.zeros(2)
+        d = spA[j][:2] - spA[j - 1][:2]
+        norm = float(np.linalg.norm(d))
+        if norm < 1.0:
+            return np.zeros(2)
+        sd = d / norm
+        xf = spA[:, :2] @ sd
+        out = []
+        for c in range(2):
+            ratios = [
+                (ipA[i][c] - ipA[i - 1][c]) / (xf[i] - xf[i - 1])
+                for i in range(1, n)
+                if abs(xf[i] - xf[i - 1]) > 0.5
+            ]
+            out.append(
+                float(np.median(ratios)) if ratios else 0.0
+            )
+        return np.asarray(out)[::-1]
+
+    def acquire_template(
+            self, settle=True, reset_history=True, relative_positions=True
+    ):
+        if settle:
+            self.settle()
+        image = self._grab_image().astype(np.float32)
+        self._tmpl_f, self._tmpl_anchor = _make_csm_template(image)
+        self._tsize = 64
+        self.image_shape = image.shape
+        if reset_history:
+            self.reset_history()
+        self._template_position = np.array([0.0, 0.0])
+        self.append_point(settle=False)
+
+    def track_image(self, image):
+        img = np.asarray(image).astype(np.float32)
+        if img.ndim == 3:
+            img = img.mean(axis=2)
+        n = len(self._image_positions)
+        if n == 0:
+            pred = np.zeros(2)
+        else:
+            sp = np.asarray(self._stage_positions, dtype=float)
+            ip = np.asarray(self._image_positions, dtype=float)
+            gap = (
+                np.asarray(self.get_position(), dtype=float)[:2]
+                - sp[-1][:2]
+            )
+            pred = ip[-1] + self._slope_estimate() * gap
+        anchor = np.asarray(self._tmpl_anchor) + pred
+        result = _ncc_track(
+            img, self._tmpl_f, self._tsize, anchor, _TRACK_SPAN
+        )
+        if result is None:
+            raise MappingError(
+                "CSM tracking: correlation below threshold near "
+                f"predicted position {anchor}"
+            )
+        px, py, score = result
+        found_disp = (
+            np.asarray(self._tmpl_anchor)[::-1] - np.array([py, px])
+        )
+        drift = found_disp - pred
+        if abs(drift[0]) > 100.0 or abs(drift[1]) > 100.0:
+            raise MappingError(
+                f"CSM tracking: found position {found_disp} is more "
+                f"than 100px from prediction {pred} - possible re-lock"
+            )
+        return found_disp
+
+    def append_point(self, settle=True, image=None):
+        if settle:
+            self.settle()
+        if image is None:
+            image = self._grab_image()
+        image_pos = self.track_image(image)
+        stage_pos = self.get_position()
+        self._image_positions.append(image_pos)
+        self._stage_positions.append(stage_pos)
+        self._times.append(time.time())
+        self._last_point = (image, image_pos)
+        return stage_pos, image_pos
+
+    def reset_history(self, leave_first_point=False):
+        if leave_first_point:
+            self._stage_positions = self._stage_positions[:1]
+            self._image_positions = self._image_positions[:1]
+            self._times = self._times[:1]
+        else:
+            self._stage_positions = []
+            self._image_positions = []
+            self._times = []
+
+    @property
+    def stage_positions(self):
+        return np.array(
+            [tuple(p) for p in self._stage_positions]
+        )
+
+    @property
+    def image_positions(self):
+        return np.array(
+            [tuple(p) for p in self._image_positions]
+        )
+
+    @property
+    def times(self):
+        return np.array(self._times)
+
+    @property
+    def history(self):
+        sp = self.stage_positions
+        ip = self.image_positions
+        tm = self.times
+
+        class _H(dict):
+            def __getitem__(self, k):
+                if isinstance(k, int):
+                    return (sp, ip, tm)[k]
+                return dict.__getitem__(self, k)
+
+            def __contains__(self, k):
+                return True
+
+            def __len__(self):
+                return 3
+
+            def __iter__(self):
+                return iter((sp, ip, tm))
+
+        return _H(
+            stage_positions=sp, image_positions=ip, times=tm
+        )
+
+    @property
+    def moving_away_from_centre(self):
+        if len(self._image_positions) < 2:
+            return None
+        a = float(np.linalg.norm(np.asarray(self._image_positions[-1])))
+        b = float(np.linalg.norm(np.asarray(self._image_positions[-2])))
+        return a > b
+
+    @property
+    def max_safe_displacement(self):
+        cap = 0.65 * float(min(self.image_shape[0], self.image_shape[1]))
+        return min(60.0, cap)
 
 
 class CSMUncalibratedError(lt.exceptions.InvocationError):
@@ -344,7 +613,6 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
             self._stage.update_position()
         self._cam.settle()
 
-
     def _calibrate_with_ceiling(
             self,
             tracker: Tracker,
@@ -365,10 +633,10 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
             limits = None
         if limits is None:
             return calibrate_backlash_1d(
-            tracker, recorded_move, direction_array,
-            logger=self.logger,
-            return_data_on_failure=True,
-        )
+                tracker, recorded_move, direction_array,
+                logger=self.logger,
+                return_data_on_failure=True,
+            )
         pps = abs(result.get("pixels_per_step", 0.0))
         fe = result.get("fractional_error", 1.0)
         self.logger.warning(
@@ -455,6 +723,8 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
             if prev_mode != "crop990":
                 cam._stop_streaming(stop_web_stream=False)
                 cam._start_streaming("crop990")
+            from .smooth_autofocus import _probe_regime
+
             _g, _e = _probe_regime(prev_gain, prev_exp)
             cam.set_probe_controls_raw(_g, _e)
             self.logger.info(
@@ -532,11 +802,12 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
         def _stream_grab() -> np.ndarray:
             return self._cam.grab_as_array(stream_name="main")
 
-        tracker = Tracker(
+        tracker = _LocalWindowTracker(
             _stream_grab,
             self._stage.get_xyz_position,
             settle=self._cam.settle,
         )
+        tracker.dropped_points = []
         direction_array: np.ndarray = np.array(direction)
 
         starting_position = self._stage.position
@@ -546,10 +817,13 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
             )
         except MappingError as e:
             self.logger.error(
-                "CSM 1d fit failed (%s); positions visited: %s",
+                "CSM 1d fit failed (%s); dropped %d re-lock points; "
+                "positions visited: %s",
                 e,
+                len(tracker.dropped_points),
                 getattr(recorded_move, "_history", None),
             )
+            self._dump_failed_fit(tracker, direction_array, starting_position)
             raise
         except lt.exceptions.InvocationCancelledError as e:
             self.logger.info("User cancelled the camera stage mapping calibration")
@@ -564,9 +838,64 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
                 **starting_position, block_cancellation=True, backlash_compensation=None
             )
             raise e
-        result["move_history"] = recorded_move.history
+        result["move_history"] = {
+            "times": [t for t, p in recorded_move._history],
+            "stage_positions": [p for t, p in recorded_move._history],
+        }
+        result["dropped_relock_points"] = len(tracker.dropped_points)
+        if tracker.dropped_points:
+            self.logger.info(
+                "CSM dropped %d template re-lock points",
+                len(tracker.dropped_points),
+            )
+        try:
+            stage_pos, image_pos, times = tracker.history
+            folder = Path("/home/admin/ofm/openflexure/data/csm_debug")
+            folder.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                folder / f"csm_track_{time.strftime('%Y%m%d_%H%M%S')}_"
+                f"{int(direction_array[0])}{int(direction_array[1])}.npz",
+                times=np.asarray(times, dtype=float),
+                stage=np.asarray(stage_pos, dtype=float),
+                image=np.asarray(image_pos, dtype=float),
+                direction=direction_array,
+                dropped=np.asarray(tracker.dropped_points, dtype=float),
+            )
+        except Exception:
+            self.logger.exception("CSM track dump failed")
         result["image_resolution"] = _stream_grab().shape[:2]
         return result
+
+    def _dump_failed_fit(
+            self,
+            tracker: Tracker,
+            direction_array: np.ndarray,
+            starting_position: Mapping[str, int],
+    ) -> None:
+        """Persist the tracker's stage+image history when the 1d fit fails.
+
+        The residual gate discards the data we most need to debug a
+        failure; save it as npz before the invocation ends."""
+        try:
+            import time as _time
+
+            stage_pos, image_pos, times = tracker.history
+            folder = Path("/home/admin/ofm/openflexure/data/csm_debug")
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / (
+                f"csm_fail_{_time.strftime('%Y%m%d_%H%M%S')}_"
+                f"{int(direction_array[0])}{int(direction_array[1])}.npz"
+            )
+            np.savez_compressed(
+                path,
+                times=np.asarray(times, dtype=float),
+                stage=np.asarray(stage_pos, dtype=float),
+                image=np.asarray(image_pos, dtype=float),
+                direction=direction_array,
+            )
+            self.logger.info("CSM failure data saved to %s", path)
+        except Exception:
+            self.logger.exception("CSM failure dump failed")
 
     @lt.action
     def calibrate_xy(self) -> dict:

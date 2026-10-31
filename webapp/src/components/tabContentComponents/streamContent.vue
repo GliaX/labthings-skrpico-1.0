@@ -80,17 +80,14 @@ export default {
       const mirror = this.navigationMirror ? "scaleX(-1) " : "";
       if (rot === 90 || rot === 270) {
         return {
-          transform: `${mirror}scaleY(-1) rotate(${rot}deg)`,
+          transform: `${mirror}rotate(${rot}deg)`,
           maxWidth: "100%",
           maxHeight: "100%",
           width: "auto",
           height: "100%",
         };
       }
-      if (rot !== 180) {
-        return { transform: `${mirror}rotate(${rot}deg) scaleY(-1)` };
-      }
-      return { transform: `${mirror}scaleY(-1) rotate(${rot}deg)` };
+      return { transform: `${mirror}rotate(${rot}deg)` };
     },
     streamEnabled: function () {
       return this.ready && !this.disableStream;
@@ -199,32 +196,35 @@ export default {
     },
 
     clickMonitor: function (event) {
-      // Calculate steps from event coordinates
-      let xCoordinate = event.offsetX;
-      let yCoordinate = event.offsetY;
+      // Click position in VISUAL space, relative to the displayed centre
+      // (getBoundingClientRect reflects the CSS transform; offsetX/offsetY
+      // do not, so they cannot be used directly here).
+      const img = event.target;
+      const rect = img.getBoundingClientRect();
+      let x = event.clientX - (rect.left + rect.width / 2);
+      let y = event.clientY - (rect.top + rect.height / 2);
 
-      // Simply scaling by naturalHeight/offsetHeight may give the wrong answer!
-      // because we use content-fit: contain in the stylesheet, the img element
-      // may be larger than the picture.  So, we must determine whether the
-      // width or height is setting the scaling factor, and use a uniform scale
-      // factor.
-      let scale = Math.max(
-        event.target.naturalWidth / event.target.offsetWidth,
-        event.target.naturalHeight / event.target.offsetHeight,
+      // Invert the preview transform (rotation, then mirror) to get
+      // camera-frame pixel offsets from the image centre.
+      const rot = (((this.navigationRotate || 0) % 360) + 360) % 360;
+      if (this.navigationMirror) {
+        x = -x;
+      }
+      const rad = (-rot * Math.PI) / 180;
+      const xLocal = x * Math.cos(rad) - y * Math.sin(rad);
+      const yLocal = x * Math.sin(rad) + y * Math.cos(rad);
+
+      // Uniform content-fit scale: the img element may be larger than the
+      // picture, so use whichever dimension is binding.
+      const scale = Math.max(
+        img.naturalWidth / img.offsetWidth,
+        img.naturalHeight / img.offsetHeight,
       );
-
-      let xRelative = (0.5 * event.target.offsetWidth - xCoordinate) * scale;
-      let yRelative = (0.5 * event.target.offsetHeight - yCoordinate) * scale;
-
-      // NB offsetX/offsetY are element-local: the browser already maps the
-      // click through the inverse of the preview CSS rotation, so these are
-      // raw camera-frame coordinates even when the preview is rotated —
-      // no extra transform is wanted here.
 
       // Emit a signal to move, acted on by paneControl.vue
       eventBus.emit("globalMoveInImageCoordinatesEvent", {
-        x: -xRelative,
-        y: -yRelative,
+        x: xLocal * scale,
+        y: -yLocal * scale,
       });
     },
 
