@@ -299,16 +299,15 @@ def _ncc_track(image, tmpl_f, tsize, anchor, span):
     peak correlation is too weak to trust."""
     half = tsize // 2
     region = tsize + 2 * span
+    H, W = image.shape[:2]
+    if region > W or region > H:
+        return None
     ax = int(round(anchor[0]))
     ay = int(round(anchor[1]))
-    x0 = ax - half - span
-    y0 = ay - half - span
-    if (
-            x0 < 0 or y0 < 0
-            or y0 + region > image.shape[0]
-            or x0 + region > image.shape[1]
-    ):
+    if ax < half or ay < half or ax + half > W or ay + half > H:
         return None
+    x0 = min(max(ax - half - span, 0), W - region)
+    y0 = min(max(ay - half - span, 0), H - region)
     reg = image[y0:y0 + region, x0:x0 + region].astype(np.float32)
     corr = np.fft.ifft2(np.fft.fft2(reg) * np.conj(tmpl_f)).real
     valid = corr[: region - tsize + 1, : region - tsize + 1]
@@ -353,7 +352,7 @@ def _ncc_track(image, tmpl_f, tsize, anchor, span):
 _TRACK_SPAN = 60
 
 
-def _make_csm_template(image, tsize=64):
+def _make_csm_template(image, tsize=160):
     """Pick a high-texture central patch and return its FFT + centre."""
     if image.ndim == 3:
         image = image.mean(axis=2)
@@ -439,7 +438,8 @@ class _LocalWindowTracker(Tracker):
             self.settle()
         image = self._grab_image().astype(np.float32)
         self._tmpl_f, self._tmpl_anchor = _make_csm_template(image)
-        self._tsize = 64
+        self._tsize = 160
+        self._last_peak_yx = np.asarray(self._tmpl_anchor)[::-1].copy()
         self.image_shape = image.shape
         if reset_history:
             self.reset_history()
@@ -461,7 +461,11 @@ class _LocalWindowTracker(Tracker):
                 - sp[-1][:2]
             )
             pred = ip[-1] + self._slope_estimate() * gap
-        anchor = np.asarray(self._tmpl_anchor) + pred
+        if n == 0 and getattr(self, "_last_peak_yx", None) is not None:
+            expected_peak_yx = np.asarray(self._last_peak_yx, dtype=float)
+        else:
+            expected_peak_yx = np.asarray(self._tmpl_anchor)[::-1] - pred
+        anchor = expected_peak_yx[::-1]
         result = _ncc_track(
             img, self._tmpl_f, self._tsize, anchor, _TRACK_SPAN
         )
@@ -471,11 +475,12 @@ class _LocalWindowTracker(Tracker):
                 f"predicted position {anchor}"
             )
         px, py, score = result
+        self._last_peak_yx = np.array([py, px])
         found_disp = (
             np.asarray(self._tmpl_anchor)[::-1] - np.array([py, px])
         )
         drift = found_disp - pred
-        if abs(drift[0]) > 100.0 or abs(drift[1]) > 100.0:
+        if n > 0 and (abs(drift[0]) > 100.0 or abs(drift[1]) > 100.0):
             raise MappingError(
                 f"CSM tracking: found position {found_disp} is more "
                 f"than 100px from prediction {pred} - possible re-lock"
@@ -557,7 +562,7 @@ class _LocalWindowTracker(Tracker):
     @property
     def max_safe_displacement(self):
         cap = 0.65 * float(min(self.image_shape[0], self.image_shape[1]))
-        return min(60.0, cap)
+        return min(200.0, cap)
 
 
 class CSMUncalibratedError(lt.exceptions.InvocationError):
