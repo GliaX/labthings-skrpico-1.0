@@ -391,7 +391,6 @@ class SmoothAutofocusThing(lt.Thing):
     _AF_BUSY: bool = False
     _LAST_REGIME: Optional[tuple] = None
     _COOL_DELAY: float = 3.0
-    _COOL_SUPPRESS: bool = False
     _CAL_LOADED: bool = False
     _TAU_FAR: Optional[float] = None
     _TAU_TINY: Optional[float] = None
@@ -858,9 +857,6 @@ class SmoothAutofocusThing(lt.Thing):
         housekeeping outside the sweep chain; a new AF run cancels it."""
         type(self)._COOLING = True
         try:
-            if type(self)._COOL_SUPPRESS:
-                _log("COOL skip: suppressed by active stage session")
-                return
             if getattr(self, "_AF_BUSY", False):
                 return
             if _SCAN_MODE() or (
@@ -2618,7 +2614,7 @@ class SmoothAutofocusThing(lt.Thing):
                     else:
                         type(self)._SPHERE_MESH_LIVE = True
         _saved_regime = type(self)._LAST_REGIME
-        type(self)._SCAN_REGIME_HOLD = True
+        SmoothAutofocusThing._SCAN_REGIME_HOLD = True
         try:
             return self.smooth_focus(self._scan_params())
         except NoFocusFoundError as exc:
@@ -2628,7 +2624,7 @@ class SmoothAutofocusThing(lt.Thing):
                 str(exc).replace("scan|", "", 1)
             ) from exc
         finally:
-            type(self)._SCAN_REGIME_HOLD = False
+            SmoothAutofocusThing._SCAN_REGIME_HOLD = False
             type(self)._LAST_REGIME = _saved_regime
             _SCAN_LOCAL.mode = False
             _SCAN_LOCAL.span = 0.0
@@ -2639,11 +2635,11 @@ class SmoothAutofocusThing(lt.Thing):
         _SCAN_LOCAL.span = 0.0
         _SCAN_LOCAL.mode = True
         _saved_regime = type(self)._LAST_REGIME
-        type(self)._SCAN_REGIME_HOLD = True
+        SmoothAutofocusThing._SCAN_REGIME_HOLD = True
         try:
             return self.smooth_focus(self._scan_params())
         finally:
-            type(self)._SCAN_REGIME_HOLD = False
+            SmoothAutofocusThing._SCAN_REGIME_HOLD = False
             type(self)._LAST_REGIME = _saved_regime
             _SCAN_LOCAL.mode = False
 
