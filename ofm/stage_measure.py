@@ -26,9 +26,9 @@ from .camera_stage_mapping import CameraStageMapper
 from .stage import BaseStage
 
 ## Size of movement in percentage of field of view
-SMALL_STEP = 20
-MEDIUM_STEP = 50
-BIG_STEP = 200
+SMALL_STEP = 10
+MEDIUM_STEP = 25
+BIG_STEP = 50
 
 PARASITIC_MOTION_TOL = 0.1
 DETECT_MOTION_TOL = 0.65
@@ -247,14 +247,22 @@ class StageMeasurementThing(OFMThing):
 
         try:
             self.logger.info("Recentring the stage.")
+            # Suppress the AF cool-down while recentre runs: it fires ~3s
+            # after the last autofocus and stops/reconfigures the camera
+            # mid-walk, deadlocking subsequent grabs (2026-11-01 y-axis).
+            self._autofocus._cancel_cooler()
+            type(self._autofocus)._COOL_SUPPRESS = True
 
             self._set_stream_resolution()
 
             # Strictly typed definitions to iterate over for MyPys sake.
             axes: tuple[Literal["x"], Literal["y"]] = ("x", "y")
 
-            for axis in axes:
-                self._recentre_axis(axis)
+            try:
+                for axis in axes:
+                    self._recentre_axis(axis)
+            finally:
+                type(self._autofocus)._COOL_SUPPRESS = False
 
             centre = self._stage.position
             centre_str = f"({centre['x']}, {centre['y']})"
@@ -334,6 +342,7 @@ class StageMeasurementThing(OFMThing):
         self._cam_stage_data = CamStageTracker()
         # Direction is in image coords, initial assumption is that centre is at (0,0).
         direction = self._img_dir_from_stage_coords({"x": 0, "y": 0, "z": 0}, axis)
+        direction = self._verify_probe_direction(axis, direction)
 
         i = 0
         while True:
@@ -366,6 +375,82 @@ class StageMeasurementThing(OFMThing):
             # Make a big z-corrected move towards estimate of centre.
             self._big_z_corrected_movement(axis, direction)
 
+    def _verify_probe_direction(
+            self, axis: Literal["x", "y"], direction: Literal[1, -1]
+    ) -> Literal[1, -1]:
+        """Check the initial walk direction against live camera evidence.
+
+        Stage-coordinate beliefs about where the centre lies go stale across
+        restarts and power cycles. Take one probe step and compare the
+        measured feature shift with the shift the commanded direction should
+        produce (same frame conventions as the parasitic check); if the
+        feature moved against the commanded direction it is receding from
+        the centre, so flip."""
+        movement = self._movement_in_img_coords(
+            fov_perc=MEDIUM_STEP * self._leg_scale(),
+            axis=axis,
+            direction=direction,
+        )
+        expected = self._measured_shift_for(movement)
+        time.sleep(PROBE_SETTLE_S)
+        self._cam.discard_frames()
+        self.logger.info("Direction check: grabbing before frame.")
+        before = self._cam.grab_as_array()
+        self.logger.info("Direction check: probing a step.")
+        self._stage_move_from_img(movement)
+        time.sleep(PROBE_SETTLE_S)
+        self._cam.discard_frames()
+        self.logger.info("Direction check: measuring offset.")
+        try:
+            measured = self._offset_from(before)
+        except RuntimeError:
+            self.logger.info(
+                "Direction check: no sample detected; keeping direction %d.",
+                direction,
+            )
+            self._stage_move_from_img({k: -v for k, v in movement.items()})
+            return direction
+        agreement = expected["x"] * measured["x"] + expected["y"] * measured["y"]
+        magnitude = (measured["x"] ** 2 + measured["y"] ** 2) ** 0.5
+        self.logger.info(
+            "Direction check: expected %s, measured %s (|%.0f|px, dot %.0f).",
+            {k: round(v) for k, v in expected.items()},
+            {k: round(v) for k, v in measured.items()},
+            magnitude,
+            agreement,
+        )
+        flipped = -1 if direction == 1 else 1
+        # Undo the probe step either way; walk in the verified direction.
+        self._stage_move_from_img({k: -v for k, v in movement.items()})
+        if magnitude < 10.0:
+            self.logger.info(
+                "Feature barely moved; keeping stage-coordinate direction %d.",
+                direction,
+            )
+            return direction
+        if agreement < 0:
+            self.logger.info(
+                "Feature moved against commanded direction; flipping to %d.",
+                flipped,
+            )
+            return flipped
+        return direction
+
+    def _measured_shift_for(
+            self, movement: Mapping[str, float]
+    ) -> Mapping[str, float]:
+        """Predicted camera-frame feature shift for a preview-space command.
+
+        Applies the same chain as _img_to_stage_rel (click convention) and
+        maps the stage move back to image pixels through the matrix
+        transpose, in the screen frame used by the offset dictionaries."""
+        matrix = np.array(self._csm.image_to_stage_displacement_matrix)
+        x2, y2 = -movement["y"], movement["x"]
+        stage = np.dot(np.array([y2, x2]), matrix)
+        inv = np.linalg.inv(matrix)
+        cam = inv @ np.array([stage[0], stage[1]])
+        return {"x": float(cam[1]), "y": -float(cam[0])}
+
     def _recentre_decision(
             self, axis: Literal["x", "y"]
     ) -> tuple[bool, Literal[1, -1]]:
@@ -389,17 +474,34 @@ class StageMeasurementThing(OFMThing):
         if self.leg_length_mm is not None:
             zs = [c["z"] for c in self._cam_stage_data.stage_coords]
             z_span = abs(max(zs) - min(zs))
-            if z_span < TURNING_POINT_MIN_Z_SPAN:
+            # Gate scales with the probe span: stock probes are 50% of the
+            # frame and the gate constant was tuned for that span.
+            gate = TURNING_POINT_MIN_Z_SPAN * (
+                MEDIUM_STEP * self._leg_scale() / 50.0
+            )
+            if z_span < gate:
                 self.logger.info(
                     "Turning-point estimate rejected: probe z-span "
                     "%.0f < %.0f (weak curvature signal).",
                     z_span,
-                    TURNING_POINT_MIN_Z_SPAN,
+                    gate,
                 )
-                return (
-                    False,
-                    self._img_dir_from_stage_coords(estimate, axis),
-                )
+                # The curvature fit is unusable, so the stage-coordinate
+                # estimate is worthless. Decide from the recorded feature
+                # offsets instead: if the feature drifted far from the frame
+                # centre, the centre lies back the way we came.
+                offs = self._cam_stage_data.offsets
+                if offs:
+                    cum = sum(o[axis] for o in offs if axis in o)
+                    flipped = -1 if cum > 0 else 1
+                    self.logger.info(
+                        "Weak-curvature direction from offsets: cum %.0f -> "
+                        "direction %d.",
+                        cum,
+                        flipped,
+                    )
+                    return False, flipped
+                return False, 1
 
         # if the distance is less than 1 big step away then move to it and exit
         if abs(img_perc) < BIG_STEP:
@@ -495,14 +597,14 @@ class StageMeasurementThing(OFMThing):
     def _img_to_stage_rel(self, movement: Mapping[str, float]) -> Mapping[str, int]:
         """Convert an image-px movement to stage units without moving.
 
-        Uses the [stage][image] column product (stage = M @ (px_x, px_y)),
-        matching the calibration's stored convention: an x-axis probe then
-        targets the stage-x flexure. The legacy csm_img_to_stage row
-        product walks the wrong physical axis and is deliberately not
-        used here (the scan path and UI image-jog keep their own
-        preview-rotation semantics)."""
-        matrix = self._csm.image_to_stage_displacement_matrix
-        rel = np.dot(np.array(matrix), np.array([movement["x"], movement["y"]]))
+        Uses the user-verified click convention: the movement dict is a
+        preview-space offset, converted to camera frame as (dy, -dx),
+        then applied through the matrix row product exactly like
+        csm_img_to_stage. A +x command therefore drives the same stage
+        motion as clicking right of centre in the webapp."""
+        matrix = np.array(self._csm.image_to_stage_displacement_matrix)
+        x2, y2 = -movement["y"], movement["x"]
+        rel = np.dot(np.array([y2, x2]), matrix)
         return {"x": int(round(rel[0])), "y": int(round(rel[1]))}
 
     def _stage_move_from_img(self, movement: Mapping[str, float]) -> Mapping[str, int]:
@@ -723,13 +825,16 @@ class StageMeasurementThing(OFMThing):
         :param before_img: The image the offset should be calculated with respect to.
         :return: The calculated offset as a dictionary in pixels
         """
+        self.logger.info("Offset: checking sample detection.")
         is_sample, _bg_message = self._cam.image_is_sample()
         if not is_sample:
             raise RuntimeError(
                 "No sample detected. Sample must be densely featured and cover the "
                 "whole range of motion."
             )
+        self.logger.info("Offset: grabbing after frame.")
         after_img = self._cam.grab_as_array()
+        self.logger.info("Offset: correlating.")
         offset = fft_image_tracking.displacement_between_images(
             image_0=before_img,
             image_1=after_img,
@@ -737,7 +842,8 @@ class StageMeasurementThing(OFMThing):
             fractional_threshold=0.1,
             pad=True,
         )
-        return {"x": offset[1], "y": offset[0]}
+        row, col = offset[0], offset[1]
+        return {"x": float(row), "y": float(-col)}
 
 
 # The number of return arguments depends on if return_other is True or False
