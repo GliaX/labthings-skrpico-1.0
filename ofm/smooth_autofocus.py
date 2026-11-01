@@ -36,17 +36,21 @@ sys.setswitchinterval(0.001)
 
 LOGGER = logging.getLogger(__name__)
 
-# Machine surface (stage bowl) from the scan_0005/scan_0007 180-deg pair
-# decomposition (2026-10-31, fiber-landmark alignment 178deg + dy=-200),
-# re-referenced to the apex: apex at (0,0), z=0 there. z = A*r^2, drop is
-# radial. SPAN is the half-width of the square mesh install (symmetric).
-# Raw-fit station note: stage (0,0) sat at (407,41) from the apex.
+# Machine surface (stage bowl + machine tilt), scan_0009 (2026-11-01) as
+# source of truth: first clean cal-mode scan in the recentred 0,0 frame.
+# Bowl A replicated by scan_0006/scan_0007 shape fits (0.2% / 3%).
+# Machine tilt (219.2 deg) = mean of the scan_0006/scan_0007 180-deg pair
+# after translating their frames to the recentre offset (108,-145).
+# z = A*(X^2 + Y^2) + MX*X + MY*Y + Z0; Z0 anchors z at stage (0,0).
+# Stationary point sits at (-442,-360); bowl centre is the recentred origin.
+# SPAN is the half-width of the square mesh install (symmetric); ptp at
+# SPAN 1100 is ~867 (inside the 1000 install guard).
 MACHINE_SURFACE = {
-    "A": -1.83e-4,
-    "APEX_X": -407.1,
-    "APEX_Y": -41.0,
-    "APEX_Z": 30.6,
-    "SPAN": 1346.0,
+    "A": -1.924e-4,
+    "MX": -0.1699,
+    "MY": -0.1384,
+    "Z0": -41.7,
+    "SPAN": 1100.0,
     "LATTICE": 129,
 }
 
@@ -1971,9 +1975,9 @@ class SmoothAutofocusThing(lt.Thing):
         if _cal_mode():
             return False
         A = MACHINE_SURFACE["A"]
-        ax = float(MACHINE_SURFACE["APEX_X"])
-        ay = float(MACHINE_SURFACE["APEX_Y"])
-        az = float(MACHINE_SURFACE["APEX_Z"])
+        mx = float(MACHINE_SURFACE["MX"])
+        my = float(MACHINE_SURFACE["MY"])
+        z0 = float(MACHINE_SURFACE["Z0"])
         half = float(MACHINE_SURFACE["SPAN"])
         gx0, gx1, gy0, gy1 = -half, half, -half, half
         try:
@@ -1983,7 +1987,7 @@ class SmoothAutofocusThing(lt.Thing):
         N = MACHINE_SURFACE.get("LATTICE", 129)
         vals = np.linspace(-half, half, N)
         XX, YY = np.meshgrid(vals, vals)
-        zs = A * ((XX - ax) ** 2 + (YY - ay) ** 2) + az
+        zs = A * (XX ** 2 + YY ** 2) + mx * XX + my * YY + z0
         base = 0.0
         rel = zs - base
         ptp = float(rel.max() - rel.min())

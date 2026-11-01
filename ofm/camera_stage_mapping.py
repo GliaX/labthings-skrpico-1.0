@@ -10,559 +10,24 @@ This module is only intended to be called from the OpenFlexure Microscope
 server, and depends on that server and its underlying LabThings library.
 """
 
-import labthings_fastapi as lt
-import logging
-import math
-import numpy as np
+import json
+import os
 import time
-from pathlib import Path
-from camera_stage_mapping.camera_stage_calibration_1d import (
-    calibrate_backlash_1d,
-    image_to_stage_displacement_from_1d,
-)
-from camera_stage_mapping.camera_stage_tracker import Tracker
-from camera_stage_mapping.exceptions import MappingError
-from labthings_fastapi.types.numpy import DenumpifyingDict
-from typing import Any, List, Mapping, NamedTuple, Optional, Tuple, cast
+from collections.abc import Mapping
+from datetime import datetime
+from typing import Any, Literal, Optional
+
+import numpy as np
+
+import labthings_fastapi as lt
+from openflexure_stitching.correlation import displacement_between_images
+
+from openflexure_microscope_server.things import OFMThing
 
 from .camera import BaseCamera
 from .stage import BaseStage
-from .view_alignment import ViewAlignmentMixin
 
-_LOGGER = logging.getLogger(__name__)
-
-
-def _patch_relative_motion_ladder(limits=None, cam=None, stage=None) -> None:
-    """Replace the calibration motion ladder with a travel-aware walk.
-
-    Walks INCREMENTS of 10,25,50,100,200,400,800,1200 units relative to
-    the current position (not absolute targets), comparing frames after
-    each increment. Increment attempts that would cross the stage travel
-    limits (with 100u margin) are skipped, so the walk never triggers
-    klippy's move-out-of-range. First increment producing image shift >=
-    threshold wins. Raises MappingError if the list is exhausted."""
-
-    import camera_stage_mapping.camera_stage_calibration_1d as _cal_mod
-    import numpy as _np
-    from numpy.linalg import norm as _norm
-
-    PX_PER_STEP = 2.9
-    MARGIN = 100.0
-
-    def _relative_ladder(tracker, move, displacement, threshold=10,
-                         multipliers=None, detect_cumulative_motion=False):
-        displacement = _np.array(displacement, dtype=float)
-        unit = displacement / (_norm(displacement) or 1.0)
-        threshold = min(threshold, 25.0)
-        step = max(6.0, min(14.0, (threshold * 1.4) / PX_PER_STEP))
-        pos = _np.array(tracker.stage_positions[-1, :], dtype=float)
-
-        lo = (-_np.inf, -_np.inf)
-        hi = (_np.inf, _np.inf)
-        if limits is not None:
-            lo = _np.array(limits[0][:2], dtype=float) + MARGIN
-            hi = _np.array(limits[1][:2], dtype=float) - MARGIN
-
-        _dbg = 0
-        for _i in range(10):
-            inc = step
-            target = pos + unit * inc
-            txy = target[:2]
-            if _np.any(txy < lo) or _np.any(txy > hi):
-                continue
-            if stage is not None and hasattr(stage, "_send_gcode_script"):
-                stage._send_gcode_script(
-                    stage._client,
-                    "G90\n"
-                    f"G1 X{target[0]:.3f} Y{target[1]:.3f} "
-                    f"Z{target[2]:.3f} S9000 F45000\nM400\n",
-                )
-            else:
-                move(tuple(target))
-            try:
-                _img = cam.capture_downsampled_array()
-                from PIL import Image as _PILImage
-                _arr = _np.asarray(_img, dtype=_np.float32)
-                if _arr.ndim == 3:
-                    _arr = _arr[..., :3].mean(axis=2)
-                _lo, _hi = float(_arr.min()), float(_arr.max())
-                if _hi > _lo:
-                    _arr = (_arr - _lo) / (_hi - _lo) * 255.0
-                _PILImage.fromarray(
-                    _arr.astype(_np.uint8)
-                ).save(f"/tmp/csm_probe_{_dbg}.png")
-                _dbg += 1
-            except Exception as _e:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    "probe dump failed: %s", _e
-                )
-            tracker.append_point()
-            pos = _np.array(tracker.stage_positions[-1, :], dtype=float)
-            shift = _norm(
-                _np.array(tracker.image_positions[-1, :], dtype=float)
-                - _np.array(tracker.image_positions[-2, :], dtype=float)
-            )
-            _LOGGER.info(
-                "CSM probe %d: inc=%.0f shift=%.1fpx thr=%.1f",
-                _i + 1, inc, shift, threshold,
-            )
-            if shift >= threshold:
-                return 1, float(inc)
-        raise MappingError(
-            "Calibration saw no image motion after "
-            f"{_i + 1} probes of {step:.0f} units (travel limits "
-            "respected). Check the sample has visible texture and is in "
-            "focus."
-        )
-
-    _cal_mod.move_until_motion_detected = _relative_ladder
-
-    def _fit_backlash_lenient(moves):
-        """Stock fit_backlash without the 0.1 fractional-error gate: on this
-        stage the per-point scatter (short travelled distance, FFT integer
-        pixel resolution) trips the stock threshold even when the linear fit
-        is good. The caller gates on pixels_per_step plausibility instead."""
-        all_stage_points, all_image_points, times = (
-            _cal_mod.to_tracker_history(moves)
-        )
-        image_direction = _cal_mod.direction_from_points(all_image_points)
-        stage_direction = _cal_mod.direction_from_points(all_stage_points)
-        xfit = _np.sum(
-            all_stage_points * stage_direction[_np.newaxis, :], axis=1
-        )
-        yfit = _np.sum(
-            all_image_points * image_direction[_np.newaxis, :], axis=1
-        )
-
-        def fit_motion(xfit, yfit, backlash=0):
-            xfit_blsh = _cal_mod.apply_backlash(xfit, backlash)
-            xfit_blsh -= _np.mean(xfit_blsh)
-            m, c = _np.polyfit(xfit_blsh, yfit, 1)
-            residuals = yfit - (xfit_blsh * m + c)
-            return m, c, _np.std(residuals, ddof=3)
-
-        max_backlash = (_np.max(xfit) - _np.min(xfit)) / 3
-        backlash_values = []
-        residual_values = []
-        backlash = 0
-        while backlash < max_backlash:
-            m, c, residual = fit_motion(xfit, yfit, backlash)
-            residual_values.append(residual)
-            backlash_values.append(backlash)
-            backlash += max(1, backlash / 3)
-        backlash = backlash_values[_np.argmin(residual_values)]
-        m, c, residual = fit_motion(xfit, yfit, backlash)
-        fractional_error = residual / _norm(_np.diff(yfit))
-        return {
-            "backlash": backlash,
-            "pixels_per_step": m,
-            "fractional_error": fractional_error,
-            "stage_direction": stage_direction,
-            "image_direction": image_direction,
-            "pixels_per_step_vector": m * image_direction,
-        }
-
-    _cal_mod.fit_backlash = _fit_backlash_lenient
-
-
-class MoveHistory(NamedTuple):
-    """A named tuple containing the position over time for a single move.
-
-    This a named tuple with elements:
-
-    * ``times``
-    * ``stage_positions``
-    * ``image_positions``
-    """
-
-    times: List[float]
-    stage_positions: List[tuple[int, int, int]]
-    image_positions: List[tuple[float, float]]
-
-
-def _array_to_stage_tuple(pos: np.ndarray) -> tuple[int, int, int]:
-    """Convert a numpy array into a tuple of ints.
-
-    :param pos: Input position array must be 3 elements long.
-    :return: a tuple of 3 integers
-    :raises ValueError: If the array is not of length 3.
-    """
-    pos_tuple = tuple(int(i) for i in pos)
-    if len(pos_tuple) == 3:
-        return cast(tuple[int, int, int], pos_tuple)
-    raise ValueError("Input array was not 3 elements long.")
-
-
-def _serialise_numpy_in_dict(dict_with_numpy: dict) -> dict:
-    def _plain(obj, depth=0):
-        if depth > 8:
-            return str(obj)
-        if isinstance(obj, dict):
-            return {str(k): _plain(v, depth + 1) for k, v in obj.items()}
-        if isinstance(obj, (list, tuple)):
-            return [_plain(v, depth + 1) for v in obj]
-        if isinstance(obj, np.ndarray):
-            return _plain(obj.tolist(), depth + 1)
-        if isinstance(obj, (np.integer,)):
-            return int(obj)
-        if isinstance(obj, (np.floating,)):
-            return float(obj)
-        return obj
-
-    serialised = _plain(dict_with_numpy)
-    if not isinstance(serialised, dict):
-        raise TypeError(f"Expecting a dictionary to serialise not a {type(serialised)}")
-    return serialised
-
-
-class RecordedMove:
-    """Call stage movement and maintain a record of position and time.
-
-    This class is callable, the callable wraps stage.move_to_xyz_position.
-
-    The class records a list of all moves made and how long they took. This is useful
-    for calibrating the stage as it allows measuring how long moves take.
-    """
-
-    def __init__(self, stage: BaseStage) -> None:
-        """Set the stage client used for for movement.
-
-        :param stage: the stage client to be used. ``stage.move_to_xyz_position`` will
-            be called whenever the instance is called.
-        """
-        self._stage = stage
-        self._current_position: Optional[tuple[int, int, int]] = None
-        self._history: List[Tuple[float, tuple[int, int, int]]] = []
-
-    def __call__(self, new_position: np.ndarray) -> None:
-        """Move to a new position, and record it."""
-        new_stage_pos = _array_to_stage_tuple(new_position)
-        starting_pos = self._current_position
-        if starting_pos is not None:
-            self._history.append((time.time(), starting_pos))
-        self._stage.move_to_xyz_position(xyz_pos=new_stage_pos)
-        self._current_position = new_stage_pos
-        self._history.append((time.time(), new_stage_pos))
-
-    @property
-    def history(self) -> MoveHistory:
-        """The history, as a numpy array of times and another of positions."""
-        times: List[float] = [t for t, p in self._history]
-        positions: List[tuple[int, int, int]] = [p for t, p in self._history]
-        return MoveHistory(times, positions)
-
-    def clear_history(self) -> None:
-        """Reset our history to be an empty list."""
-        self._history = []
-
-
-class _CappedSafeTracker(Tracker):
-    """Tracker whose max_safe_displacement is capped so the backlash walk
-    stays inside the template search window on this stage's scale."""
-
-    @property
-    def max_safe_displacement(self):
-        return min(super().max_safe_displacement, 25.0)
-
-
-class _DwellRecordedMove(RecordedMove):
-    """RecordedMove that dwells after each move so the sample
-    settles, and rejects runaway step moves."""
-
-    def __call__(self, new_position: np.ndarray) -> None:
-        from numpy.linalg import norm as _norm
-        cur = (
-            self._current_position
-            if self._current_position is not None
-            else new_position
-        )
-        if _norm(
-                np.asarray(new_position, dtype=float) - np.asarray(cur, dtype=float)
-        ) > 600.0:
-            raise MappingError(
-                "Calibration attempted a move of more than 600 units - "
-                "steps_per_pixel estimate exploded; aborting to protect travel."
-            )
-        super().__call__(new_position)
-        time.sleep(1.0)
-
-
-def _ncc_track(image, tmpl_f, tsize, anchor, span):
-    """Locate the template in ``image`` near ``anchor`` by NCC.
-
-    The search region is a ``(tsize + 2*span)`` square centred on
-    ``anchor`` (the predicted position), so features further away
-    than ``span`` are structurally outside the search. Returns
-    ``(dx, dy, score)`` offsets of the template centre relative to
-    its position in the template-acquisition frame, or None when the
-    peak correlation is too weak to trust."""
-    half = tsize // 2
-    region = tsize + 2 * span
-    H, W = image.shape[:2]
-    if region > W or region > H:
-        return None
-    ax = int(round(anchor[0]))
-    ay = int(round(anchor[1]))
-    if ax < half or ay < half or ax + half > W or ay + half > H:
-        return None
-    x0 = min(max(ax - half - span, 0), W - region)
-    y0 = min(max(ay - half - span, 0), H - region)
-    reg = image[y0:y0 + region, x0:x0 + region].astype(np.float32)
-    corr = np.fft.ifft2(np.fft.fft2(reg) * np.conj(tmpl_f)).real
-    valid = corr[: region - tsize + 1, : region - tsize + 1]
-    f64 = reg.astype(np.float64)
-    sat = np.zeros((region + 1, region + 1))
-    sat[1:, 1:] = np.cumsum(np.cumsum(f64, 0), 1)
-    sat2 = np.zeros((region + 1, region + 1))
-    sat2[1:, 1:] = np.cumsum(np.cumsum(f64 * f64, 0), 1)
-    tt = float(tsize * tsize)
-    box1 = (
-        sat[tsize:, tsize:] - sat[:-tsize, tsize:]
-        - sat[tsize:, :-tsize] + sat[:-tsize, :-tsize]
-    )
-    box2 = (
-        sat2[tsize:, tsize:] - sat2[:-tsize, tsize:]
-        - sat2[tsize:, :-tsize] + sat2[:-tsize, :-tsize]
-    )
-    var = box2 - box1 * box1 / tt
-    norm = np.sqrt(np.maximum(var, 0.0))
-    scores = valid / np.maximum(norm, 1e-6)
-    scores = np.where(norm > 1e-6, scores, -2.0)
-    s = 2 * span + 1
-    j, i = np.unravel_index(int(np.argmax(scores)), scores.shape)
-    if scores[j, i] < 0.35:
-        return None
-    sx, sy = 0.0, 0.0
-    if 0 < i < s - 1:
-        row = scores[j]
-        denom = row[i - 1] - 2.0 * row[i] + row[i + 1]
-        if denom < -1e-9:
-            sx = 0.5 * (row[i - 1] - row[i + 1]) / denom
-    if 0 < j < s - 1:
-        col = scores[:, i]
-        denom = col[j - 1] - 2.0 * col[j] + col[j + 1]
-        if denom < -1e-9:
-            sy = 0.5 * (col[j - 1] - col[j + 1]) / denom
-    px = x0 + i + sx + half
-    py = y0 + j + sy + half
-    return float(px), float(py), float(scores[j, i])
-
-
-_TRACK_SPAN = 60
-
-
-def _make_csm_template(image, tsize=160):
-    """Pick a high-texture central patch and return its FFT + centre."""
-    if image.ndim == 3:
-        image = image.mean(axis=2)
-    half = tsize // 2
-    H, W = image.shape
-    best = None
-    best_var = 100.0
-    for cy in range(H // 2 - 200, H // 2 + 200 - tsize, 24):
-        for cx in range(W // 2 - 200, W // 2 + 200 - tsize, 24):
-            v = float(image[cy:cy + tsize, cx:cx + tsize].astype(
-                np.float32
-            ).var())
-            if v > best_var:
-                best_var = v
-                best = (cy, cx)
-    if best is None:
-        raise MappingError(
-            "CSM template: no textured patch near the field centre"
-        )
-    cy, cx = best
-    ref = image[cy:cy + tsize, cx:cx + tsize].astype(np.float32)
-    ref -= ref.mean()
-    n = math.sqrt(float((ref * ref).sum()))
-    if n < 1e-6:
-        raise MappingError("CSM template: degenerate patch")
-    ref /= n
-    region = tsize + 2 * _TRACK_SPAN
-    pad = np.zeros((region, region), dtype=np.float32)
-    pad[:tsize, :tsize] = ref
-    return np.fft.fft2(pad), (float(cx + half), float(cy + half))
-
-
-class _LocalWindowTracker(Tracker):
-    """Tracker with a prediction-anchored local correlation window.
-
-    The stock tracker correlates the template against the whole frame
-    and takes a global argmax; on quasi-periodic samples the match can
-    re-lock onto a wrong texture period hundreds of px away, and the
-    least-squares backlash fit cannot survive such points. Here the
-    search region is re-centred on a stage-space prediction of the
-    sample position each step, so wrong-period peaks are outside the
-    window by construction."""
-
-    dropped_points: List[tuple] = []
-
-    def _slope_estimate(self) -> np.ndarray:
-        sp = self._stage_positions
-        ip = self._image_positions
-        n = min(len(sp), len(ip))
-        if n < 2:
-            return np.zeros(2)
-        spA = np.asarray(sp[:n], dtype=float)
-        ipA = np.asarray(ip[:n], dtype=float)
-        j = n - 1
-        while j > 0 and float(
-                np.linalg.norm(spA[j][:2] - spA[j - 1][:2])
-        ) < 0.5:
-            j -= 1
-        if j == 0:
-            return np.zeros(2)
-        d = spA[j][:2] - spA[j - 1][:2]
-        norm = float(np.linalg.norm(d))
-        if norm < 1.0:
-            return np.zeros(2)
-        sd = d / norm
-        xf = spA[:, :2] @ sd
-        out = []
-        for c in range(2):
-            ratios = [
-                (ipA[i][c] - ipA[i - 1][c]) / (xf[i] - xf[i - 1])
-                for i in range(1, n)
-                if abs(xf[i] - xf[i - 1]) > 0.5
-            ]
-            out.append(
-                float(np.median(ratios)) if ratios else 0.0
-            )
-        return np.asarray(out)[::-1]
-
-    def acquire_template(
-            self, settle=True, reset_history=True, relative_positions=True
-    ):
-        if settle:
-            self.settle()
-        image = self._grab_image().astype(np.float32)
-        self._tmpl_f, self._tmpl_anchor = _make_csm_template(image)
-        self._tsize = 160
-        self._last_peak_yx = np.asarray(self._tmpl_anchor)[::-1].copy()
-        self.image_shape = image.shape
-        if reset_history:
-            self.reset_history()
-        self._template_position = np.array([0.0, 0.0])
-        self.append_point(settle=False)
-
-    def track_image(self, image):
-        img = np.asarray(image).astype(np.float32)
-        if img.ndim == 3:
-            img = img.mean(axis=2)
-        n = len(self._image_positions)
-        if n == 0:
-            pred = np.zeros(2)
-        else:
-            sp = np.asarray(self._stage_positions, dtype=float)
-            ip = np.asarray(self._image_positions, dtype=float)
-            gap = (
-                np.asarray(self.get_position(), dtype=float)[:2]
-                - sp[-1][:2]
-            )
-            pred = ip[-1] + self._slope_estimate() * gap
-        if n == 0 and getattr(self, "_last_peak_yx", None) is not None:
-            expected_peak_yx = np.asarray(self._last_peak_yx, dtype=float)
-        else:
-            expected_peak_yx = np.asarray(self._tmpl_anchor)[::-1] - pred
-        anchor = expected_peak_yx[::-1]
-        result = _ncc_track(
-            img, self._tmpl_f, self._tsize, anchor, _TRACK_SPAN
-        )
-        if result is None:
-            raise MappingError(
-                "CSM tracking: correlation below threshold near "
-                f"predicted position {anchor}"
-            )
-        px, py, score = result
-        self._last_peak_yx = np.array([py, px])
-        found_disp = (
-            np.asarray(self._tmpl_anchor)[::-1] - np.array([py, px])
-        )
-        drift = found_disp - pred
-        if n > 0 and (abs(drift[0]) > 100.0 or abs(drift[1]) > 100.0):
-            raise MappingError(
-                f"CSM tracking: found position {found_disp} is more "
-                f"than 100px from prediction {pred} - possible re-lock"
-            )
-        return found_disp
-
-    def append_point(self, settle=True, image=None):
-        if settle:
-            self.settle()
-        if image is None:
-            image = self._grab_image()
-        image_pos = self.track_image(image)
-        stage_pos = self.get_position()
-        self._image_positions.append(image_pos)
-        self._stage_positions.append(stage_pos)
-        self._times.append(time.time())
-        self._last_point = (image, image_pos)
-        return stage_pos, image_pos
-
-    def reset_history(self, leave_first_point=False):
-        if leave_first_point:
-            self._stage_positions = self._stage_positions[:1]
-            self._image_positions = self._image_positions[:1]
-            self._times = self._times[:1]
-        else:
-            self._stage_positions = []
-            self._image_positions = []
-            self._times = []
-
-    @property
-    def stage_positions(self):
-        return np.array(
-            [tuple(p) for p in self._stage_positions]
-        )
-
-    @property
-    def image_positions(self):
-        return np.array(
-            [tuple(p) for p in self._image_positions]
-        )
-
-    @property
-    def times(self):
-        return np.array(self._times)
-
-    @property
-    def history(self):
-        sp = self.stage_positions
-        ip = self.image_positions
-        tm = self.times
-
-        class _H(dict):
-            def __getitem__(self, k):
-                if isinstance(k, int):
-                    return (sp, ip, tm)[k]
-                return dict.__getitem__(self, k)
-
-            def __contains__(self, k):
-                return True
-
-            def __len__(self):
-                return 3
-
-            def __iter__(self):
-                return iter((sp, ip, tm))
-
-        return _H(
-            stage_positions=sp, image_positions=ip, times=tm
-        )
-
-    @property
-    def moving_away_from_centre(self):
-        if len(self._image_positions) < 2:
-            return None
-        a = float(np.linalg.norm(np.asarray(self._image_positions[-1])))
-        b = float(np.linalg.norm(np.asarray(self._image_positions[-2])))
-        return a > b
-
-    @property
-    def max_safe_displacement(self):
-        cap = 0.65 * float(min(self.image_shape[0], self.image_shape[1]))
-        return min(200.0, cap)
+SETTLING_TIME = 0.1
 
 
 class CSMUncalibratedError(lt.exceptions.InvocationError):
@@ -574,7 +39,18 @@ class CSMUncalibratedError(lt.exceptions.InvocationError):
     """
 
 
-class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
+class MappingError(RuntimeError):
+    """Failure during the Camera Stage Mapping procedure."""
+
+
+def _csm_matrix_to_string(mat: np.ndarray) -> str:
+    return (
+        f"[[{round(mat[0, 0], 2)}, {round(mat[0, 1], 2)},],"
+        f"[{round(mat[1, 0], 2)}, {round(mat[1, 1], 2)}]]"
+    )
+
+
+class CameraStageMapper(OFMThing):
     """A Thing to manage mapping between image and stage coordinates.
 
     To use this Thing, the stage must have axes named "x", "y", and "z", or must
@@ -586,441 +62,371 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
     _cam: BaseCamera = lt.thing_slot()
     _stage: BaseStage = lt.thing_slot()
 
-    def _use_fast_cal(self) -> bool:
-        """False: calibration always runs in the default 2800x2800
-        mode. The crop990 fast path tracks on anisotropically
-        squeezed frames of the non-square sensor crop, which bent
-        the matrix 1.6-1.8x (verified by displacement measurement
-        2026-10-28). Full-res tracking is slower but correct."""
-        return False
+    @lt.action
+    def calibrate_xy(self) -> None:
+        """Measure the relationship between camera and stage coordinates.
 
-    def _velocity_settle(self) -> None:
-        """Wait until the stage is actually stationary (motion_report
-        live_velocity ~ 0), then discard frames so the next grab is a
-        post-move frame. Happens-before on motion completion - replaces
-        the fixed 0.2s sleep, which races fast stage moves."""
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            try:
-                st = self._stage._get_status(payload={
-                    "objects": {"motion_report": ["live_velocity"]}
-                })
-                v = float(
-                    (st["result"]["status"].get("motion_report") or {})
-                    .get("live_velocity") or 0.0
-                )
-                if abs(v) < 1.0:
-                    break
-            except Exception:
-                pass
-            time.sleep(0.05)
-        if hasattr(self._stage, "update_position"):
-            self._stage.update_position()
-        self._cam.settle()
-
-    def _calibrate_with_ceiling(
-            self,
-            tracker: Tracker,
-            recorded_move: RecordedMove,
-            direction_array: np.ndarray,
-            starting_position: Mapping[str, int],
-    ) -> dict:
-        """Backlash calibration with a travel-limited motion ladder.
-
-        Wraps ``calibrate_backlash_1d`` but pre-flights each move the
-        escalation ladder would make against the stage's configured
-        limits (klippy toolhead position_max/min), so an over-long
-        probe fails with a clear MappingError instead of a 400 from
-        the motion system mid-calibration."""
-        try:
-            limits = self._stage_position_limits()
-        except Exception:
-            limits = None
-        if limits is None:
-            return calibrate_backlash_1d(
-                tracker, recorded_move, direction_array,
-                logger=self.logger,
-                return_data_on_failure=True,
-            )
-        pps = abs(result.get("pixels_per_step", 0.0))
-        fe = result.get("fractional_error", 1.0)
-        self.logger.warning(
-            "CSM fit: pixels_per_step=%.2f fractional_error=%.3f",
-            pps, fe,
-        )
-        if not (0.1 < pps < 50.0):
-            raise MappingError(
-                f"CSM fit implausible: pixels_per_step={pps:.2f}"
-            )
-        lo, hi = limits
-        dir_xy = np.array(direction_array[:2], dtype=float)
-        if not np.any(dir_xy):
-            return calibrate_backlash_1d(
-                tracker, recorded_move, direction_array, logger=self.logger
-            )
-        cur = self._stage.get_xyz_position()
-        cx, cy = float(cur["x"]), float(cur["y"])
-        if dir_xy[0]:
-            avail = (hi[0] - cx) if dir_xy[0] > 0 else (cx - lo[0])
-        else:
-            avail = (hi[1] - cy) if dir_xy[1] > 0 else (cy - lo[1])
-        ceiling = max(50.0, abs(avail) * 0.9)
-        self.logger.info(
-            "Calibration move ceiling: %.0f steps (travel remaining %.0f)",
-            ceiling, avail,
-        )
-        try:
-            return calibrate_backlash_1d(
-                tracker, recorded_move, direction_array, logger=self.logger
-            )
-        except MappingError as exc:
-            raise MappingError(
-                f"{exc} (move ceiling {ceiling:.0f} steps for this axis; "
-                "stage travel or correlation failed - home the stage and "
-                "start closer to the sample if the ceiling is the issue)"
-            ) from exc
-
-    def _stage_position_limits(self):
-        """Return ((x_min, y_min), (x_max, y_max)) toolhead travel limits
-        from klippy's toolhead status, or None if unavailable."""
-        st = self._stage._get_status(payload={
-            "objects": {"toolhead": None}
-        })
-        th = st["result"]["status"].get("toolhead") or {}
-        pos = th.get("position")
-        if not pos:
-            return None
-        cfg = self._stage._get_status(payload={
-            "objects": {"configfile": ["settings"]}
-        })
-        settings = (
-                (cfg["result"]["status"].get("configfile") or {}).get("settings")
-                or {}
-        )
-
-        def _lim(axis, key):
-            v = settings.get(f"stepper_{axis}.{key}")
-            if v is None:
-                return None
-            return float(str(v).split(",")[0])
-
-        x_min, x_max = _lim("x", "position_min"), _lim("x", "position_max")
-        y_min, y_max = _lim("y", "position_min"), _lim("y", "position_max")
-        if None in (x_min, x_max, y_min, y_max):
-            return None
-        return ((x_min, y_min), (x_max, y_max))
-
-    def _calibrate_1d_fast(self, direction: Tuple[int, int, int]) -> dict:
-        """1D calibration in the camera's high-fps streaming mode.
-
-        The stage is fast enough to outrun full-resolution frames, so the
-        tracker runs against the live crop990 stream instead. The result is
-        scaled to full-resolution pixel units so downstream consumers see
-        the same matrix as a full-res calibration would produce."""
+        Note: this is the method used by camera_stage_mapping to measure the CSM matrix,
+        calling this directly will perform a measurement but not set the measurement,
+        for use.
+        """
+        # The tracker must look through an isotropic stream. crop990's
+        # main stream is an anisotropic 1332x990 sensor window squeezed
+        # into 700x700, which bends the y scale by 990/1332 (measured
+        # 2026-11-01: y=4.43 px/u against the true 5.83). Hold default
+        # (square sensor, isotropic) for the measurement.
         cam = self._cam
         held_before = cam.stream_mode_held
+        prev_mode = cam.streaming_mode
         if not held_before:
             cam.hold_stream_mode("csm_cal")
-        prev_mode = cam.streaming_mode
-        prev_gain = cam.analogue_gain
-        prev_exp = cam.exposure_time
-        try:
-            if prev_mode != "crop990":
-                cam._stop_streaming(stop_web_stream=False)
-                cam._start_streaming("crop990")
-            from .smooth_autofocus import _probe_regime
-
-            _g, _e = _probe_regime(prev_gain, prev_exp)
-            cam.set_probe_controls_raw(_g, _e)
-            self.logger.info(
-                "CSM cal regime: gain=%.2f exposure=%dus (AF sweep regime)",
-                _g, _e,
+        if prev_mode != "default":
+            cam._stop_streaming(stop_web_stream=False)
+            cam._start_streaming("default")
+        if cam.streaming_mode != "default":
+            self.logger.warning(
+                "CSM cal on non-default stream %s; y scale will be wrong",
+                cam.streaming_mode,
             )
-            deadline = time.monotonic() + 0.35
-            while time.monotonic() < deadline:
-                time.sleep(0.05)
-            try:
-                _limits = self._stage_position_limits()
-            except Exception:
-                _limits = None
-            _patch_relative_motion_ladder(_limits, cam, self._stage)
-            with _EncoderBurst(cam):
-                settle_deadline = time.monotonic() + 1.5
-                while time.monotonic() < settle_deadline:
-                    try:
-                        cam.capture_downsampled_array()
-                    except Exception:
-                        pass
-                    time.sleep(0.1)
-                recorded_move = _DwellRecordedMove(self._stage)
-                tracker = Tracker(
-                    cam.capture_downsampled_array,
-                    self._stage.get_xyz_position,
-                    settle=self._velocity_settle,
-                )
-                tracker.__class__ = _CappedSafeTracker
-                direction_array: np.ndarray = np.array(direction)
-                starting_position = self._stage.position
-                try:
-                    result: dict = self._calibrate_with_ceiling(
-                        tracker,
-                        recorded_move,
-                        direction_array,
-                        starting_position,
-                    )
-                except MappingError:
-                    self.logger.info(
-                        "Calibration failed - returning to starting position"
-                    )
-                    self._stage.move_absolute(
-                        **starting_position, block_cancellation=True,
-                        backlash_compensation=None,
-                    )
-                    raise
-                for _k in ("move_history",):
-                    result.pop(_k, None)
-                result["image_resolution"] = cam.capture_downsampled_array().shape[:2]
-                result["calibration_stream_mode"] = "crop990"
-                return result
+        try:
+            self._calibrate_xy_body()
         finally:
-            try:
-                cam.set_probe_controls_raw(prev_gain, prev_exp)
-            except Exception:
-                self.logger.warning("CSM cal regime restore failed", exc_info=True)
             if not held_before:
                 cam.release_stream_mode("csm_cal")
                 if cam.streaming_mode != prev_mode:
                     cam._stop_streaming(stop_web_stream=False)
                     cam._start_streaming(prev_mode)
 
-    def calibrate_1d(self, direction: Tuple[int, int, int]) -> dict:
-        """Move a microscope's stage in 1D, and figure out the relationship with the camera."""
-        if self._use_fast_cal():
-            return self._calibrate_1d_fast(direction)
-        # Record positions and times for stage calibration. The dwell
-        # variant is required on this stage: moves complete far faster
-        # than the 22fps tracker samples, so without a settle the
-        # tracker sees mid-motion or stale frames and the fit
-        # residuals blow up (seen 2026-10-28, Y-axis full-res cal).
-        recorded_move = _DwellRecordedMove(self._stage)
-
-        def _stream_grab() -> np.ndarray:
-            return self._cam.grab_as_array(stream_name="main")
-
-        tracker = _LocalWindowTracker(
-            _stream_grab,
-            self._stage.get_xyz_position,
-            settle=self._cam.settle,
-        )
-        tracker.dropped_points = []
-        direction_array: np.ndarray = np.array(direction)
-
+    def _calibrate_xy_body(self) -> None:
+        cal_data: dict[str, Any] = {}
         starting_position = self._stage.position
+        image_resolution = self._cam.grab_as_array().shape[:2]
+        # Set the target motion in pixels to one 10th of the smallest camera axis
+        target_movement_px = min(image_resolution) // 10
+
+        # Strictly typed definitions to iterate over for MyPys sake.
+        axes: tuple[Literal["x", "y"], ...] = ("y", "x")
+        for axis in axes:
+            cal_data |= self._measure_single_axis(
+                axis,
+                target_movement_px=target_movement_px,
+                starting_position=starting_position,
+            )
+
+        # If the data was collected always save it even if there is an error in fitting
         try:
-            result: dict = calibrate_backlash_1d(
-                tracker, recorded_move, direction_array, logger=self.logger
-            )
-        except MappingError as e:
-            self.logger.error(
-                "CSM 1d fit failed (%s); dropped %d re-lock points; "
-                "positions visited: %s",
-                e,
-                len(tracker.dropped_points),
-                getattr(recorded_move, "_history", None),
-            )
-            self._dump_failed_fit(tracker, direction_array, starting_position)
-            raise
-        except lt.exceptions.InvocationCancelledError as e:
-            self.logger.info("User cancelled the camera stage mapping calibration")
-            self.logger.info("Returning to starting position")
-            self._stage.move_absolute(
-                **starting_position, block_cancellation=True, backlash_compensation=None
-            )
-            raise e
-        except MappingError as e:
-            self.logger.info("Returning to starting position due to failed calibration")
-            self._stage.move_absolute(
-                **starting_position, block_cancellation=True, backlash_compensation=None
-            )
-            raise e
-        result["move_history"] = {
-            "times": [t for t, p in recorded_move._history],
-            "stage_positions": [p for t, p in recorded_move._history],
-        }
-        result["dropped_relock_points"] = len(tracker.dropped_points)
-        if tracker.dropped_points:
-            self.logger.info(
-                "CSM dropped %d template re-lock points",
-                len(tracker.dropped_points),
-            )
+            # Fit all the results
+            self.logger.info("Fitting all data")
+            csm_matrix_np, backlash = self._fit_all_csm_runs(cal_data)
+
+            self.logger.info(f"Estimated backlash {backlash} steps")
+            self.logger.info(f"CSM matrix is {_csm_matrix_to_string(csm_matrix_np)}.")
+
+            csm_matrix = csm_matrix_np.tolist()
+            cal_data["csm_matrix"] = csm_matrix
+            cal_data["backlash"] = backlash
+        finally:
+            timestamp = self._write_csm_data_to_disk(cal_data)
+
+        # Save settings if successfully fitted.
+        self.image_to_stage_displacement_matrix = csm_matrix
+        self.image_resolution = image_resolution
+        # Data is saved on an error, but the timestamp isn't updated.
+        self.last_cal_timestamp = timestamp
+
+    def _measure_single_axis(
+        self,
+        axis: Literal["x", "y"],
+        *,
+        target_movement_px: int,
+        starting_position: Mapping[str, int],
+    ) -> dict[str, Any]:
+        """Measure a single axis, and return the measurement data in a dictionary."""
+        # Note: `cal_data` keys must contain the axis name, as this dictionary
+        # is merged with the same dictionary from the other axis.
+        cal_data: dict[str, Any] = {}
         try:
-            stage_pos, image_pos, times = tracker.history
-            folder = Path("/home/admin/ofm/openflexure/data/csm_debug")
-            folder.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(
-                folder / f"csm_track_{time.strftime('%Y%m%d_%H%M%S')}_"
-                f"{int(direction_array[0])}{int(direction_array[1])}.npz",
-                times=np.asarray(times, dtype=float),
-                stage=np.asarray(stage_pos, dtype=float),
-                image=np.asarray(image_pos, dtype=float),
-                direction=direction_array,
-                dropped=np.asarray(tracker.dropped_points, dtype=float),
+            self.logger.info(f"Measuring {axis} axis")
+            # First using increasing steps to find motion
+            self.logger.info("Moving until motion is detected")
+            stage_positions, cam_offsets = self._detect_motion_on_axis(
+                axis=axis, target_movement_px=target_movement_px
             )
-        except Exception:
-            self.logger.exception("CSM track dump failed")
-        result["image_resolution"] = _stream_grab().shape[:2]
-        return result
+            # Calculate step size
+            index = 0 if axis == "x" else 1
+            step_size = stage_positions[-1][index] - stage_positions[0][index]
+            cal_data[f"{axis}_detection"] = {
+                "stage_positions": stage_positions,
+                "cam_offsets": cam_offsets,
+            }
 
-    def _dump_failed_fit(
-            self,
-            tracker: Tracker,
-            direction_array: np.ndarray,
-            starting_position: Mapping[str, int],
-    ) -> None:
-        """Persist the tracker's stage+image history when the 1d fit fails.
-
-        The residual gate discards the data we most need to debug a
-        failure; save it as npz before the invocation ends."""
-        try:
-            import time as _time
-
-            stage_pos, image_pos, times = tracker.history
-            folder = Path("/home/admin/ofm/openflexure/data/csm_debug")
-            folder.mkdir(parents=True, exist_ok=True)
-            path = folder / (
-                f"csm_fail_{_time.strftime('%Y%m%d_%H%M%S')}_"
-                f"{int(direction_array[0])}{int(direction_array[1])}.npz"
-            )
-            np.savez_compressed(
-                path,
-                times=np.asarray(times, dtype=float),
-                stage=np.asarray(stage_pos, dtype=float),
-                image=np.asarray(image_pos, dtype=float),
-                direction=direction_array,
-            )
-            self.logger.info("CSM failure data saved to %s", path)
-        except Exception:
-            self.logger.exception("CSM failure dump failed")
-
-    @lt.action
-    def calibrate_xy(self) -> dict:
-        """Move the microscope's stage in X and Y, to calibrate its relationship to the camera.
-
-        This performs two 1d calibrations in x and y, then combines their results.
-        """
-        # Calibrate y-axis first as it is more likely to fail.
-        # The x-y difference is due to the camera aspect ratio, not the stage hardware.
-        self.logger.info("Calibrating Y axis:")
-        cal_y: dict = self.calibrate_1d((0, 1, 0))
-        self.logger.info("Calibrating X axis:")
-        cal_x: dict = self.calibrate_1d((1, 0, 0))
-        # Strip tracker-history debug data: the nested move arrays make the
-        # result dict recurse when labthings serialises it.
-        for cal in (cal_y, cal_x):
-            for _k in ("exponential_moves", "linear_moves",
-                       "backlash_corrected_moves", "move_history"):
-                cal.pop(_k, None)
-        # Fast-mode calibrations ran against the crop990 stream: scale their
-        # matrices to full-resolution pixel units so the combined result
-        # matches what a full-res calibration would have produced.
-        if cal_x.get("calibration_stream_mode") == "crop990":
-            full_res = self._cam.streaming_modes["default"].main_resolution
-            scale = full_res[0] / cal_x["image_resolution"][0]
-            self.logger.info(
-                "Scaling crop990 calibration x%.2f to full-res units", scale
-            )
-            for cal in (cal_x, cal_y):
-                cal["pixels_per_step"] = cal["pixels_per_step"] * scale
-                cal["pixels_per_step_vector"] = (
-                        cal["pixels_per_step_vector"] * scale
+            # Run motion backwards and forwards to measure CSM
+            cal_data[f"{axis}_run"] = []
+            total_moves = 4
+            for i in range(total_moves):
+                sign = 1 if i % 2 == 0 else -1
+                self.logger.info(
+                    f"Performing {axis} axis measurement {i + 1} of {total_moves}"
                 )
-                cal["image_resolution"] = full_res
-        self.logger.info("Calibration complete, updating metadata.")
-
-        # Combine X and Y calibrations to make a 2D calibration
-        cal_xy: dict = image_to_stage_displacement_from_1d([cal_x, cal_y])
-
-        csm_matrix = cal_xy["image_to_stage_displacement"]
-        csm_as_string = (
-            f"[{round(csm_matrix[0][0], 2)}, {round(csm_matrix[0][1], 2)},],"
-            f"[{round(csm_matrix[1][0], 2)}, {round(csm_matrix[1][1], 2)}]"
-        )
-        self.logger.info(f"CSM matrix is {csm_as_string}.")
-
-        data = {
-            "camera_stage_mapping_calibration": cal_xy,
-            "linear_calibration_x": cal_x,
-            "linear_calibration_y": cal_y,
-            "downsampled_image_resolution": cal_x["image_resolution"],
-            "image_resolution": cal_x["image_resolution"],
-        }
-
-        data = _serialise_numpy_in_dict(data)
-        self.last_calibration = data
-
-        backlash_vector = cal_xy.get("backlash_vector")
-        if backlash_vector is not None:
-            axis_names = self._stage.axis_names
-            steps = dict(self._stage.backlash_steps)
-            measured = {}
-            for cal in (cal_x, cal_y):
-                for ax, d in zip(axis_names, cal["stage_direction"]):
-                    if d:
-                        measured[ax] = int(
-                            round(float(backlash_vector[axis_names.index(ax)]))
-                        )
-            steps.update(measured)
-            self._stage.settings["backlash_steps"].set(steps)
-            self.logger.info(
-                f"Stage backlash_steps updated from calibration: {measured}"
+                stage_positions, cam_offsets = self._measure_axis_displacement(
+                    axis=axis, step_size=sign * step_size, n_moves=10
+                )
+                cal_data[f"{axis}_run"].append(
+                    {
+                        "stage_positions": stage_positions,
+                        "cam_offsets": cam_offsets,
+                    }
+                )
+        finally:
+            self._stage.move_absolute(
+                **starting_position, block_cancellation=True, backlash_compensation=None
             )
+        return cal_data
 
-        return data
+    def _write_csm_data_to_disk(self, data: dict[str, Any]) -> str:
+        """Write the CSM data to disk and return the timestamp."""
+        timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
+        datafile_path = os.path.join(self.data_dir, f"csm_data_{timestamp}.json")
+        with open(datafile_path, "w", encoding="utf-8") as file_obj:
+            json.dump(data, file_obj, indent=4)
+        return timestamp
 
-    @lt.property
-    def image_to_stage_displacement_matrix(self) -> Optional[List[List[float]]]:
-        """A 2x2 matrix that converts displacement in image coordinates to stage coordinates.
+    def _detect_motion_on_axis(
+        self, axis: Literal["x", "y"], target_movement_px: int
+    ) -> tuple[list[tuple[int, int, int]], list[tuple[float, float]]]:
+        """Move the stage in increasing steps until motion is detected.
 
-        Note that this matrix is defined using "matrix coordinates", i.e. image coordinates
-        may be (y,x). This is an artifact of the way numpy, opencv, etc. define images. If
-        you are making use of this matrix in your own code, you will need to take care of
-        that conversion.
+        The stage is moved in one axis. This will complete if motion is detected in
+        any direction in the camera coordinates.
 
-        It is often helpful to give a concrete example: to make a move in image coordinates
-        (``dy``, ``dx``), where ``dx`` is horizontal, i.e. the longer dimension of the image, you
-        should move the stage by:
-
-        .. code-block:: python
-
-            stage_disp = np.dot(
-                np.array([dy,dx]),
-                np.array(image_to_stage_displacement_matrix),
-            )
-
+        :return: Two lists, One of absolute x positions and camera .
         """
-        if self.last_calibration is None:
-            return None
-        displacement_matrix = self.last_calibration["camera_stage_mapping_calibration"][
-            "image_to_stage_displacement"
-        ]
-        return np.array(displacement_matrix).tolist()
+        is_sample, _bg_message = self._cam.image_is_sample()
+        if not is_sample:
+            raise MappingError(
+                "No sample detected. Camera stage mapping requires a sample."
+            )
+        stage_pos = [self._stage.get_xyz_position()]
+        cam_pos = [(0.0, 0.0)]
 
-    last_calibration: Optional[dict] = lt.setting(default=None, readonly=True)
-    """The most recent CSM calibration."""
+        initial_image = self._cam.grab_as_array()
+
+        motion_detected = False
+        for step_size in [2**i for i in range(15)]:
+            ## Explicitly define steps as MyPy gets condused by the kwarg dict
+            x_step, y_step = (step_size, 0) if axis == "x" else (0, step_size)
+            # Move and measure displacement
+            self._stage.move_relative(x=x_step, y=y_step)
+            self._cam.settle()
+            new_image = self._cam.grab_as_array()
+            offset = displacement_between_images(initial_image, new_image)
+
+            # Save positions
+            stage_pos.append(self._stage.get_xyz_position())
+            cam_pos.append((offset[0], offset[1]))
+
+            largest = np.max(np.abs(offset))
+            if largest > target_movement_px:
+                motion_detected = True
+                break
+        if not motion_detected:
+            raise MappingError(
+                "No motion detected. Check a sample is present and motors are working."
+            )
+        return stage_pos, cam_pos
+
+    def _measure_axis_displacement(
+        self, axis: Literal["x", "y"], step_size: int, n_moves: int = 10
+    ) -> tuple[list[tuple[int, int, int]], list[tuple[float, float]]]:
+        """Measure camera vs stage displacement in 1 direction on one axis."""
+        stage_pos = [self._stage.get_xyz_position()]
+        cam_pos = [(0.0, 0.0)]
+
+        previous_image = self._cam.grab_as_array()
+
+        ## Explicitly define steps as MyPy gets condused by the kwarg dict
+        x_step, y_step = (step_size, 0) if axis == "x" else (0, step_size)
+
+        for _i in range(n_moves):
+            self._stage.move_relative(x=x_step, y=y_step)
+            self._cam.settle()
+            new_image = self._cam.grab_as_array()
+            offset = displacement_between_images(previous_image, new_image)
+            previous_image = new_image
+
+            # Save positions
+            stage_pos.append(self._stage.get_xyz_position())
+            # Note: Cam position is cumulative
+            cam_pos.append((cam_pos[-1][0] + offset[0], cam_pos[-1][1] + offset[1]))
+        return stage_pos, cam_pos
+
+    def _fit_all_csm_runs(self, csm_data: dict[str, Any]) -> tuple[np.ndarray, float]:
+        """Fit all runs from the camera stage.
+
+        :param csm_data: The dictionary created by ``calibrate_xy``
+
+        :return: The camera stage mapping matrix and the magnitude of the backlash.
+        """
+        all_stage_displacements = []
+        all_cam_displacements = []
+        backlashes = []
+
+        # Strictly typed definitions to iterate over for MyPys sake.
+        axes: tuple[Literal["x", "y"], ...] = ("x", "y")
+        for axis in axes:
+            axis_runs = csm_data[f"{axis}_run"]
+
+            for i, run_data in enumerate(axis_runs):
+                stage = np.array(run_data["stage_positions"])
+                cam = np.array(run_data["cam_offsets"])
+
+                if i > 0:
+                    backlash, points_to_remove = self._fit_backlash(axis, stage, cam)
+                    backlashes.append(backlash)
+                else:
+                    backlash = 0
+                    points_to_remove = 0
+
+                stage_displacements = stage[1:, :] - stage[:-1, :]
+                cam_displacements = cam[1:, :] - cam[:-1, :]
+
+                all_stage_displacements.append(stage_displacements[points_to_remove:])
+                all_cam_displacements.append(cam_displacements[points_to_remove:])
+
+        csm_matrix = self._fit_csm_matrix(
+            all_stage_displacements, all_cam_displacements
+        )
+        return csm_matrix, float(np.mean(backlashes))
+
+    def _fit_backlash(
+        self, axis: Literal["x", "y"], stage_pos: np.ndarray, cam_pos: np.ndarray
+    ) -> tuple[float, int]:
+        """Fit the backlash in this run.
+
+        Start with the full fit and remove the initial points until the standard error
+        minimises. Then use the displacement between the first point and the
+        extrapolated fit to calculate the backlash.
+
+        :param stage_pos: A nx3 matrix of stage positions.
+        :param cam_pos: A nx2 matrix of camera positions.
+
+        :return: The estimated backlash, and the number of points to exclude due to
+            backlash.
+        """
+        stage_pos = stage_pos[:, 0] if axis == "x" else stage_pos[:, 1]
+        # Use last position to get camera index as the first cam_pos for a run is 0,0
+        cam_is_x = abs(cam_pos[-1, 0]) > abs(cam_pos[-1, 1])
+        cam_pos = cam_pos[:, 0] if cam_is_x else cam_pos[:, 1]
+
+        n_points = len(stage_pos)
+        # Allow removing up to 1/2 of the points
+        max_cut = n_points // 2
+
+        # standard errors of each fit
+        errs = []
+        # backlashes for each fit
+        backlashes = []
+        for n_cut in range(max_cut + 1):
+            stage_pos_cut = stage_pos[n_cut:]
+            cam_pos_cut = cam_pos[n_cut:]
+            m, c = np.polyfit(stage_pos_cut, cam_pos_cut, 1)
+            residuals = cam_pos_cut - (stage_pos_cut * m + c)
+            errs.append(np.std(residuals, ddof=2) / np.sqrt(len(stage_pos_cut)))
+            # Use first element to calculate backlash from extrapolated line
+            backlashes.append(stage_pos[0] - (cam_pos[0] - c) / m)
+        # The backlash for the lowest standard error fit.
+        backlash = abs(backlashes[np.argmin(errs)])
+        points_to_remove = int(np.ceil(abs(backlash / (stage_pos[1] - stage_pos[0]))))
+        # If the standard error of the residuals is above 5 pixels raise an error.
+        if np.min(errs) > 5:
+            raise MappingError(
+                "Unable to track stage motion. Ensure the sample is in focus and has "
+                "clear features."
+            )
+        return float(backlash), points_to_remove
+
+    def _fit_csm_matrix(
+        self,
+        all_stage_displacements: list[np.ndarray],
+        all_cam_displacements: list[np.ndarray],
+    ) -> np.ndarray:
+        """Fit the camera stage mapping matrix from all the displacements recorded.
+
+        :param all_stage_displacements: A list of nx3 matrixies with the camera
+            displacements for each run.
+        :param all_cam_displacements: A list of nx3 matrixies with the stage
+            displacements for each run.
+
+        :return: The camera stage mapping matrix.
+        """
+        # Create a matrix of the positions
+        stage_mat = np.concatenate(all_stage_displacements)[:, :2]
+        cam_mat = np.concatenate(all_cam_displacements)
+
+        csm_matrix, _res, _rank, _s = np.linalg.lstsq(cam_mat, stage_mat)
+
+        residuals = np.linalg.norm(np.dot(cam_mat, csm_matrix) - stage_mat)
+        steps = np.linalg.norm(stage_mat, axis=1)
+        fractional_error = residuals / np.sqrt(len(stage_mat)) / np.mean(steps)
+        if fractional_error > 0.1:
+            # Add a warning that is followed instantly by the error. This should
+            # never show in the summary log view but will show to more technical
+            # users expanding the full log.
+            self.logger.warning(
+                "The relative RMS error of fitting the camera stage matrix was "
+                f"{fractional_error:.4f}"
+            )
+            raise MappingError(
+                "Stage motion was not as expected, check the stage is moving freely."
+            )
+        return csm_matrix
+
+    image_to_stage_displacement_matrix: Optional[list[list[float]]] = lt.setting(
+        default=None, readonly=True
+    )
+    """A 2x2 matrix that converts displacement in image coordinates to stage coordinates.
+
+    Note that this matrix is defined using "matrix coordinates", i.e. image coordinates
+    are (y,x). To make a move in image coordinates (``dy``, ``dx``), where ``dx`` is
+    horizontal, you should move the stage by:
+
+    .. code-block:: python
+
+        stage_disp = np.dot(
+            np.array([dy,dx]),
+            np.array(image_to_stage_displacement_matrix),
+        )
+
+    """
+
+    image_resolution: Optional[tuple[float, float]] = lt.setting(
+        default=None, readonly=True
+    )
+    """The image size used to calibrate the image_to_stage_displacement_matrix."""
+
+    last_cal_timestamp: Optional[str] = lt.setting(default=None, readonly=True)
+    """The timestamp of the last calibration. This can be used to get the data file."""
 
     @lt.property
-    def image_resolution(self) -> Optional[Tuple[float, float]]:
-        """The image size used to calibrate the image_to_stage_displacement_matrix."""
-        if self.last_calibration is None:
+    def last_calibration(self) -> Optional[dict]:
+        """The most recent CSM calibration."""
+        if self.last_cal_timestamp is None:
             return None
-        return self.last_calibration["image_resolution"]
+
+        filename = f"csm_data_{self.last_cal_timestamp}.json"
+        datafile_path = os.path.join(self.data_dir, filename)
+        if not os.path.isfile(datafile_path):
+            return None
+
+        with open(datafile_path, "r", encoding="utf-8") as file_obj:
+            return json.load(file_obj)
 
     @lt.property
     def calibration_required(self) -> bool:
         """Whether the camera stage mapper needs calibrating."""
         return self.image_to_stage_displacement_matrix is None
 
-    def assert_calibration(self) -> List[List[float]]:
+    def assert_calibration(self) -> list[list[float]]:
         """Return image_to_stage_displacement matrix or raise error if it's not set."""
         if self.image_to_stage_displacement_matrix is None:
             raise CSMUncalibratedError(
@@ -1055,7 +461,7 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
 
     @lt.action
     def convert_image_to_stage_coordinates(
-            self, x: float, y: float, **_kwargs: float
+        self, x: float, y: float, **_kwargs: float
     ) -> Mapping[str, int]:
         """Convert image coordinates to stage coordinates. Only x and y are returned."""
         csm_matrix = self.assert_calibration()
@@ -1063,7 +469,7 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
 
     @lt.action
     def convert_stage_to_image_coordinates(
-            self, x: int, y: int, **_kwargs: int
+        self, x: int, y: int, **_kwargs: int
     ) -> Mapping[str, float]:
         """Convert stage coordinates to image coordinates. Only x and y are returned."""
         csm_matrix = self.assert_calibration()
@@ -1079,11 +485,11 @@ class CameraStageMapper(ViewAlignmentMixin, lt.Thing):
 
 
 def csm_img_to_stage(
-        matrix: np.ndarray | list[list[float]],
-        *,
-        x: float | int,
-        y: float | int,
-        **_kwargs: int,
+    matrix: np.ndarray | list[list[float]],
+    *,
+    x: float | int,
+    y: float | int,
+    **_kwargs: int,
 ) -> Mapping[str, int]:
     """Apply any CSM matrix to image coordinates.
 
@@ -1098,19 +504,17 @@ def csm_img_to_stage(
     :param y: the y image coordinate (keyword only)
     :return: The resulting stage coordinates as a mapping.
     """
-    # (y,x) row product: legacy convention kept byte-compatible for the
-    # scan path and the UI image-jog (which carries preview-rotation
-    # compensation). Recenter does not use this; see stage_measure.
+    # Note this is (y,x) not (x,y) to put it in numpy image indices
     relative_move: np.ndarray = np.dot(np.array([y, x]), np.array(matrix))
     return {"x": round(relative_move[0]), "y": round(relative_move[1])}
 
 
 def csm_stage_to_img(
-        matrix: np.ndarray | list[list[float]],
-        *,
-        x: float | int,
-        y: float | int,
-        **_kwargs: int,
+    matrix: np.ndarray | list[list[float]],
+    *,
+    x: float | int,
+    y: float | int,
+    **_kwargs: int,
 ) -> Mapping[str, float]:
     """Apply any CSM matrix to stage coordinates to get image coordinates.
 
