@@ -1,15 +1,11 @@
 import math
 import random
-import sys
 
-sys.path.insert(
-    0,
-    r"C:\glia\EU_dotacje\mikroskop\OFM-server\openflexure-microscope-server"
-    r"\src\openflexure_microscope_server\things",
+from openflexure_microscope_server.things.smooth_af_core import (
+    CurvePoint,
+    fit_log_gaussian,
+    median_filter_curve,
 )
-from smooth_af_core import CurvePoint, cluster_curve, fit_log_gaussian
-
-random.seed(7)
 
 
 def gauss_curve(peak, fwhm, amp, base, lo, hi, n, noise):
@@ -22,36 +18,49 @@ def gauss_curve(peak, fwhm, amp, base, lo, hi, n, noise):
     return pts
 
 
-r = fit_log_gaussian(gauss_curve(26.2, 3.0, 10, 5, 20, 32, 25, 0.05))
-print("clean gaussian:", r)
-assert r.ok and abs(r.peak - 26.2) < 0.15 and 2.0 < r.fwhm < 4.5
-assert r.snr > 2 and r.r2 > 0.9
+def test_clean_gaussian_recovers_peak():
+    random.seed(7)
+    r = fit_log_gaussian(gauss_curve(26.2, 3.0, 10, 5, 20, 32, 25, 0.05))
+    assert r.ok
+    assert abs(r.peak - 26.2) < 0.15
+    assert 2.0 < r.fwhm < 4.5
+    assert r.snr > 2
+    assert r.r2 > 0.9
 
-r = fit_log_gaussian(gauss_curve(26.2, 3.0, 10, 5, 20, 32, 25, 0.25))
-print("noisy gaussian:", r)
-assert r.ok and abs(r.peak - 26.2) < 0.6
 
-r = fit_log_gaussian([CurvePoint(z=z, sharpness=8.0) for z in range(20, 30)])
-print("flat curve:", r)
-assert not r.ok
+def test_noisy_gaussian_recovers_peak():
+    random.seed(7)
+    r = fit_log_gaussian(gauss_curve(26.2, 3.0, 10, 5, 20, 32, 25, 0.25))
+    assert r.ok
+    assert abs(r.peak - 26.2) < 0.6
 
-r = fit_log_gaussian([CurvePoint(z=z, sharpness=8.0 + z * 0.1) for z in range(20, 30)])
-print("gentle ramp:", r)
-assert not r.ok
 
-r = fit_log_gaussian([CurvePoint(z=z, sharpness=5.0 + z * 0.5) for z in range(20, 30)])
-print("steep ramp:", r)
-assert not r.ok
+def test_flat_curve_rejected():
+    r = fit_log_gaussian([CurvePoint(z=z, sharpness=8.0) for z in range(20, 30)])
+    assert not r.ok
 
-r = fit_log_gaussian([CurvePoint(z=20, sharpness=5), CurvePoint(z=21, sharpness=6)])
-print("too few points:", r)
-assert not r.ok
 
-raw = [CurvePoint(z=1.0, sharpness=10), CurvePoint(z=1.0, sharpness=20),
-       CurvePoint(z=1.0, sharpness=30), CurvePoint(z=2.0, sharpness=5)]
-cl = cluster_curve(raw)
-print("clustered:", [(p.z, round(p.sharpness, 2)) for p in cl])
-assert len(cl) == 2
-assert cl[0].sharpness == 25.0
+def test_gentle_ramp_rejected():
+    r = fit_log_gaussian(
+        [CurvePoint(z=z, sharpness=8.0 + z * 0.1) for z in range(20, 30)]
+    )
+    assert not r.ok
 
-print("\nALL SMOOTH-AF CORE TESTS PASS")
+
+def test_steep_ramp_rejected():
+    r = fit_log_gaussian(
+        [CurvePoint(z=z, sharpness=5.0 + z * 0.5) for z in range(20, 30)]
+    )
+    assert not r.ok
+
+
+def test_too_few_points_rejected():
+    r = fit_log_gaussian([CurvePoint(z=20, sharpness=5), CurvePoint(z=21, sharpness=6)])
+    assert not r.ok
+
+
+def test_median_filter_kills_spike():
+    pts = [CurvePoint(z=z, sharpness=10.0) for z in range(10)]
+    pts[5].sharpness = 100.0
+    out = median_filter_curve(pts, window=3)
+    assert out[5].sharpness == 10.0

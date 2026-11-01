@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import httpx
 import json
+import labthings_fastapi as lt
 import threading
 import time
 from enum import Enum
 from types import TracebackType
 from typing import Any, Literal, Mapping, Optional, Self, Sequence, Tuple
-
-import httpx
-import labthings_fastapi as lt
 
 from . import BaseStage, JogCommand
 

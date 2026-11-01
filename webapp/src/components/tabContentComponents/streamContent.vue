@@ -210,8 +210,11 @@ export default {
       if (this.navigationMirror) {
         x = -x;
       }
-      const rad = (-rot * Math.PI) / 180;
-      const xLocal = x * Math.cos(rad) - y * Math.sin(rad);
+      // Rotate screen offsets into the camera frame such that the
+      // CSM row-product conversion sends click-right to +X and
+      // click-up to +Y, matching the jog keys (rot=270, no mirror).
+      const rad = ((180 - rot) * Math.PI) / 180;
+      const xLocal = -(x * Math.cos(rad) - y * Math.sin(rad));
       const yLocal = x * Math.sin(rad) + y * Math.cos(rad);
 
       // Uniform content-fit scale: the img element may be larger than the

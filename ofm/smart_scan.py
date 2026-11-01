@@ -517,7 +517,7 @@ class SmartScanThing(OFMThing):
         try:
             # Change into streaming mode instantly so mode is correct when collecting
             # Scan Data
-            self._cam.change_streaming_mode(mode="full_resolution")
+            self._cam.change_streaming_mode(mode="default")
             self._cam._scan_hold = True
             self._scan_data = self._collect_scan_data(workflow)
             images_dir = self.ongoing_scan.images_dir
