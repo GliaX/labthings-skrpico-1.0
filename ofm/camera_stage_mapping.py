@@ -88,9 +88,34 @@ class CameraStageMapper(OFMThing):
                 "CSM cal on non-default stream %s; y scale will be wrong",
                 cam.streaming_mode,
             )
+        # Steady LED for the measurement: the free-running flash band
+        # drifts ~100-200px between frames (measured 2026-11-02 with the
+        # stage still), corrupting row-axis displacement correlations -
+        # the Y axis only. Continuous light also suppresses the strobe
+        # mode-change hooks so nothing re-arms mid-calibration.
+        strobe = getattr(cam, "_strobe_control", None)
+        strobe_was_continuous = bool(getattr(strobe, "_continuous", False))
+        if strobe is not None:
+            strobe.enter_continuous_light()
+            # The strobe pin leaves full-period exposure (45ms); under
+            # continuous light that saturates the sensor. Short shutter
+            # for the measurement (400us, the value proven under
+            # continuous light by the shaper-rolling cal). Gain is kept.
+            # Raw write: persisted settings untouched; exit_continuous_light
+            # re-pins the strobe operating point on the way out.
+            gain = float(cam.analogue_gain)
+            cam.set_probe_controls_raw(gain, 400)
+            cam.discard_frames()
+            self.logger.info(
+                "CSM cal: continuous light, shutter 400us, gain %.2f",
+                gain,
+            )
         try:
             self._calibrate_xy_body()
         finally:
+            if strobe is not None and not strobe_was_continuous:
+                strobe.exit_continuous_light()
+                self.logger.info("CSM cal: strobe restored")
             if not held_before:
                 cam.release_stream_mode("csm_cal")
                 if cam.streaming_mode != prev_mode:
