@@ -782,8 +782,8 @@ class StreamingPiCamera2(BaseCamera, ABC):
                             hh // blk, blk, ww // blk, blk
                         ).mean(axis=(1, 3))
                         chroma = float(mb.std())
-                ph = y_rows // blk * blk
-                pw = stride // blk * blk
+                ph = (y_rows // 2) // blk * blk
+                pw = (stride // 2) // blk * blk
                 if ph >= blk and pw >= blk:
                     gx = a[:ph, 1:pw] - a[:ph, : pw - 1]
                     gy = a[1:ph, :pw] - a[: ph - 1, :pw]

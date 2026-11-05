@@ -413,6 +413,25 @@ class SmoothAutofocusThing(lt.Thing):
     _SPHERE_FIT: dict | None = None
     _SPHERE_MESH_LIVE: bool = False
     _LAST_SCAN_TS: float = 0.0
+    _SUPPRESS_MISMATCH_FOR: Optional[str] = None
+    _MISMATCH: Optional[dict] = None
+    _LAST_ANCHOR_Z: Optional[float] = None
+    _LAST_SEEN_OBJECTIVE: Optional[str] = None
+    _objective: Optional[str] = None
+
+    @lt.setting
+    def objective(self) -> Optional[str]:
+        """Magnification of the mounted objective (e.g. "40x").
+
+        User-selected dropdown value; selects the per-objective focus
+        profile and gates the CSM mismatch warning. When a sibling
+        instance runs a flow without its own stored value, the value
+        set on the autofocus thing is used."""
+        return self._objective
+
+    @objective.setter
+    def _set_objective(self, value: Optional[str]) -> None:
+        self._objective = str(value).strip().lower() if value else None
 
     def _hw_steps_param(self, delta_hw):
         inv = getattr(self._stage, "axis_inverted", {}) or {}
@@ -1472,6 +1491,416 @@ class SmoothAutofocusThing(lt.Thing):
         )
         return self._stage_z(), rev_s
 
+    def _objective_name(self) -> Optional[str]:
+        """Selected objective: this instance's value, else the sibling
+        autofocus thing's value (x-002 registers smooth_autofocus and
+        autofocus as separate instances; dropdown lives on autofocus)."""
+        v = getattr(self, "_objective", None)
+        if v:
+            return v
+        try:
+            server = self._thing_server_interface._get_server()
+            af = server.things.get("autofocus")
+            if af is not None and af is not self:
+                v = af._objective
+                if v:
+                    return v
+        except Exception:
+            pass
+        return None
+
+    def _objective_profiles_path(self) -> str:
+        return "/home/admin/openflexure-microscope-server/"
+        + "smooth_af_objective_profiles.json"
+
+    def _load_profiles(self) -> dict:
+        """Load per-objective focus profiles from disk."""
+        try:
+            with open(self._objective_profiles_path()) as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_profiles(self, profiles: dict) -> None:
+        try:
+            with open(self._objective_profiles_path(), "w") as f:
+                json.dump(profiles, f, indent=1)
+        except Exception:
+            LOGGER.warning(
+                "objective profile save failed", exc_info=True
+            )
+
+    _ACTIVE_PROFILE: dict = {}
+
+    def _profile_for(self, obj: Optional[str]) -> Optional[dict]:
+        if not obj:
+            return None
+        p = self._load_profiles().get(obj)
+        if isinstance(p, dict) and p:
+            return p
+        return None
+
+    def _active_profile(self) -> Optional[dict]:
+        obj = self._objective_name()
+        if obj is None:
+            return None
+        if type(self)._LAST_SEEN_OBJECTIVE != obj:
+            type(self)._LAST_SEEN_OBJECTIVE = obj
+            type(self)._SUPPRESS_MISMATCH_FOR = None
+        if type(self)._ACTIVE_PROFILE.get("objective") != obj:
+            type(self)._ACTIVE_PROFILE = (
+                self._profile_for(obj) or {"objective": obj}
+            )
+        return type(self)._ACTIVE_PROFILE or None
+
+    def _update_profile(self, key: str, value) -> None:
+        """Write one key into the active objective's profile (and the
+        shared legacy cal file when no objective is selected)."""
+        obj = self._objective_name()
+        if not obj:
+            self._save_cal(key, value)
+            return
+        profiles = self._load_profiles()
+        p = profiles.get(obj)
+        if not isinstance(p, dict):
+            p = {"objective": obj}
+            profiles[obj] = p
+        p[key] = value
+        self._save_profiles(profiles)
+        if type(self)._ACTIVE_PROFILE.get("objective") == obj:
+            type(self)._ACTIVE_PROFILE[key] = value
+
+    def _csm_thing(self):
+        """The camera_stage_mapping thing via the server, or None."""
+        try:
+            server = self._thing_server_interface._get_server()
+            return server.things.get("camera_stage_mapping")
+        except Exception:
+            return None
+
+    def _csm_scale(self) -> Optional[float]:
+        """|det|**0.5 of the live CSM matrix (image px -> stage units)."""
+        csm = self._csm_thing()
+        if csm is None:
+            return None
+        try:
+            m = csm.assert_calibration()
+            det = float(m[0][0] * m[1][1] - m[0][1] * m[1][0])
+            if det == 0.0:
+                return None
+            return abs(det) ** 0.5
+        except Exception:
+            return None
+
+    _OBJECTIVE_SCALES: dict = {
+        "20x": (0.32, 0.62),
+        "40x": (0.17, 0.34),
+        "60x": (0.12, 0.24),
+        "100x": (0.07, 0.15),
+    }
+
+    def _objective_mismatch(self) -> Optional[dict]:
+        """Compare the live CSM scale against the calibrated per-objective
+        scale, then the survey band. Returns a report dict when they
+        disagree enough to suspect the dropdown is wrong; None otherwise
+        (or when no objective is selected / nothing to compare)."""
+        obj = self._objective_name()
+        if not obj:
+            return None
+        live = self._csm_scale()
+        if not live:
+            return None
+        profiles = self._load_profiles()
+        stored = profiles.get(obj) or {}
+        cal_scale = stored.get("csm_scale")
+        src = "calibrated"
+        if not cal_scale:
+            band = self._OBJECTIVE_SCALES.get(obj)
+            if not band:
+                return None
+            cal_scale = band
+            src = "survey"
+        ratio = max(live, cal_scale) / min(live, cal_scale)
+        if ratio > 1.3:
+            return {
+                "objective": obj,
+                "live_scale": live,
+                "expected_scale": cal_scale,
+                "source": src,
+                "ratio": ratio,
+            }
+        return None
+
+    @lt.property
+    def objective_mismatch(self) -> Optional[dict]:
+        """Non-null when the live CSM scale disagrees with the selected
+        objective. Shape: {objective, live_scale, expected_scale,
+        source, ratio}. The user may suppress this until the next
+        objective change."""
+        return type(self)._MISMATCH
+
+    @lt.property
+    def objective_profiles(self) -> dict:
+        """Stored per-objective focus profiles (read-only view)."""
+        return self._load_profiles()
+
+    @lt.action
+    def suppress_objective_warning(self) -> dict:
+        """Silence the objective/CSM mismatch warning until the objective
+        setting is changed again."""
+        self._SUPPRESS_MISMATCH_FOR = self._objective_name()
+        return {"suppressed_for": self._SUPPRESS_MISMATCH_FOR}
+
+    def _mismatch_report(self) -> Optional[dict]:
+        if type(self)._SUPPRESS_MISMATCH_FOR == self._objective_name():
+            return None
+        return self._objective_mismatch()
+
+    def _mismatch_report_now(self) -> Optional[dict]:
+        """Check the live objective mismatch right now and log the
+        warning once per occurrence."""
+        r = self._mismatch_report()
+        if r is not None:
+            _log(
+                "OBJWARN objective=%s live_scale=%.4f expected=%.4f "
+                "(%s) ratio=%.2f - dropdown might be wrong"
+                % (
+                    r["objective"], r["live_scale"], r["expected_scale"],
+                    r["source"], r["ratio"],
+                )
+            )
+        return r
+
+    def _refresh_mismatch_state(self) -> None:
+        r = self._objective_mismatch()
+        suppressed = (
+            type(self)._SUPPRESS_MISMATCH_FOR == self._objective_name()
+        )
+        type(self)._MISMATCH = None if (r is None or suppressed) else r
+        if r is not None and not suppressed:
+            self._mismatch_report_now()
+
+    def _learn_parfocal_delta(self, z_before: float, peak: float) -> None:
+        """Store (peak - prediction) as the active objective's parfocal
+        delta, so the next start prediction improves."""
+        obj = self._objective_name()
+        if not obj or not peak == peak:
+            return
+        pred = self._predicted_start_z(z_before)
+        if pred is None:
+            return
+        d = float(peak) - pred
+        if abs(d) > 2000.0:
+            return
+        self._update_profile("parfocal_delta", round(d, 2))
+        _log("PARFOCAL obj=%s delta=%.1f (peak %.1f - pred %.1f)"
+             % (obj, d, peak, pred))
+
+    def _predicted_start_z(
+            self, z_before: float
+    ) -> Optional[float]:
+        """Best z prediction for the AF sweep start.
+
+        Layer 1: SAMPLE_MESH surface_here (per-XY sample surface).
+        Layer 2: MACHINE_SURFACE bowl+tilt model.
+        Layer 3: last focused z from any objective.
+        Plus the active objective's learned parfocal delta."""
+        pred = None
+        sender = getattr(self._stage, "_send_gcode_script", None)
+        if sender is not None:
+            try:
+                st = self._stage._get_status(payload={
+                    "objects": {"sample_mesh": None}
+                })
+                sm = ((st.get("result") or {}).get("status") or {}).get(
+                    "sample_mesh"
+                ) or {}
+                pred = sm.get("surface_here")
+            except Exception:
+                pred = None
+        if pred is None:
+            try:
+                pos = self._stage.position
+                pred = (
+                    MACHINE_SURFACE["A"] * (pos["x"] ** 2 + pos["y"] ** 2)
+                    + MACHINE_SURFACE["MX"] * pos["x"]
+                    + MACHINE_SURFACE["MY"] * pos["y"]
+                    + MACHINE_SURFACE["Z0"]
+                )
+            except Exception:
+                pred = None
+        if pred is None:
+            pred = getattr(type(self), "_LAST_ANCHOR_Z", None)
+        if pred is None:
+            return None
+        prof = self._active_profile() or {}
+        try:
+            pred += float(prof.get("parfocal_delta") or 0.0)
+        except (TypeError, ValueError):
+            pass
+        if abs(pred - z_before) > 3000.0:
+            return None
+        return float(pred)
+
+    def _objective_fwhm(self) -> Optional[float]:
+        prof = self._active_profile() or {}
+        fw = prof.get("fwhm_u")
+        if fw is None:
+            fw = type(self)._CAL_FWHM
+        try:
+            fw = float(fw)
+        except (TypeError, ValueError):
+            return None
+        if not (2.0 < fw < 400.0):
+            return None
+        return fw
+
+    @lt.action
+    def calibrate_focus_profile(
+            self, sweep: float = 0.0, hold: int = 3
+    ) -> dict:
+        """Calibrate this objective's focus profile.
+
+        Bring the sample roughly into focus by eye/jog first. Runs a
+        slow resting-mode sweep around the current position, fits the
+        sharpness curve, and stores fwhm_u, contrast, sharpness floor,
+        and the live CSM scale into the objective's profile.
+        """
+        obj = self._objective_name()
+        if not obj:
+            raise RuntimeError(
+                "calibrate_focus_profile: set the objective dropdown on "
+                "the autofocus thing first"
+            )
+        if type(self)._AF_BUSY:
+            raise RuntimeError("autofocus is busy")
+        try:
+            st = self._stage._get_status(payload={
+                "objects": {"gcode_move": None}
+            })
+            self._last_hw = float(
+                st["result"]["status"]["gcode_move"]["position"][2]
+            )
+        except Exception:
+            LOGGER.warning(
+                "AFCAL logical-z resync failed, using cached", exc_info=True
+            )
+            self._last_hw = float(self._stage.position["z"])
+        z = self._stage_z()
+        if z != z:
+            raise RuntimeError("no live z position")
+        half = float(sweep) if sweep and sweep > 0 else 120.0
+        fps = 22.0
+        try:
+            m = self._cam.streaming_modes.get(self._cam.streaming_mode)
+            fr = getattr(m, "frame_rate", None)
+            if fr:
+                fps = float(fr)
+        except Exception:
+            pass
+        v = max(60.0, min(200.0, fps * 12.0 / 5.0))
+        exp, gain = self._cam.exposure_time, self._cam.analogue_gain
+        _log("AFCAL %s start z=%.1f span=+-%.0f v=%.0f fps=%.1f"
+             % (obj, z, half, v, fps))
+        prof = self._load_profiles().get(obj) or {}
+        prev = prof.get("parfocal_delta")
+        try:
+            prev_gain, prev_exp = type(self)._LAST_REGIME or (None, None)
+            monitor = StreamSharpnessMonitor(self._cam)
+            with monitor:
+                try:
+                    if self._cam.streaming_mode != "default":
+                        self._cam._start_streaming("default")
+                except Exception:
+                    LOGGER.warning(
+                        "AFCAL streaming switch failed", exc_info=True
+                    )
+                monitor.wait_frames(4, 0, timeout=2.0)
+                if prev_gain and prev_exp:
+                    try:
+                        self._cam.set_probe_controls_raw(
+                            float(prev_gain), int(prev_exp)
+                        )
+                    except Exception:
+                        pass
+                pts = []
+                mark = len(monitor.times)
+                traj, frames = self._sync_move(
+                    monitor, z + half, v, mark
+                )
+                traj2, frames2 = self._sync_move(
+                    monitor, z - half, v, len(monitor.times)
+                )
+                pts = self._label_leg(
+                    frames2, z - half, z + half, traj2, v
+                )
+                _dump_json("smooth_af_afcal_curve.json", {
+                    "objective": obj,
+                    "z": [q[0] for q in pts],
+                    "s": [q[2] for q in pts],
+                    "p": [q[3] for q in pts],
+                })
+                cp = [CurvePoint(z=q[0], sharpness=q[2]) for q in pts]
+                fit = fit_log_gaussian(cp)
+                out = {
+                    "objective": obj,
+                    "ok": False,
+                    "n_points": len(pts),
+                }
+                if not fit.ok or len(pts) < 10:
+                    out["reason"] = (
+                        "curve fit failed - start closer to focus "
+                        "and retry"
+                    )
+                    return out
+                if not (2.0 < (fit.fwhm or 0) < 400.0):
+                    out["reason"] = (
+                        "fwhm out of range (%s) - start closer to "
+                        "focus and retry" % fit.fwhm
+                    )
+                    return out
+                s_vals = [q[2] for q in pts]
+                s_floor = sorted(s_vals)[
+                    max(0, len(s_vals) * 3 // 10 - 1)
+                ]
+                s_best = max(s_vals)
+                contrast = s_best / max(s_floor, 1e-9)
+                if contrast < 1.25:
+                    out["reason"] = (
+                        "contrast too flat (%.2f) - more texture in "
+                        "view or clean lens" % contrast
+                    )
+                    return out
+                stored = {
+                    "fwhm_u": round(float(fit.fwhm), 2),
+                    "contrast": round(float(contrast), 3),
+                    "static_floor": round(float(s_floor), 1),
+                    "csm_scale": self._csm_scale(),
+                    "cal_z": round(float(fit.peak), 2),
+                    "cal_time": time.time(),
+                }
+                profiles = self._load_profiles()
+                p = profiles.get(obj) or {}
+                if prev is not None:
+                    stored["parfocal_delta"] = prev
+                profiles[obj] = {**p, **stored}
+                self._save_profiles(profiles)
+                if type(self)._ACTIVE_PROFILE.get("objective") == obj:
+                    type(self)._ACTIVE_PROFILE.update(stored)
+                out.update(stored)
+                out["ok"] = True
+                return out
+        finally:
+            try:
+                self._cam.set_probe_controls_raw(
+                    float(gain or 1.0),
+                    max(100, int(exp or 500)),
+                )
+            except Exception:
+                pass
+            self._arm_cooler()
+
     def _load_cal(self) -> None:
         try:
             p = "/home/admin/openflexure-microscope-server/"
@@ -1673,8 +2102,21 @@ class SmoothAutofocusThing(lt.Thing):
     def _run_flow(self, monitor: StreamSharpnessMonitor) -> SmoothFocusResult:
         t0 = time.monotonic()
         mode = ""
-        span = float(getattr(self, "_span_hint", 0.0) or _FAR_SPAN)
+        hint = float(getattr(self, "_span_hint", 0.0) or 0.0)
+        fw = self._objective_fwhm()
+        if hint > 0.0:
+            span = hint
+        elif fw:
+            span = max(120.0, min(_FAR_SPAN, fw * 18.0))
+        else:
+            span = _FAR_SPAN
         half_span = min(span / 2.0, _FAR_SPAN)
+        prof = self._active_profile() or {}
+        if prof.get("parfocal_delta"):
+            mode += "|pdelta%.0f" % float(prof["parfocal_delta"])
+        if prof.get("contrast"):
+            type(self)._CAL_CONTRAST = float(prof["contrast"])
+        self._refresh_mismatch_state()
         try:
             st = self._stage._get_status(payload={
                 "objects": {"gcode_move": None}
@@ -1757,6 +2199,16 @@ class SmoothAutofocusThing(lt.Thing):
         cur = self._stage_z()
         if not (cur == cur):
             cur = self._last_hw
+        if not _SCAN_MODE():
+            _pred = self._predicted_start_z(cur)
+            if _pred is not None and abs(_pred - cur) > 15.0:
+                self._sync_move(
+                    monitor, _pred, _PARK_VELOCITY,
+                    len(monitor.times), labeled=False,
+                )
+                cur = self._stage_z()
+                mode += "|pred%.0f" % _pred
+            self._flow_z_before = cur
         leg_a = cur + half_span
         leg_b = cur - half_span
         if not type(self)._CAL_LOADED:
@@ -1769,6 +2221,10 @@ class SmoothAutofocusThing(lt.Thing):
             mode += "|accelcal"
         else:
             far_v = _FAR_VELOCITY
+            if fw:
+                far_v = max(
+                    700.0, min(far_v, FPS * fw / 2.2)
+                )
         _log(
             f"FARREGIME_V v={far_v:.0f} cal={type(self)._CAL_ACCEL}"
         )
@@ -2257,7 +2713,7 @@ class SmoothAutofocusThing(lt.Thing):
         = claw hit, span = fwhm-derived) and the scan-only flow (anchor =
         last focused z, span = caller-set)."""
         fwhm = (
-            type(self)._CAL_FWHM if type(self)._CAL_CONTRAST else None
+            self._objective_fwhm() if type(self)._CAL_CONTRAST else None
         )
         if span:
             span_h = float(span)
@@ -2816,6 +3272,28 @@ class SmoothAutofocusThing(lt.Thing):
                             f"RUN total={time.monotonic() - t0:.2f} "
                             f"mode={result.mode}"
                         )
+                        try:
+                            type(self)._LAST_ANCHOR_Z = float(
+                                result.peak_z
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            if not _SCAN_MODE():
+                                self._learn_parfocal_delta(
+                                    float(
+                                        getattr(
+                                            self,
+                                            "_flow_z_before",
+                                            result.peak_z,
+                                        )
+                                    ),
+                                    float(result.peak_z),
+                                )
+                        except Exception:
+                            LOGGER.warning(
+                                "parfocal learn failed", exc_info=True
+                            )
                         return result
                     except NoFocusFoundError as exc:
                         _log(

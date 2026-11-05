@@ -605,7 +605,7 @@ class StageMeasurementThing(OFMThing):
         matrix = np.array(self._csm.image_to_stage_displacement_matrix)
         x2, y2 = -movement["y"], movement["x"]
         rel = np.dot(np.array([y2, x2]), matrix)
-        return {"x": int(round(rel[1])), "y": int(round(rel[0]))}
+        return {"x": int(round(rel[0])), "y": int(round(rel[1]))}
 
     def _stage_move_from_img(self, movement: Mapping[str, float]) -> Mapping[str, int]:
         """Convert an image-px movement to stage units and execute it."""
