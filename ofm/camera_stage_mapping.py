@@ -99,15 +99,14 @@ class CameraStageMapper(OFMThing):
             strobe.enter_continuous_light()
             # The strobe pin leaves full-period exposure (45ms); under
             # continuous light that saturates the sensor. Short shutter
-            # for the measurement (400us, the value proven under
-            # continuous light by the shaper-rolling cal). Gain is kept.
+            # for the measurement (2500us). Gain is kept.
             # Raw write: persisted settings untouched; exit_continuous_light
             # re-pins the strobe operating point on the way out.
             gain = float(cam.analogue_gain)
-            cam.set_probe_controls_raw(gain, 400)
+            cam.set_probe_controls_raw(gain, 2500)
             cam.discard_frames()
             self.logger.info(
-                "CSM cal: continuous light, shutter 400us, gain %.2f",
+                "CSM cal: continuous light, shutter 2500us, gain %.2f",
                 gain,
             )
         try:

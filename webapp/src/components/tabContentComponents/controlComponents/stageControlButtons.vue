@@ -100,12 +100,7 @@ export default {
   }),
 
   computed: {
-    ...mapWritableState(useSettingsStore, [
-      "navigationInvert",
-      "navigationStepSize",
-      "navigationRotate",
-      "stageToImageRotation",
-    ]),
+    ...mapWritableState(useSettingsStore, ["navigationInvert", "navigationStepSize"]),
   },
 
   methods: {
@@ -127,24 +122,12 @@ export default {
       // pointer is.
       pointerEvent.target.setPointerCapture(pointerEvent.pointerId);
 
-      let invokeJog = () => {
-        let jx = x * this.navigationStepSize.x * (this.navigationInvert.x ? -1 : 1);
-        let jy = y * this.navigationStepSize.y * (this.navigationInvert.y ? -1 : 1);
-        const delta =
-          ((((this.navigationRotate || 0) + (this.stageToImageRotation || 0)) % 360) + 360) % 360;
-        if (delta === 90) {
-          [jx, jy] = [jy, -jx];
-        } else if (delta === 180) {
-          [jx, jy] = [-jx, -jy];
-        } else if (delta === 270) {
-          [jx, jy] = [-jy, jx];
-        }
+      let invokeJog = () =>
         this.invokeAction("stage", "jog", {
-          x: jx,
-          y: jy,
+          x: x * this.navigationStepSize.x * (this.navigationInvert.x ? -1 : 1),
+          y: y * this.navigationStepSize.y * (this.navigationInvert.y ? -1 : 1),
           z: z * this.navigationStepSize.z,
         });
-      };
       invokeJog();
       this.jogIntervalId = setInterval(invokeJog, this.jogTime);
     },

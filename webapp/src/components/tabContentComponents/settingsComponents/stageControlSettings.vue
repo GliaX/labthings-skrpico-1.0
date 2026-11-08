@@ -34,22 +34,27 @@
         </div>
       </div>
     </div>
-    <div class="uk-grid-small" uk-grid>
-      <div class="uk-width-1-3">
-        <label class="uk-form-label" for="form-stacked-select">Preview rotation</label>
-        <div class="uk-form-controls">
-          <select v-model.number="navigationRotate" class="uk-select uk-form-small">
-            <option :value="0">0°</option>
-            <option :value="90">90°</option>
-            <option :value="180">180°</option>
-            <option :value="270">270°</option>
-          </select>
-        </div>
-        <p class="uk-text-meta uk-margin-remove">
-          Rotates the camera preview; navigation follows the rotated view. Use Auto-Detect View
-          Alignment in the Camera-Stage Mapping settings to measure it automatically.
-        </p>
-      </div>
+    <div class="uk-margin-top">
+      <button class="uk-button uk-button-default" :disabled="detecting" @click="detectRotation">
+        {{ detecting ? "Detecting..." : "Detect rotation" }}
+      </button>
+      <span v-if="detectMessage" class="uk-margin-left">{{ detectMessage }}</span>
+    </div>
+    <div class="uk-margin-small uk-flex uk-flex-middle">
+      <button
+        v-for="angle in [0, 90, 180, 270]"
+        :key="angle"
+        class="uk-button uk-button-small uk-margin-small-right"
+        :class="{ 'uk-button-primary': previewRotation === angle }"
+        @click="setPreviewTransform(angle, previewMirror)"
+      >
+        {{ angle }}&deg;
+      </button>
+      <label class="uk-margin-small-right">
+        <input v-model="previewMirror" type="checkbox" class="uk-checkbox" />
+        Mirror
+      </label>
+      <span>Current: {{ previewRotation }}&deg;{{ previewMirror ? ", mirrored" : "" }}</span>
     </div>
     <shaper-calibration-card />
   </div>
@@ -57,8 +62,10 @@
 
 <script>
 import ShaperCalibrationCard from "./ShaperCalibrationCard.vue";
+import { ref } from "vue";
 import { storeToRefs } from "pinia";
 import { useSettingsStore } from "@/stores/settings.js";
+import { detectRotationFromCSM } from "@/js_utils/previewRotation.mjs";
 
 export default {
   name: "StageControlSettings",
@@ -67,8 +74,43 @@ export default {
 
   setup() {
     const store = useSettingsStore();
-    const { navigationStepSize, navigationInvert, navigationRotate } = storeToRefs(store);
-    return { navigationStepSize, navigationInvert, navigationRotate };
+    const { navigationStepSize, navigationInvert, previewRotation, previewMirror } = storeToRefs(store);
+    const detecting = ref(false);
+    const detectMessage = ref("");
+    return {
+      navigationStepSize,
+      navigationInvert,
+      previewRotation,
+      previewMirror,
+      detecting,
+      detectMessage,
+      setPreviewTransform: store.setPreviewTransform,
+    };
+  },
+
+  methods: {
+    async detectRotation() {
+      this.detecting = true;
+      this.detectMessage = "";
+      try {
+        const matrix = await this.readThingProperty(
+          "camera_stage_mapping",
+          "image_to_stage_displacement_matrix",
+        );
+        if (!matrix) {
+          this.detectMessage =
+            "No calibration available - run the camera-stage mapping calibration first.";
+          return;
+        }
+        const { rotation, mirror } = detectRotationFromCSM(matrix);
+        this.setPreviewTransform(rotation, mirror);
+        this.detectMessage = `Preview set to ${rotation} degrees${mirror ? " + mirror" : ""}`;
+      } catch {
+        this.detectMessage = "Detection failed - is the camera_stage_mapping thing available?";
+      } finally {
+        this.detecting = false;
+      }
+    },
   },
 };
 </script>

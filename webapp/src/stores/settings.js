@@ -4,6 +4,7 @@
 
 import { defineStore } from "pinia";
 import { ref } from "vue";
+import { assertValidRotationAngle } from "@/js_utils/previewRotation.mjs";
 
 /**
  * Get the origin from the current window location.
@@ -53,14 +54,10 @@ export const useSettingsStore = defineStore(
       y: false,
       z: false,
     });
-    // Preview rotation in degrees (0/90/180/270). Rotates the camera
-    // preview and remaps navigation so screen directions match the view.
-    const navigationRotate = ref(0);
-    // Preview horizontal mirror (optics handedness). Composed with rotation.
-    const navigationMirror = ref(false);
-    // Measured rotation from stage axes to camera image axes (degrees).
-    // Set by the Auto-Detect View Alignment action; 0 before first run.
-    const stageToImageRotation = ref(0);
+    // Rotation applied to the camera preview, in degrees (0, 90, 180, 270)
+    const previewRotation = ref(0);
+    // Whether the preview is mirrored horizontally after rotating
+    const previewMirror = ref(false);
     // The aspect ratio of the camera stream that the webapp started with
     const cameraStreamAspectRatio = ref(null);
 
@@ -88,6 +85,12 @@ export const useSettingsStore = defineStore(
       cameraStreamAspectRatio.value = width / height;
     }
 
+    function setPreviewTransform(angleDeg, mirror) {
+      assertValidRotationAngle(angleDeg);
+      previewRotation.value = angleDeg;
+      previewMirror.value = Boolean(mirror);
+    }
+
     // Export
     return {
       // State
@@ -103,9 +106,8 @@ export const useSettingsStore = defineStore(
       overrideOrigin,
       navigationStepSize,
       navigationInvert,
-      navigationRotate,
-      navigationMirror,
-      stageToImageRotation,
+      previewRotation,
+      previewMirror,
       cameraStreamAspectRatio,
 
       // Actions
@@ -114,6 +116,7 @@ export const useSettingsStore = defineStore(
       addStream,
       removeStream,
       setCameraStreamAspectRatio,
+      setPreviewTransform,
     };
   },
   {
@@ -125,9 +128,8 @@ export const useSettingsStore = defineStore(
         "disableStream",
         "navigationStepSize",
         "navigationInvert",
-        "navigationRotate",
-        "navigationMirror",
-        "stageToImageRotation",
+        "previewRotation",
+        "previewMirror",
       ],
     },
   },

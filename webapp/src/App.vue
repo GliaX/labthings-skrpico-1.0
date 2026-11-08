@@ -85,8 +85,6 @@ export default {
       "appTheme",
       "navigationStepSize",
       "navigationInvert",
-      "navigationRotate",
-      "stageToImageRotation",
       "microscopeHostname",
       "error",
       "waiting",
@@ -284,24 +282,9 @@ export default {
         return;
       }
       this.lastJogTime = now;
-      // Screen intent (x=right, y=down) -> stage axes. The camera shows
-      // the stage frame rotated by stageToImageRotation; the preview is
-      // then rotated by navigationRotate. To make the view move in the
-      // pressed direction, rotate the request by (previewRot - stageRot).
-      let jx = x * this.navigationStepSize.x * (this.navigationInvert.x ? -1 : 1);
-      let jy = y * this.navigationStepSize.y * (this.navigationInvert.y ? -1 : 1);
-      const delta =
-        ((((this.navigationRotate || 0) + (this.stageToImageRotation || 0)) % 360) + 360) % 360;
-      if (delta === 90) {
-        [jx, jy] = [jy, -jx];
-      } else if (delta === 180) {
-        [jx, jy] = [-jx, -jy];
-      } else if (delta === 270) {
-        [jx, jy] = [-jy, jx];
-      }
       this.invokeAction("stage", "jog", {
-        x: jx,
-        y: jy,
+        x: x * this.navigationStepSize.x * (this.navigationInvert.x ? -1 : 1),
+        y: y * this.navigationStepSize.y * (this.navigationInvert.y ? -1 : 1),
         z: z * this.navigationStepSize.z,
       });
       eventBus.emit("globalUpdatePositionEvent");

@@ -7,8 +7,8 @@
     <img
       v-show="isVisible && streamEnabled"
       ref="click-frame"
-      class="uk-align-center uk-margin-remove-bottom stream-image"
-      :style="rotateStyle"
+      class="uk-align-center uk-margin-remove-bottom"
+      :style="{ transform: previewCssTransform(previewRotation, previewMirror) }"
       :src="streamImgUri"
       alt="Stream"
       @load="updateStreamAspectRatio"
@@ -36,6 +36,11 @@ import { eventBus } from "../../eventBus.js";
 import { useIntersectionObserver } from "@vueuse/core";
 import { useSettingsStore } from "@/stores/settings.js";
 import { mapState } from "pinia";
+import {
+  applyRotationToStageVector,
+  displayedOffsetToRawOffset,
+  previewCssTransform,
+} from "@/js_utils/previewRotation.mjs";
 
 const ONE_PIXEL_FALLBACK = "data:image/PNG;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=";
 
@@ -72,23 +77,9 @@ export default {
       "baseUri",
       "disableStream",
       "waiting",
-      "navigationRotate",
-      "navigationMirror",
+      "previewRotation",
+      "previewMirror",
     ]),
-    rotateStyle: function () {
-      const rot = (((this.navigationRotate || 0) % 360) + 360) % 360;
-      const mirror = this.navigationMirror ? "scaleX(-1) " : "";
-      if (rot === 90 || rot === 270) {
-        return {
-          transform: `${mirror}rotate(${rot}deg)`,
-          maxWidth: "100%",
-          maxHeight: "100%",
-          width: "auto",
-          height: "100%",
-        };
-      }
-      return { transform: `${mirror}rotate(${rot}deg)` };
-    },
     streamEnabled: function () {
       return this.ready && !this.disableStream;
     },
@@ -169,6 +160,7 @@ export default {
   },
 
   methods: {
+    previewCssTransform,
     flashStream: function () {
       // Run an animation that flashes the stream (for capture feedback)
       let element = this.$refs.streamDisplay;
@@ -196,38 +188,32 @@ export default {
     },
 
     clickMonitor: function (event) {
-      // Click position in VISUAL space, relative to the displayed centre
-      // (getBoundingClientRect reflects the CSS transform; offsetX/offsetY
-      // do not, so they cannot be used directly here).
-      const img = event.target;
-      const rect = img.getBoundingClientRect();
-      let x = event.clientX - (rect.left + rect.width / 2);
-      let y = event.clientY - (rect.top + rect.height / 2);
+      const target = event.target;
+      const rect = target.getBoundingClientRect();
+      let xCoordinate = event.clientX - (rect.left + rect.width / 2);
+      let yCoordinate = event.clientY - (rect.top + rect.height / 2);
 
-      // Invert the preview transform (rotation, then mirror) to get
-      // camera-frame pixel offsets from the image centre.
-      const rot = (((this.navigationRotate || 0) % 360) + 360) % 360;
-      if (this.navigationMirror) {
-        x = -x;
-      }
-      // Rotate screen offsets into the camera frame such that the
-      // CSM row-product conversion sends click-right to +X and
-      // click-up to +Y, matching the jog keys (rot=270, no mirror).
-      const rad = ((180 - rot) * Math.PI) / 180;
-      const xLocal = -(x * Math.cos(rad) - y * Math.sin(rad));
-      const yLocal = x * Math.sin(rad) + y * Math.cos(rad);
+      // Simply scaling by naturalHeight/offsetHeight may give the wrong answer!
+      // because we use content-fit: contain in the stylesheet, the img element
+      // may be larger than the picture.  So, we must determine whether the
+      // width or height is setting the scaling factor, and use a uniform scale
+      // factor.
+      let scale = Math.max(
+        event.target.naturalWidth / event.target.offsetWidth,
+        event.target.naturalHeight / event.target.offsetHeight,
+      );
 
-      // Uniform content-fit scale: the img element may be larger than the
-      // picture, so use whichever dimension is binding.
-      const scale = Math.max(
-        img.naturalWidth / img.offsetWidth,
-        img.naturalHeight / img.offsetHeight,
+      const rawOffset = displayedOffsetToRawOffset(
+        xCoordinate,
+        yCoordinate,
+        this.previewRotation,
+        this.previewMirror,
       );
 
       // Emit a signal to move, acted on by paneControl.vue
       eventBus.emit("globalMoveInImageCoordinatesEvent", {
-        x: xLocal * scale,
-        y: -yLocal * scale,
+        x: rawOffset.x * scale,
+        y: rawOffset.y * scale,
       });
     },
 

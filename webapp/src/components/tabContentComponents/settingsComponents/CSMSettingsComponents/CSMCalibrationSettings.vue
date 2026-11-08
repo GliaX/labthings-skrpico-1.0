@@ -1,7 +1,7 @@
 <template>
   <div id="CSMCalibrationSettings" ref="CSMCalibrationSettingsContainer" class="uk-width-large">
     <!--Show auto calibrate if default plugin is enabled-->
-    <div v-if="'calibrate_xy' in actions" class="uk-margin-small">
+    <div class="uk-margin-small">
       <action-button
         :button-primary="true"
         :can-terminate="true"
@@ -17,7 +17,6 @@
       />
     </div>
     <button
-      v-if="'last_calibration' in properties"
       v-show="showExtraSettings"
       type="button"
       class="uk-button uk-button-default uk-width-1-1"
@@ -86,15 +85,6 @@ export default {
       csmRatio: undefined,
       csmFOV: undefined,
     };
-  },
-
-  computed: {
-    actions() {
-      return this.thingDescription("camera_stage_mapping").actions;
-    },
-    properties() {
-      return this.thingDescription("camera_stage_mapping").properties;
-    },
   },
 
   mounted() {
