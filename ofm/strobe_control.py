@@ -186,8 +186,8 @@ class StrobeControlThing(OFMThing):
         self._last_width_us = microseconds
 
     def capture_operating_point(self) -> None:
-        """Store the camera's calibrated gain as the pinned operating
-        point used during the continuous-light phase."""
+        """Store the AE-converged constant-light gain and shutter as the
+        pinned operating point for every continuous-light phase."""
         self.exposure_us = int(self._cam.exposure_time)
         self.analogue_gain = float(self._cam.analogue_gain)
         self.logger.info(
@@ -200,19 +200,34 @@ class StrobeControlThing(OFMThing):
         """Light the LED continuously for measurements that need
         continuous illumination (WIDTH=1 s holds it HIGH across
         many frames). Suppresses mode-change re-arms until
-        ``exit_continuous_light``."""
+        ``exit_continuous_light``. The saved constant-light operating
+        point is applied so measurements run at the calibrated
+        gain/shutter pair rather than the flash pin."""
         self._continuous = True
+        gain = float(self.analogue_gain)
+        exposure = int(self.exposure_us)
+        if exposure > 0:
+            self._cam.set_probe_controls_raw(gain, exposure)
+            self.logger.info(
+                "continuous light: exposure %d us, gain %.2f",
+                exposure,
+                gain,
+            )
+        else:
+            self.logger.warning(
+                "continuous light: no operating point saved; "
+                "run auto gain & shutter calibration first"
+            )
         self._send("HWSYNC_STROBE STROBE=camera ENABLE=1 WIDTH=1")
         self._send("SYNC_PULSE_STATUS STROBE=camera")
 
     def exit_continuous_light(self) -> None:
         """Re-arm the calibrated flash width and re-pin the exposure.
 
-        Entering the strobe phase drops the continuous-light exposure:
-        zeroing ``exposure_us`` makes every re-arm derive the full-frame
-        fps-safe pin for the active mode."""
+        The flash is the shutter again, so the sensor pin returns to the
+        full frame period; the saved constant-light operating point is
+        kept on disk for the next continuous-light phase."""
         self._continuous = False
-        self.exposure_us = 0
         self.strobe_on()
         self._pin_exposure()
 
@@ -590,9 +605,7 @@ class StrobeControlThing(OFMThing):
             return
         if period_us is None:
             period_us = self._period_us()
-        exposure = (
-            self.exposure_us if self.exposure_us > 0 else int(period_us)
-        )
+        exposure = int(period_us)
         try:
             self._cam.set_probe_controls_raw(self.analogue_gain, exposure)
         except Exception as exc:

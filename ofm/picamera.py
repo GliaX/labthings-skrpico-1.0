@@ -1080,19 +1080,32 @@ class StreamingPiCamera2(BaseCamera, ABC):
         if target_white_level is None:
             target_white_level = self._sensor_info.default_target_white_level
 
-        with self._streaming_picamera(pause_stream=True) as cam:
-            recalibrate_utils.adjust_shutter_and_gain_from_raw(
-                cam,
-                self._sensor_info,
-                target_white_level=target_white_level,
-                percentile=percentile,
-            )
-            self._exposure_time = int(
-                cam.capture_metadata()["ExposureTime"]
-            )
-            self._analogue_gain = float(
-                cam.capture_metadata()["AnalogueGain"]
-            )
+        strobe = self._strobe_control
+        use_strobe = strobe is not None and strobe.enabled
+        held_before = bool(getattr(strobe, "_continuous", False))
+        if use_strobe and not held_before:
+            strobe.enter_continuous_light()
+        try:
+            with self._streaming_picamera(pause_stream=True) as cam:
+                recalibrate_utils.adjust_shutter_and_gain_from_raw(
+                    cam,
+                    self._sensor_info,
+                    target_white_level=target_white_level,
+                    percentile=percentile,
+                )
+                self._exposure_time = int(
+                    cam.capture_metadata()["ExposureTime"]
+                )
+                self._analogue_gain = float(
+                    cam.capture_metadata()["AnalogueGain"]
+                )
+            if use_strobe:
+                strobe.capture_operating_point()
+            else:
+                self._capture_converged_operating_point()
+        finally:
+            if use_strobe and not held_before:
+                strobe.exit_continuous_light()
 
     def _capture_converged_operating_point(self) -> None:
         """Persist the sensor's converged exposure and gain so stream
@@ -1252,9 +1265,8 @@ class StreamingPiCamera2(BaseCamera, ABC):
 
         * ``flat_lens_shading`` to disable flat-field
         * ``auto_expose_from_minimum`` under continuous illumination;
-          the chosen gain and shutter become the pinned operating
-          point, captured into the strobe settings before the strobe
-          re-arms
+          the converged gain and shutter are saved as the
+          constant-light operating point
         * ``set_static_green_equalisation`` to set geq offset to max
         * ``calibrate_lens_shading`` under the same continuous light
         * ``set_background``
@@ -1274,11 +1286,6 @@ class StreamingPiCamera2(BaseCamera, ABC):
             self.set_ce_enable_to_off()
             time.sleep(0.2)
             self.calibrate_lens_shading()
-            time.sleep(0.2)
-            if strobe is not None:
-                strobe.capture_operating_point()
-            else:
-                self._capture_converged_operating_point()
         finally:
             if strobe is not None:
                 strobe.exit_continuous_light()

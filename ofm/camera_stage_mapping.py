@@ -97,18 +97,26 @@ class CameraStageMapper(OFMThing):
         strobe_was_continuous = bool(getattr(strobe, "_continuous", False))
         if strobe is not None:
             strobe.enter_continuous_light()
-            # The strobe pin leaves full-period exposure (45ms); under
-            # continuous light that saturates the sensor. Short shutter
-            # for the measurement (2500us). Gain is kept.
-            # Raw write: persisted settings untouched; exit_continuous_light
-            # re-pins the strobe operating point on the way out.
-            gain = float(cam.analogue_gain)
-            cam.set_probe_controls_raw(gain, 2500)
-            cam.discard_frames()
-            self.logger.info(
-                "CSM cal: continuous light, shutter 2500us, gain %.2f",
-                gain,
-            )
+            saved_exp = int(getattr(strobe, "exposure_us", 0) or 0)
+            saved_gain = float(getattr(strobe, "analogue_gain", 0.0) or 0.0)
+            if saved_exp > 0:
+                cam.set_probe_controls_raw(saved_gain, saved_exp)
+                cam.discard_frames()
+                self.logger.info(
+                    "CSM cal: continuous light, saved pair "
+                    "exposure %d us, gain %.2f",
+                    saved_exp,
+                    saved_gain,
+                )
+            else:
+                gain = float(cam.analogue_gain)
+                cam.set_probe_controls_raw(gain, 2500)
+                cam.discard_frames()
+                self.logger.warning(
+                    "CSM cal: no saved operating point; fallback "
+                    "shutter 2500us, gain %.2f",
+                    gain,
+                )
         try:
             self._calibrate_xy_body()
         finally:
